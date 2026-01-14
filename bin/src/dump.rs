@@ -4,7 +4,7 @@ use memmap2::Mmap;
 use std::fs::File;
 
 use chrono::{DateTime, Local};
-use erofs::{
+use erofs_rs::{
     EroFS,
     types::{SB_EXTSLOT_SIZE, SuperBlock},
 };

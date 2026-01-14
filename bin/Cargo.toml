@@ -18,7 +18,7 @@ chrono = { workspace = true, default-features = false, features = [
     "clock",
 ] }
 clap = { workspace = true, default-features = true, features = ["derive"] }
-erofs = { path = "../lib" }
+erofs-rs = { path = "../lib" }
 memmap2 = { workspace = true, default-features = true }
 tar = { workspace = true, default-features = true }
 uuid = { workspace = true, default-features = true }

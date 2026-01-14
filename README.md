@@ -16,9 +16,9 @@ A pure Rust library for reading and building [EROFS](https://docs.kernel.org/fil
 use std::fs::File;
 use std::io::Read;
 use memmap2::Mmap;
-use erofs::EroFS;
+use erofs_rs::EroFS;
 
-fn main() -> erofs::Result<()> {
+fn main() -> erofs_rs::Result<()> {
     let file = File::open("system.erofs")?;
     let mmap = unsafe { Mmap::map(&file) }?;
     let fs = EroFS::new(mmap)?;

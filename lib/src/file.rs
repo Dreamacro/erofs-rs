@@ -13,7 +13,7 @@ use crate::{EroFS, types::Inode};
 ///
 /// ```no_run
 /// use std::io::Read;
-/// use erofs::EroFS;
+/// use erofs_rs::EroFS;
 /// # use memmap2::Mmap;
 /// # use std::fs::File;
 /// # let file = File::open("image.erofs").unwrap();

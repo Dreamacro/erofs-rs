@@ -2,7 +2,7 @@ use std::{fs::File, os::unix::fs::PermissionsExt, path::Path, time::UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Args;
-use erofs::EroFS;
+use erofs_rs::EroFS;
 use memmap2::Mmap;
 use tar::Header;
 

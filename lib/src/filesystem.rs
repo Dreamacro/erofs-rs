@@ -24,7 +24,7 @@ use crate::{Error, Result};
 /// use std::fs::File;
 /// use std::io::Read;
 /// use memmap2::Mmap;
-/// use erofs::EroFS;
+/// use erofs_rs::EroFS;
 ///
 /// let file = File::open("image.erofs").unwrap();
 /// let mmap = unsafe { Mmap::map(&file) }.unwrap();
