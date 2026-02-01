@@ -132,7 +132,7 @@ impl EroFS {
         self.block_size
     }
 
-    pub(crate) fn get_inode(&self, nid: u64) -> Result<Inode> {
+    pub fn get_inode(&self, nid: u64) -> Result<Inode> {
         let offset = self.get_inode_offset(nid) as usize;
 
         let mut inode_buf = self
