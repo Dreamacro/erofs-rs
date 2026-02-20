@@ -14,10 +14,23 @@ rust-version = "1.88"
 [lints]
 workspace = true
 
+[features]
+default = ["std"]
+std = [
+  "dep:memmap2",
+  "thiserror/std",
+  "bytes/std",
+  "binrw/std",
+  "rustix/std",
+  "typed-path/std",
+]
+
 [dependencies]
-bytes = { workspace = true, default-features = true }
-thiserror = { workspace = true }
-binrw = { workspace = true, default-features = true }
+binrw = { workspace = true }
 bitflags = { workspace = true }
-memmap2 = { workspace = true, default-features = true }
+bytes = { workspace = true }
+enum_dispatch = { workspace = true }
+memmap2 = { workspace = true, default-features = true, optional = true }
 rustix = { workspace = true, features = ["fs"] }
+thiserror = { workspace = true }
+typed-path = { workspace = true }

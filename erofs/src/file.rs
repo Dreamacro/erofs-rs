@@ -1,4 +1,5 @@
-use std::{cmp, io::Read};
+#[cfg(feature = "std")]
+use std::{cmp, format, io::Read};
 
 use bytes::Bytes;
 
@@ -25,15 +26,15 @@ use crate::{EroFS, types::Inode};
 /// file.read_to_end(&mut content).unwrap();
 /// ```
 #[derive(Debug)]
-pub struct File {
+pub struct File<'a> {
     inode: Inode,
-    erofs: EroFS,
+    erofs: EroFS<'a>,
     offset: usize,
     buf: Option<Bytes>,
 }
 
-impl File {
-    pub(crate) fn new(inode: Inode, erofs: EroFS) -> Self {
+impl<'a> File<'a> {
+    pub(crate) fn new(inode: Inode, erofs: EroFS<'a>) -> Self {
         Self {
             inode,
             erofs,
@@ -48,7 +49,8 @@ impl File {
     }
 }
 
-impl Read for File {
+#[cfg(feature = "std")]
+impl<'a> Read for File<'a> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.offset >= self.inode.data_size() {
             return Ok(0);

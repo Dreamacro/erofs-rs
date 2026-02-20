@@ -1,19 +1,22 @@
-use std::{
-    cmp,
-    ffi::{OsStr, OsString},
-    hint,
-    io::Cursor,
-    path::{Path, PathBuf},
-};
+#[cfg(feature = "std")]
+use std::string::{String, ToString};
+#[cfg(feature = "std")]
+use std::{cmp, hint};
 
-use binrw::BinRead;
+#[cfg(not(feature = "std"))]
+use alloc::string::{String, ToString};
+#[cfg(not(feature = "std"))]
+use core::{cmp, hint};
+
+use binrw::{BinRead, io::Cursor};
+use typed_path::{UnixPath, UnixPathBuf};
 
 use crate::{
     EroFS, Error, Result,
     types::{Dirent, DirentFileType, Inode},
 };
 
-pub fn find_nodeid_by_name(name: &OsStr, data: &[u8]) -> Result<Option<u64>> {
+pub fn find_nodeid_by_name(name: &[u8], data: &[u8]) -> Result<Option<u64>> {
     let dirent = read_nth_dirent(data, 0)?;
     let n = dirent.name_off as usize / Dirent::size();
     if n <= 2 {
@@ -30,7 +33,7 @@ pub fn find_nodeid_by_name(name: &OsStr, data: &[u8]) -> Result<Option<u64>> {
 
         let cmp = {
             let (_, entry_name) = read_nth_id_name(data, mid + offset, n)?;
-            entry_name.as_os_str().cmp(name)
+            entry_name.cmp(name)
         };
         base = hint::select_unpredictable(cmp == cmp::Ordering::Greater, base, mid);
 
@@ -39,7 +42,7 @@ pub fn find_nodeid_by_name(name: &OsStr, data: &[u8]) -> Result<Option<u64>> {
 
     let (inner_nid, cmp) = {
         let (nid, entry_name) = read_nth_id_name(data, base + offset, n)?;
-        let cmp = entry_name.as_os_str().cmp(name);
+        let cmp = entry_name.cmp(name);
         (nid, cmp)
     };
     if cmp != cmp::Ordering::Equal {
@@ -49,7 +52,7 @@ pub fn find_nodeid_by_name(name: &OsStr, data: &[u8]) -> Result<Option<u64>> {
     Ok(Some(inner_nid))
 }
 
-fn read_nth_id_name(data: &[u8], n: usize, max: usize) -> Result<(u64, OsString)> {
+fn read_nth_id_name(data: &[u8], n: usize, max: usize) -> Result<(u64, &[u8])> {
     let dirent = read_nth_dirent(data, n)?;
     let name_start = dirent.name_off as usize;
     let name_end = if n < max - 1 {
@@ -64,9 +67,7 @@ fn read_nth_id_name(data: &[u8], n: usize, max: usize) -> Result<(u64, OsString)
             "invalid directory entry name offset".to_string(),
         ));
     }
-    let name = String::from_utf8_lossy(&data[name_start..name_end])
-        .trim_end_matches('\0')
-        .into();
+    let name = &data[name_start..name_end];
     Ok((dirent.nid, name))
 }
 
@@ -82,14 +83,14 @@ pub fn read_nth_dirent(data: &[u8], n: usize) -> Result<Dirent> {
 #[derive(Debug)]
 struct DirentBlock<'a> {
     data: &'a [u8],
-    root: PathBuf,
+    root: UnixPathBuf,
     dirent: Dirent,
     i: usize,
     n: usize,
 }
 
 impl<'a> DirentBlock<'a> {
-    fn new(root: PathBuf, data: &'a [u8]) -> Result<Self> {
+    fn new(root: UnixPathBuf, data: &'a [u8]) -> Result<Self> {
         let dirent = read_nth_dirent(data, 0)?;
         let n = dirent.name_off as usize / Dirent::size();
         Ok(Self {
@@ -157,15 +158,15 @@ impl Iterator for DirentBlock<'_> {
 
 #[derive(Debug)]
 pub struct ReadDir<'a> {
-    dir: PathBuf,
+    dir: UnixPathBuf,
     inode: Inode,
-    erofs: &'a EroFS,
+    erofs: &'a EroFS<'a>,
     dirent_block: DirentBlock<'a>,
     offset: usize,
 }
 
 impl<'a> ReadDir<'a> {
-    pub(crate) fn new<P: AsRef<Path>>(erofs: &'a EroFS, inode: Inode, dir: P) -> Result<Self> {
+    pub(crate) fn new<P: AsRef<UnixPath>>(erofs: &'a EroFS, inode: Inode, dir: P) -> Result<Self> {
         let block = erofs.get_inode_block(&inode, 0)?;
         let dirent_block = DirentBlock::new(dir.as_ref().to_path_buf(), block)?;
         Ok(Self {
@@ -209,7 +210,7 @@ impl Iterator for ReadDir<'_> {
 /// A directory entry within an EROFS filesystem.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
-    dir: PathBuf,
+    dir: UnixPathBuf,
     nid: u64,
     file_type: DirentFileType,
     file_name: String,
@@ -227,7 +228,7 @@ impl DirEntry {
     }
 
     /// Returns the full path of this entry.
-    pub fn path(&self) -> PathBuf {
+    pub fn path(&self) -> UnixPathBuf {
         self.dir.join(&self.file_name)
     }
 

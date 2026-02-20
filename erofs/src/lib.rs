@@ -20,12 +20,17 @@
 //! let mut content = String::new();
 //! file.read_to_string(&mut content).unwrap();
 //! ```
+#![no_std]
 
+#[macro_use]
+extern crate alloc;
+extern crate std;
+
+pub mod backend;
 mod dirent;
 mod error;
 pub mod file;
 pub mod filesystem;
-mod traits;
 pub mod types;
 pub mod walkdir;
 

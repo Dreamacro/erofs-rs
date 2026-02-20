@@ -1,11 +1,10 @@
 use anyhow::Result;
 use clap::Args;
-use memmap2::Mmap;
-use std::fs::File;
 
 use chrono::{DateTime, Local};
 use erofs_rs::{
     EroFS,
+    backend::MmapImage,
     types::{SB_EXTSLOT_SIZE, SuperBlock},
 };
 use uuid::Uuid;
@@ -29,9 +28,8 @@ pub struct DumpArgs {
 // Filesystem UUID:                              71bd9ab4-fb8c-47b4-986c-5c901ad547c7
 
 pub fn dump(args: DumpArgs) -> Result<()> {
-    let file = File::open(args.path)?;
-    let file = unsafe { Mmap::map(&file) }?;
-    let fs = EroFS::new(file)?;
+    let image = MmapImage::new_from_path(args.path)?;
+    let fs = EroFS::new(image.into())?;
 
     let block = fs.super_block();
 

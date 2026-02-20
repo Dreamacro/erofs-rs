@@ -1,10 +1,9 @@
-use std::{fs::File, os::unix::fs::PermissionsExt, path::Path};
+use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local};
 use clap::{Args, Subcommand};
-use erofs_rs::{EroFS, types::Inode};
-use memmap2::Mmap;
+use erofs_rs::{EroFS, backend::MmapImage, types::Inode};
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
@@ -27,9 +26,8 @@ enum InspectSubcommands {
 }
 
 pub fn inspect(args: InspectArgs) -> Result<()> {
-    let file = File::open(args.image)?;
-    let file = unsafe { Mmap::map(&file) }?;
-    let fs = EroFS::new(file)?;
+    let image = MmapImage::new_from_path(args.image)?;
+    let fs = EroFS::new(image.into())?;
 
     match args.operation {
         InspectSubcommands::Ls { path } => ls(&fs, &path)?,
@@ -97,7 +95,7 @@ fn format_time(inode: &Inode) -> String {
 
 fn ls(fs: &EroFS, path: &str) -> Result<()> {
     let read_dir = fs
-        .read_dir(Path::new(path))
+        .read_dir(path)
         .with_context(|| format!("failed to read directory: {}", path))?;
 
     for entry in read_dir {

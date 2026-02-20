@@ -1,5 +1,11 @@
 use thiserror::Error;
 
+#[cfg(feature = "std")]
+use std::string::String;
+
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("invalid super block: {0}")]
@@ -36,4 +42,8 @@ pub enum Error {
     CorruptedData(String),
 }
 
+#[cfg(feature = "std")]
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(not(feature = "std"))]
+pub type Result<T> = core::result::Result<T, Error>;
