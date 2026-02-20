@@ -20,23 +20,39 @@ use crate::{backend, dirent};
 /// The main entry point for reading EROFS filesystem images.
 ///
 /// `EroFS` provides methods to traverse directories, open files, and access
-/// filesystem metadata from a memory-mapped EROFS image.
+/// filesystem metadata from EROFS images. It supports both standard (mmap-based)
+/// and no_std (slice-based) backends.
 ///
-/// # Example
+/// # Examples
+///
+/// ## Standard usage with mmap
 ///
 /// ```no_run
-/// use std::fs::File;
 /// use std::io::Read;
-/// use memmap2::Mmap;
-/// use erofs_rs::EroFS;
+/// use erofs_rs::{EroFS, backend::MmapImage};
 ///
-/// let file = File::open("image.erofs").unwrap();
-/// let mmap = unsafe { Mmap::map(&file) }.unwrap();
-/// let fs = EroFS::new(mmap).unwrap();
+/// let image = MmapImage::new_from_path("image.erofs").unwrap();
+/// let fs = EroFS::new(image.into()).unwrap();
 ///
 /// let mut file = fs.open("/etc/passwd").unwrap();
 /// let mut content = String::new();
 /// file.read_to_string(&mut content).unwrap();
+/// ```
+///
+/// ## no_std usage with byte slice
+///
+/// ```no_run
+/// # extern crate alloc;
+/// use erofs_rs::{EroFS, backend::{Backend, SliceImage}};
+///
+/// let image_data: &'static [u8] = &[/* EROFS image data */];
+/// let fs = EroFS::new(Backend::Slice(SliceImage::new(image_data))).unwrap();
+///
+/// // Traverse directories
+/// for entry in fs.read_dir("/etc").unwrap() {
+///     let entry = entry.unwrap();
+///     // Process directory entry...
+/// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct EroFS<'a> {
@@ -46,11 +62,30 @@ pub struct EroFS<'a> {
 }
 
 impl<'a> EroFS<'a> {
-    /// Creates a new `EroFS` instance from a memory-mapped EROFS image.
+    /// Creates a new `EroFS` instance from a backend image source.
+    ///
+    /// The backend can be either a memory-mapped file ([`MmapImage`](crate::backend::MmapImage))
+    /// in std environments, or a byte slice ([`SliceImage`](crate::backend::SliceImage)) in
+    /// no_std environments.
     ///
     /// # Errors
     ///
-    /// Returns an error if the superblock is invalid or the magic number doesn't match.
+    /// Returns an error if:
+    /// - The superblock cannot be read
+    /// - The magic number doesn't match EROFS format (0xE0F5E1E2)
+    /// - The block size is invalid (must be 2^n where 9 ≤ n ≤ 24)
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use erofs_rs::{EroFS, backend::MmapImage};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let image = MmapImage::new_from_path("image.erofs")?;
+    /// let fs = EroFS::new(image.into())?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(image: backend::Backend<'a>) -> Result<Self> {
         let mut cursor = image.get_cursor(SUPER_BLOCK_OFFSET).ok_or_else(|| {
             Error::InvalidSuperblock("failed to read super block from mmap".to_string())
@@ -261,7 +296,8 @@ impl<'a> EroFS<'a> {
     pub(crate) fn get_path_inode<P: AsRef<UnixPath>>(&self, path: P) -> Result<Option<Inode>> {
         let mut nid = self.super_block.root_nid as u64;
 
-        'outer: for part in path.as_ref().components() {
+        let path = path.as_ref().normalize();
+        'outer: for part in path.components() {
             if part == UnixComponent::RootDir {
                 continue;
             }
