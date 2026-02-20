@@ -68,6 +68,11 @@ fn read_nth_id_name(data: &[u8], n: usize, max: usize) -> Result<(u64, &[u8])> {
         ));
     }
     let name = &data[name_start..name_end];
+    if let Some(i) = name.iter().position(|&b| b == 0) {
+        // Trim trailing null bytes
+        return Ok((dirent.nid, &name[..i]));
+    }
+
     Ok((dirent.nid, name))
 }
 
