@@ -1,9 +1,21 @@
 #[cfg(feature = "std")]
-use std::{cmp, format, io::Read};
+use std::{
+    cmp, format,
+    io::{Read, Result},
+};
+
+#[cfg(not(feature = "std"))]
+use crate::Result;
 
 use bytes::Bytes;
 
 use crate::{EroFS, types::Inode};
+
+#[cfg(not(feature = "std"))]
+/// A trait for reading file contents in `no_std` mode.
+pub trait Read {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+}
 
 /// A handle to a file within an EROFS filesystem.
 ///
@@ -49,9 +61,8 @@ impl<'a> File<'a> {
     }
 }
 
-#[cfg(feature = "std")]
 impl<'a> Read for File<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         if self.offset >= self.inode.data_size() {
             return Ok(0);
         }
