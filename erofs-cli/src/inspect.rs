@@ -3,7 +3,11 @@ use std::os::unix::fs::PermissionsExt;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local};
 use clap::{Args, Subcommand};
-use erofs_rs::{EroFS, backend::MmapImage, types::Inode};
+use erofs_rs::{
+    EroFS,
+    backend::{Image, MmapImage},
+    types::Inode,
+};
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
@@ -27,7 +31,7 @@ enum InspectSubcommands {
 
 pub fn inspect(args: InspectArgs) -> Result<()> {
     let image = MmapImage::new_from_path(args.image)?;
-    let fs = EroFS::new(image.into())?;
+    let fs = EroFS::new(image)?;
 
     match args.operation {
         InspectSubcommands::Ls { path } => ls(&fs, &path)?,
@@ -93,7 +97,7 @@ fn format_time(inode: &Inode) -> String {
     }
 }
 
-fn ls(fs: &EroFS, path: &str) -> Result<()> {
+fn ls<I: Image>(fs: &EroFS<I>, path: &str) -> Result<()> {
     let read_dir = fs
         .read_dir(path)
         .with_context(|| format!("failed to read directory: {}", path))?;
@@ -113,7 +117,7 @@ fn ls(fs: &EroFS, path: &str) -> Result<()> {
     Ok(())
 }
 
-fn cat(fs: &EroFS, path: &str) -> Result<()> {
+fn cat<I: Image>(fs: &EroFS<I>, path: &str) -> Result<()> {
     let mut file = fs
         .open(path)
         .with_context(|| format!("failed to open file: {}", path))?;

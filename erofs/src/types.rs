@@ -1,3 +1,4 @@
+#[cfg(feature = "std")]
 use std::{
     fs::Permissions,
     os::unix::fs::PermissionsExt,
@@ -203,6 +204,7 @@ impl Inode {
         self.file_type().is_symlink()
     }
 
+    #[cfg(feature = "std")]
     pub fn permissions(&self) -> Permissions {
         match self {
             Self::Compact((_, n)) => Permissions::from_mode(n.mode.into()),
@@ -210,6 +212,15 @@ impl Inode {
         }
     }
 
+    #[cfg(not(feature = "std"))]
+    pub fn permissions(&self) -> u16 {
+        match self {
+            Self::Compact((_, n)) => n.mode,
+            Self::Extended((_, n)) => n.mode,
+        }
+    }
+
+    #[cfg(feature = "std")]
     pub fn modified(&self) -> Option<SystemTime> {
         match self {
             Self::Compact((_, _)) => None,
@@ -221,6 +232,18 @@ impl Inode {
                         + Duration::from_secs(secs)
                         + Duration::from_nanos(nanos as u64),
                 )
+            }
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn modified(&self) -> Option<(u64, u32)> {
+        match self {
+            Self::Compact((_, _)) => None,
+            Self::Extended((_, n)) => {
+                let secs = n.mtime;
+                let nanos = n.mtime_ns;
+                Some((secs, nanos))
             }
         }
     }

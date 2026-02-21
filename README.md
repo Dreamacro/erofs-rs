@@ -69,7 +69,7 @@ fn main() -> erofs_rs::Result<()> {
 ## Feature Flags
 
 - `std` (default): Enables standard library support, including mmap backend
-- Without `std`: Operates in `no_std` mode with `alloc`, using slice backend
+- Without `std`: Operates in `no_std` mode with `alloc`
 
 ```toml
 # Standard usage (default)

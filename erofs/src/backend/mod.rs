@@ -33,40 +33,20 @@
 //! ```
 
 use binrw::io::Cursor;
-use enum_dispatch::*;
+use core::ops;
 
-#[cfg(feature = "std")]
-use std::ops;
 #[cfg(feature = "std")]
 mod mmap;
 #[cfg(feature = "std")]
 pub use mmap::MmapImage;
 
-#[cfg(not(feature = "std"))]
-use core::ops;
-
 mod slice;
 pub use slice::SliceImage;
-
-/// A unified backend enum for different EROFS image sources.
-///
-/// This enum uses `enum_dispatch` to provide zero-cost abstraction over
-/// different backend implementations.
-#[enum_dispatch(Image)]
-#[derive(Debug)]
-pub enum Backend<'a> {
-    /// Memory-mapped file backend (requires `std` feature)
-    #[cfg(feature = "std")]
-    Mmap(mmap::MmapImage),
-    /// Byte slice backend (available in `no_std` mode)
-    Slice(slice::SliceImage<'a>),
-}
 
 /// A trait for accessing EROFS image data from various sources.
 ///
 /// This trait provides a common interface for reading data from different
 /// backend types, enabling zero-copy access where possible.
-#[enum_dispatch]
 pub trait Image {
     /// Gets a slice of data at the specified range.
     ///

@@ -47,6 +47,8 @@
 
 #[macro_use]
 extern crate alloc;
+
+#[cfg(feature = "std")]
 extern crate std;
 
 pub mod backend;

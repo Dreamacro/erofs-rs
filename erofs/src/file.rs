@@ -9,7 +9,7 @@ use crate::Result;
 
 use bytes::Bytes;
 
-use crate::{EroFS, types::Inode};
+use crate::{EroFS, backend::Image, types::Inode};
 
 #[cfg(not(feature = "std"))]
 /// A trait for reading file contents in `no_std` mode.
@@ -38,15 +38,15 @@ pub trait Read {
 /// file.read_to_end(&mut content).unwrap();
 /// ```
 #[derive(Debug)]
-pub struct File<'a> {
+pub struct File<'a, I: Image> {
     inode: Inode,
-    erofs: EroFS<'a>,
+    erofs: &'a EroFS<I>,
     offset: usize,
     buf: Option<Bytes>,
 }
 
-impl<'a> File<'a> {
-    pub(crate) fn new(inode: Inode, erofs: EroFS<'a>) -> Self {
+impl<'a, I: Image> File<'a, I> {
+    pub(crate) fn new(inode: Inode, erofs: &'a EroFS<I>) -> Self {
         Self {
             inode,
             erofs,
@@ -61,7 +61,7 @@ impl<'a> File<'a> {
     }
 }
 
-impl<'a> Read for File<'a> {
+impl<'a, I: Image> Read for File<'a, I> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         if self.offset >= self.inode.data_size() {
             return Ok(0);

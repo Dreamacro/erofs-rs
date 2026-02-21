@@ -1,16 +1,10 @@
-#[cfg(feature = "std")]
-use std::string::{String, ToString};
-#[cfg(feature = "std")]
-use std::{cmp, hint};
-
-#[cfg(not(feature = "std"))]
 use alloc::string::{String, ToString};
-#[cfg(not(feature = "std"))]
 use core::{cmp, hint};
 
 use binrw::{BinRead, io::Cursor};
 use typed_path::{UnixPath, UnixPathBuf};
 
+use crate::backend::Image;
 use crate::{
     EroFS, Error, Result,
     types::{Dirent, DirentFileType, Inode},
@@ -162,16 +156,20 @@ impl Iterator for DirentBlock<'_> {
 }
 
 #[derive(Debug)]
-pub struct ReadDir<'a> {
+pub struct ReadDir<'a, I: Image> {
     dir: UnixPathBuf,
     inode: Inode,
-    erofs: &'a EroFS<'a>,
+    erofs: &'a EroFS<I>,
     dirent_block: DirentBlock<'a>,
     offset: usize,
 }
 
-impl<'a> ReadDir<'a> {
-    pub(crate) fn new<P: AsRef<UnixPath>>(erofs: &'a EroFS, inode: Inode, dir: P) -> Result<Self> {
+impl<'a, I: Image> ReadDir<'a, I> {
+    pub(crate) fn new<P: AsRef<UnixPath>>(
+        erofs: &'a EroFS<I>,
+        inode: Inode,
+        dir: P,
+    ) -> Result<Self> {
         let block = erofs.get_inode_block(&inode, 0)?;
         let dirent_block = DirentBlock::new(dir.as_ref().to_path_buf(), block)?;
         Ok(Self {
@@ -204,7 +202,7 @@ impl<'a> ReadDir<'a> {
     }
 }
 
-impl Iterator for ReadDir<'_> {
+impl<'a, I: Image> Iterator for ReadDir<'a, I> {
     type Item = Result<DirEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {

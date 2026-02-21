@@ -29,7 +29,7 @@ pub struct DumpArgs {
 
 pub fn dump(args: DumpArgs) -> Result<()> {
     let image = MmapImage::new_from_path(args.path)?;
-    let fs = EroFS::new(image.into())?;
+    let fs = EroFS::new(image)?;
 
     let block = fs.super_block();
 

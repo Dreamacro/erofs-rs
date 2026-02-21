@@ -29,7 +29,6 @@ std = [
 binrw = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
-enum_dispatch = { workspace = true }
 memmap2 = { workspace = true, default-features = true, optional = true }
 rustix = { workspace = true, features = ["fs"] }
 thiserror = { workspace = true }

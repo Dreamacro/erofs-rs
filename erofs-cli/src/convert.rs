@@ -18,7 +18,7 @@ pub struct ConvertArgs {
 
 pub fn convert(args: ConvertArgs) -> Result<()> {
     let image = MmapImage::new_from_path(args.path)?;
-    let fs = EroFS::new(image.into())?;
+    let fs = EroFS::new(image)?;
 
     let out_file = File::create(args.output)?;
     let mut tar = tar::Builder::new(out_file);

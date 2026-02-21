@@ -1,7 +1,3 @@
-#[cfg(feature = "std")]
-use std::{format, string::ToString, sync::Arc};
-
-#[cfg(not(feature = "std"))]
 use alloc::{format, string::ToString, sync::Arc};
 use typed_path::Component;
 
@@ -11,11 +7,11 @@ use bytes::Buf;
 use typed_path::{UnixComponent, UnixPath};
 
 use crate::backend::Image;
+use crate::dirent;
 use crate::file::File;
 use crate::types::*;
 use crate::walkdir::WalkDir;
 use crate::{Error, Result};
-use crate::{backend, dirent};
 
 /// The main entry point for reading EROFS filesystem images.
 ///
@@ -55,13 +51,13 @@ use crate::{backend, dirent};
 /// }
 /// ```
 #[derive(Debug, Clone)]
-pub struct EroFS<'a> {
-    image: Arc<backend::Backend<'a>>,
+pub struct EroFS<I: Image> {
+    image: Arc<I>,
     super_block: SuperBlock,
     block_size: usize,
 }
 
-impl<'a> EroFS<'a> {
+impl<I: Image> EroFS<I> {
     /// Creates a new `EroFS` instance from a backend image source.
     ///
     /// The backend can be either a memory-mapped file ([`MmapImage`](crate::backend::MmapImage))
@@ -86,7 +82,7 @@ impl<'a> EroFS<'a> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(image: backend::Backend<'a>) -> Result<Self> {
+    pub fn new(image: I) -> Result<Self> {
         let mut cursor = image.get_cursor(SUPER_BLOCK_OFFSET).ok_or_else(|| {
             Error::InvalidSuperblock("failed to read super block from mmap".to_string())
         })?;
@@ -122,14 +118,14 @@ impl<'a> EroFS<'a> {
     ///
     /// Returns an iterator that yields all entries (files and directories)
     /// under the specified root path.
-    pub fn walk_dir<P: AsRef<UnixPath>>(&self, root: P) -> Result<WalkDir<'_>> {
+    pub fn walk_dir<P: AsRef<UnixPath>>(&self, root: P) -> Result<WalkDir<'_, I>> {
         WalkDir::new(self, root)
     }
 
     /// Lists the immediate contents of a directory.
     ///
     /// This is equivalent to `walk_dir` with `max_depth(1)`.
-    pub fn read_dir<P: AsRef<UnixPath>>(&self, path: P) -> Result<WalkDir<'_>> {
+    pub fn read_dir<P: AsRef<UnixPath>>(&self, path: P) -> Result<WalkDir<'_, I>> {
         Ok(WalkDir::new(self, path)?.max_depth(1))
     }
 
@@ -140,7 +136,7 @@ impl<'a> EroFS<'a> {
     /// # Errors
     ///
     /// Returns an error if the path doesn't exist or is not a regular file.
-    pub fn open<P: AsRef<UnixPath>>(&self, path: P) -> Result<File<'_>> {
+    pub fn open<P: AsRef<UnixPath>>(&self, path: P) -> Result<File<'_, I>> {
         let inode = self
             .get_path_inode(&path)?
             .ok_or_else(|| Error::PathNotFound(path.as_ref().to_string_lossy().into_owned()))?;
@@ -151,7 +147,7 @@ impl<'a> EroFS<'a> {
     /// Opens a file from an inode directly.
     ///
     /// This is useful when you already have an inode from directory traversal.
-    pub fn open_inode_file(&self, inode: Inode) -> Result<File<'_>> {
+    pub fn open_inode_file(&self, inode: Inode) -> Result<File<'_, I>> {
         if !inode.is_file() {
             return Err(Error::NotAFile(format!(
                 "inode {} is not a regular file",
@@ -159,7 +155,7 @@ impl<'a> EroFS<'a> {
             )));
         }
 
-        Ok(File::new(inode, self.clone()))
+        Ok(File::new(inode, self))
     }
 
     /// Returns a reference to the filesystem superblock.
