@@ -28,7 +28,7 @@ use crate::{Error, Result};
 /// use erofs_rs::{EroFS, backend::MmapImage};
 ///
 /// let image = MmapImage::new_from_path("image.erofs").unwrap();
-/// let fs = EroFS::new(image.into()).unwrap();
+/// let fs = EroFS::new(image).unwrap();
 ///
 /// let mut file = fs.open("/etc/passwd").unwrap();
 /// let mut content = String::new();
@@ -39,10 +39,10 @@ use crate::{Error, Result};
 ///
 /// ```no_run
 /// # extern crate alloc;
-/// use erofs_rs::{EroFS, backend::{Backend, SliceImage}};
+/// use erofs_rs::{EroFS, backend::SliceImage};
 ///
 /// let image_data: &'static [u8] = &[/* EROFS image data */];
-/// let fs = EroFS::new(Backend::Slice(SliceImage::new(image_data))).unwrap();
+/// let fs = EroFS::new(SliceImage::new(image_data)).unwrap();
 ///
 /// // Traverse directories
 /// for entry in fs.read_dir("/etc").unwrap() {
@@ -78,7 +78,7 @@ impl<I: Image> EroFS<I> {
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let image = MmapImage::new_from_path("image.erofs")?;
-    /// let fs = EroFS::new(image.into())?;
+    /// let fs = EroFS::new(image)?;
     /// # Ok(())
     /// # }
     /// ```

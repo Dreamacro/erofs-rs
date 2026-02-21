@@ -6,19 +6,19 @@
 //! - [`MmapImage`]: Memory-mapped files (requires `std` feature)
 //! - [`SliceImage`]: Raw byte slices (available in `no_std` mode)
 //!
-//! The [`Image`] trait defines the common interface that all backends must implement,
-//! and the [`Backend`] enum uses `enum_dispatch` for efficient dynamic dispatch.
+//! The [`Image`] trait defines the common interface that all backend implementations
+//! must implement.
 //!
 //! # Examples
 //!
 //! ## Using mmap backend (std)
 //!
 //! ```no_run
-//! use erofs_rs::backend::MmapImage;
+//! use erofs_rs::{EroFS, backend::MmapImage};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! let image = MmapImage::new_from_path("image.erofs")?;
-//! let backend = image.into();
+//! let fs = EroFS::new(image)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -26,10 +26,10 @@
 //! ## Using slice backend (no_std)
 //!
 //! ```
-//! use erofs_rs::backend::{Backend, SliceImage};
+//! use erofs_rs::{EroFS, backend::SliceImage};
 //!
 //! let data: &[u8] = &[/* EROFS image data */];
-//! let backend = Backend::Slice(SliceImage::new(data));
+//! let fs = EroFS::new(SliceImage::new(data)).unwrap();
 //! ```
 
 use binrw::io::Cursor;

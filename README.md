@@ -21,7 +21,7 @@ use erofs_rs::{EroFS, backend::MmapImage};
 
 fn main() -> erofs_rs::Result<()> {
     let image = MmapImage::new_from_path("system.erofs")?;
-    let fs = EroFS::new(image.into())?;
+    let fs = EroFS::new(image)?;
 
     // Read file
     let mut file = fs.open("/etc/os-release")?;
@@ -43,12 +43,12 @@ fn main() -> erofs_rs::Result<()> {
 #![no_std]
 
 extern crate alloc;
-use erofs_rs::{EroFS, backend::{Backend, SliceImage}};
+use erofs_rs::{EroFS, backend::SliceImage};
 
 fn main() -> erofs_rs::Result<()> {
     // Assuming you have the EROFS image data in memory
     let image_data: &'static [u8] = include_bytes!("system.erofs");
-    let fs = EroFS::new(Backend::Slice(SliceImage::new(image_data)))?;
+    let fs = EroFS::new(SliceImage::new(image_data))?;
 
     // List directory entries
     for entry in fs.read_dir("/etc")? {

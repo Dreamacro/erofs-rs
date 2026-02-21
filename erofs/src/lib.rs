@@ -19,7 +19,7 @@
 //! use erofs_rs::{EroFS, backend::MmapImage};
 //!
 //! let image = MmapImage::new_from_path("image.erofs").unwrap();
-//! let fs = EroFS::new(image.into()).unwrap();
+//! let fs = EroFS::new(image).unwrap();
 //!
 //! // Read a file
 //! let mut file = fs.open("/etc/passwd").unwrap();
@@ -31,11 +31,11 @@
 //!
 //! ```no_run
 //! # extern crate alloc;
-//! use erofs_rs::{EroFS, backend::{Backend, SliceImage}};
+//! use erofs_rs::{EroFS, backend::SliceImage};
 //!
 //! // Assuming you have the EROFS image data in memory
 //! let image_data: &'static [u8] = &[/* ... */];
-//! let fs = EroFS::new(Backend::Slice(SliceImage::new(image_data))).unwrap();
+//! let fs = EroFS::new(SliceImage::new(image_data)).unwrap();
 //!
 //! // List directory entries
 //! for entry in fs.read_dir("/etc").unwrap() {
