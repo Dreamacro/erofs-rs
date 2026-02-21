@@ -1,16 +1,18 @@
-use std::path::Path;
+use alloc::vec::Vec;
 
+use crate::backend::Image;
 use crate::dirent::DirEntry;
 use crate::{EroFS, dirent::ReadDir};
 use crate::{Error, Result, types::Inode};
+use typed_path::UnixPath;
 
 /// An iterator for recursively walking a directory tree.
 ///
 /// Created by [`EroFS::walk_dir`] or [`EroFS::read_dir`].
 #[derive(Debug)]
-pub struct WalkDir<'a> {
-    erofs: &'a EroFS,
-    dir_stack: Vec<(usize, ReadDir<'a>)>,
+pub struct WalkDir<'a, I: Image> {
+    erofs: &'a EroFS<I>,
+    dir_stack: Vec<(usize, ReadDir<'a, I>)>,
     max_depth: usize,
 }
 
@@ -24,8 +26,8 @@ pub struct WalkDirEntry {
     pub inode: Inode,
 }
 
-impl<'a> WalkDir<'a> {
-    pub(crate) fn new<P: AsRef<Path>>(erofs: &'a EroFS, root: P) -> Result<Self> {
+impl<'a, I: Image> WalkDir<'a, I> {
+    pub(crate) fn new<P: AsRef<UnixPath>>(erofs: &'a EroFS<I>, root: P) -> Result<Self> {
         let read_dir = {
             let inode = erofs
                 .get_path_inode(&root)?
@@ -88,7 +90,7 @@ impl<'a> WalkDir<'a> {
     }
 }
 
-impl Iterator for WalkDir<'_> {
+impl<'a, I: Image> Iterator for WalkDir<'a, I> {
     type Item = Result<WalkDirEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {

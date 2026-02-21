@@ -1,8 +1,21 @@
-use std::{cmp, io::Read};
+#[cfg(feature = "std")]
+use std::{
+    cmp, format,
+    io::{Read, Result},
+};
+
+#[cfg(not(feature = "std"))]
+use crate::Result;
 
 use bytes::Bytes;
 
-use crate::{EroFS, types::Inode};
+use crate::{EroFS, backend::Image, types::Inode};
+
+#[cfg(not(feature = "std"))]
+/// A trait for reading file contents in `no_std` mode.
+pub trait Read {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+}
 
 /// A handle to a file within an EROFS filesystem.
 ///
@@ -25,15 +38,15 @@ use crate::{EroFS, types::Inode};
 /// file.read_to_end(&mut content).unwrap();
 /// ```
 #[derive(Debug)]
-pub struct File {
+pub struct File<'a, I: Image> {
     inode: Inode,
-    erofs: EroFS,
+    erofs: &'a EroFS<I>,
     offset: usize,
     buf: Option<Bytes>,
 }
 
-impl File {
-    pub(crate) fn new(inode: Inode, erofs: EroFS) -> Self {
+impl<'a, I: Image> File<'a, I> {
+    pub(crate) fn new(inode: Inode, erofs: &'a EroFS<I>) -> Self {
         Self {
             inode,
             erofs,
@@ -48,8 +61,8 @@ impl File {
     }
 }
 
-impl Read for File {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl<'a, I: Image> Read for File<'a, I> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         if self.offset >= self.inode.data_size() {
             return Ok(0);
         }

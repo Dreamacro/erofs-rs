@@ -16,7 +16,8 @@ clap = { version = "4", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
 rustix = { version = "1", default-features = false }
 tar = { version = "0.4", default-features = false}
-thiserror = "2"
+thiserror = { version = "2", default-features = false }
+typed-path = { version = "0.12", default-features = false }
 uuid = { version = "1", default-features = false }
 
 [profile.release]

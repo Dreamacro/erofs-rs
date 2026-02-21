@@ -1,9 +1,8 @@
-use std::{fs::File, os::unix::fs::PermissionsExt, path::Path, time::UNIX_EPOCH};
+use std::{fs::File, os::unix::fs::PermissionsExt, time::UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Args;
-use erofs_rs::EroFS;
-use memmap2::Mmap;
+use erofs_rs::{EroFS, backend::MmapImage};
 use tar::Header;
 
 #[derive(Args, Debug)]
@@ -18,18 +17,17 @@ pub struct ConvertArgs {
 }
 
 pub fn convert(args: ConvertArgs) -> Result<()> {
-    let file = File::open(args.path)?;
-    let file = unsafe { Mmap::map(&file) }?;
-    let fs = EroFS::new(file)?;
+    let image = MmapImage::new_from_path(args.path)?;
+    let fs = EroFS::new(image)?;
 
     let out_file = File::create(args.output)?;
     let mut tar = tar::Builder::new(out_file);
 
-    for entry in fs.walk_dir(Path::new(&args.root))? {
+    for entry in fs.walk_dir(args.root)? {
         let entry = entry.context("read entry failed")?;
 
         let mut header = Header::new_gnu();
-        header.set_path(entry.dir_entry.path().strip_prefix("/")?)?;
+        header.set_path(entry.dir_entry.path().strip_prefix("/")?.to_string())?;
         header.set_mode(entry.inode.permissions().mode());
         if let Some(time) = entry.inode.modified() {
             header.set_mtime(time.duration_since(UNIX_EPOCH)?.as_secs());
