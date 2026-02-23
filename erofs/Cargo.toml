@@ -9,7 +9,7 @@ repository = "https://github.com/Dreamacro/erofs-rs"
 keywords = ["erofs", "filesystem", "readonly", "linux"]
 categories = ["filesystem"]
 readme = "../README.md"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [lints]
 workspace = true
