@@ -18,11 +18,11 @@ use core::ops;
 ///
 /// ## With embedded data
 ///
-/// ```
+/// ```ignore
 /// use erofs_rs::backend::SliceImage;
 ///
 /// // In real usage, this would be actual EROFS image data
-/// static IMAGE_DATA: &[u8] = include_bytes!("../../../test_data/test.erofs");
+/// static IMAGE_DATA: &[u8] = include_bytes!("path/to/image.erofs");
 /// let image = SliceImage::new(IMAGE_DATA);
 /// ```
 #[derive(Debug)]

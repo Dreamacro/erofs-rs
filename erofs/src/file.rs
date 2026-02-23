@@ -27,11 +27,10 @@ pub trait Read {
 /// ```no_run
 /// use std::io::Read;
 /// use erofs_rs::EroFS;
-/// # use memmap2::Mmap;
-/// # use std::fs::File;
-/// # let file = File::open("image.erofs").unwrap();
-/// # let mmap = unsafe { Mmap::map(&file) }.unwrap();
-/// # let fs = EroFS::new(mmap).unwrap();
+/// use erofs_rs::backend::MmapImage;
+///
+/// let image = MmapImage::new_from_path("image.erofs").unwrap();
+/// let fs = EroFS::new(image).unwrap();
 ///
 /// let mut file = fs.open("/etc/passwd").unwrap();
 /// let mut content = Vec::new();

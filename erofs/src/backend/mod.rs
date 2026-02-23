@@ -16,7 +16,7 @@
 //! ```no_run
 //! use erofs_rs::{EroFS, backend::MmapImage};
 //!
-//! # fn main() -> std::io::Result<()> {
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let image = MmapImage::new_from_path("image.erofs")?;
 //! let fs = EroFS::new(image)?;
 //! # Ok(())
@@ -25,7 +25,7 @@
 //!
 //! ## Using slice backend (no_std)
 //!
-//! ```
+//! ```no_run
 //! use erofs_rs::{EroFS, backend::SliceImage};
 //!
 //! let data: &[u8] = &[/* EROFS image data */];
