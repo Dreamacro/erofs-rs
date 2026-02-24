@@ -1,91 +1,47 @@
-use alloc::{format, string::ToString, sync::Arc};
-use typed_path::Component;
+use alloc::{format, string::ToString};
 
 use binrw::BinRead;
 use binrw::BinReaderExt;
-use bytes::Buf;
-use typed_path::{UnixComponent, UnixPath};
+use binrw::io::Cursor;
 
-use crate::backend::Image;
-use crate::dirent;
-use crate::file::File;
 use crate::types::*;
-use crate::walkdir::WalkDir;
 use crate::{Error, Result};
 
-/// The main entry point for reading EROFS filesystem images.
+/// Shared core data and pure computation logic for EROFS filesystem.
 ///
-/// `EroFS` provides methods to traverse directories, open files, and access
-/// filesystem metadata from EROFS images. It supports both standard (mmap-based)
-/// and no_std (slice-based) backends.
-///
-/// # Examples
-///
-/// ## Standard usage with mmap
-///
-/// ```no_run
-/// use std::io::Read;
-/// use erofs_rs::{EroFS, backend::MmapImage};
-///
-/// let image = MmapImage::new_from_path("image.erofs").unwrap();
-/// let fs = EroFS::new(image).unwrap();
-///
-/// let mut file = fs.open("/etc/passwd").unwrap();
-/// let mut content = String::new();
-/// file.read_to_string(&mut content).unwrap();
-/// ```
-///
-/// ## no_std usage with byte slice
-///
-/// ```no_run
-/// # extern crate alloc;
-/// use erofs_rs::{EroFS, backend::SliceImage};
-///
-/// let image_data: &'static [u8] = &[/* EROFS image data */];
-/// let fs = EroFS::new(SliceImage::new(image_data)).unwrap();
-///
-/// // Traverse directories
-/// for entry in fs.read_dir("/etc").unwrap() {
-///     let entry = entry.unwrap();
-///     // Process directory entry...
-/// }
-/// ```
+/// This struct is used by both sync and async `EroFS` implementations
+/// to avoid duplicating parsing and calculation logic.
 #[derive(Debug, Clone)]
-pub struct EroFS<I: Image> {
-    image: Arc<I>,
-    super_block: SuperBlock,
-    block_size: usize,
+pub(crate) struct EroFSCore {
+    pub(crate) super_block: SuperBlock,
+    pub(crate) block_size: usize,
 }
 
-impl<I: Image> EroFS<I> {
-    /// Creates a new `EroFS` instance from a backend image source.
+/// Describes a planned block read operation.
+///
+/// Used by both sync and async implementations to share the layout
+/// calculation logic, while keeping the actual I/O separate.
+pub(crate) enum BlockPlan {
+    /// A direct read: read `size` bytes at `offset`.
+    Direct { offset: usize, size: usize },
+    /// A two-phase read for chunk-based layout:
+    /// 1. Read 4 bytes at `addr_offset` to get chunk address
+    /// 2. Call `resolve_chunk_read()` with the chunk address
+    Chunked {
+        addr_offset: usize,
+        chunk_fixed: usize,
+        data_size: usize,
+        chunk_index: usize,
+        chunk_count: usize,
+    },
+}
+
+impl EroFSCore {
+    /// Parse and validate a superblock from raw bytes.
     ///
-    /// The backend can be either a memory-mapped file ([`MmapImage`](crate::backend::MmapImage))
-    /// in std environments, or a byte slice ([`SliceImage`](crate::backend::SliceImage)) in
-    /// no_std environments.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The superblock cannot be read
-    /// - The magic number doesn't match EROFS format (0xE0F5E1E2)
-    /// - The block size is invalid (must be 2^n where 9 ≤ n ≤ 24)
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use erofs_rs::{EroFS, backend::MmapImage};
-    ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let image = MmapImage::new_from_path("image.erofs")?;
-    /// let fs = EroFS::new(image)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn new(image: I) -> Result<Self> {
-        let mut cursor = image.get_cursor(SUPER_BLOCK_OFFSET).ok_or_else(|| {
-            Error::InvalidSuperblock("failed to read super block from mmap".to_string())
-        })?;
+    /// `data` should be the bytes starting at `SUPER_BLOCK_OFFSET`.
+    pub(crate) fn new(data: &[u8]) -> Result<Self> {
+        let mut cursor = Cursor::new(data);
         let super_block = SuperBlock::read(&mut cursor)?;
 
         let magic_number = super_block.magic;
@@ -105,77 +61,17 @@ impl<I: Image> EroFS<I> {
             )));
         }
 
-        let block_size = 1u64 << blk_size_bits;
-
+        let block_size = 1usize << blk_size_bits;
         Ok(Self {
-            image: image.into(),
             super_block,
-            block_size: block_size as usize,
+            block_size,
         })
     }
 
-    /// Recursively walks a directory tree starting from the given path.
-    ///
-    /// Returns an iterator that yields all entries (files and directories)
-    /// under the specified root path.
-    pub fn walk_dir<P: AsRef<UnixPath>>(&self, root: P) -> Result<WalkDir<'_, I>> {
-        WalkDir::new(self, root)
-    }
-
-    /// Lists the immediate contents of a directory.
-    ///
-    /// This is equivalent to `walk_dir` with `max_depth(1)`.
-    pub fn read_dir<P: AsRef<UnixPath>>(&self, path: P) -> Result<WalkDir<'_, I>> {
-        Ok(WalkDir::new(self, path)?.max_depth(1))
-    }
-
-    /// Opens a file at the given path for reading.
-    ///
-    /// The returned [`File`] implements [`std::io::Read`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the path doesn't exist or is not a regular file.
-    pub fn open<P: AsRef<UnixPath>>(&self, path: P) -> Result<File<'_, I>> {
-        let inode = self
-            .get_path_inode(&path)?
-            .ok_or_else(|| Error::PathNotFound(path.as_ref().to_string_lossy().into_owned()))?;
-
-        self.open_inode_file(inode)
-    }
-
-    /// Opens a file from an inode directly.
-    ///
-    /// This is useful when you already have an inode from directory traversal.
-    pub fn open_inode_file(&self, inode: Inode) -> Result<File<'_, I>> {
-        if !inode.is_file() {
-            return Err(Error::NotAFile(format!(
-                "inode {} is not a regular file",
-                inode.id()
-            )));
-        }
-
-        Ok(File::new(inode, self))
-    }
-
-    /// Returns a reference to the filesystem superblock.
-    pub fn super_block(&self) -> &SuperBlock {
-        &self.super_block
-    }
-
-    pub(crate) fn block_size(&self) -> usize {
-        self.block_size
-    }
-
-    pub fn get_inode(&self, nid: u64) -> Result<Inode> {
-        let offset = self.get_inode_offset(nid) as usize;
-
-        let mut inode_buf = self
-            .image
-            .get_cursor(offset)
-            .ok_or_else(|| Error::OutOfBounds("failed to read inode format".to_string()))?;
-
-        let layout = inode_buf.read_le()?;
+    /// Parse an inode from raw bytes.
+    pub(crate) fn parse_inode(&self, data: &[u8], nid: u64) -> Result<Inode> {
+        let mut inode_buf = Cursor::new(data);
+        let layout: u16 = inode_buf.read_le()?;
         inode_buf.set_position(0);
         if Inode::is_compact_format(layout) {
             let inode = InodeCompact::read(&mut inode_buf)?;
@@ -186,7 +82,12 @@ impl<I: Image> EroFS<I> {
         }
     }
 
-    pub(crate) fn get_inode_block(&self, inode: &Inode, offset: usize) -> Result<&[u8]> {
+    /// Plan a block read operation for the given inode and offset.
+    ///
+    /// Returns a `BlockPlan` describing what bytes to read.
+    /// For `BlockPlan::Chunked`, the caller must perform an additional
+    /// read and call `resolve_chunk_read()`.
+    pub(crate) fn plan_inode_block_read(&self, inode: &Inode, offset: usize) -> Result<BlockPlan> {
         match inode.layout()? {
             Layout::FlatPlain => {
                 let block_count = inode.data_size().div_ceil(self.block_size);
@@ -198,11 +99,7 @@ impl<I: Image> EroFS<I> {
                 let size = inode.data_size();
                 let offset = self.block_offset(inode.raw_block_addr()) as usize
                     + (block_index * self.block_size);
-                let data = self
-                    .image
-                    .get(offset..offset + size)
-                    .ok_or_else(|| Error::OutOfBounds("failed to get inode data".to_string()))?;
-                Ok(data)
+                Ok(BlockPlan::Direct { offset, size })
             }
             Layout::FlatInline => {
                 let block_count = inode.data_size().div_ceil(self.block_size);
@@ -213,23 +110,19 @@ impl<I: Image> EroFS<I> {
 
                 if block_count != 0 && block_index == block_count - 1 {
                     // tail block
-                    let offset = self.get_inode_offset(inode.id());
+                    let inode_offset = self.get_inode_offset(inode.id());
                     let buf_size = inode.data_size() % self.block_size;
-                    let offset = offset as usize + inode.size() + inode.xattr_size();
-                    let data = self.image.get(offset..offset + buf_size).ok_or_else(|| {
-                        Error::OutOfBounds("failed to get inode tail data".to_string())
-                    })?;
-                    return Ok(data);
+                    let offset = inode_offset as usize + inode.size() + inode.xattr_size();
+                    return Ok(BlockPlan::Direct {
+                        offset,
+                        size: buf_size,
+                    });
                 }
 
                 let offset = self.block_offset(inode.raw_block_addr()) as usize
                     + (block_index * self.block_size);
                 let len = self.block_size.min(inode.data_size());
-                let buf = self
-                    .image
-                    .get(offset..offset + len)
-                    .ok_or_else(|| Error::OutOfBounds("failed to get inode data".to_string()))?;
-                Ok(buf)
+                Ok(BlockPlan::Direct { offset, size: len })
             }
             Layout::CompressedFull | Layout::CompressedCompact => {
                 Err(Error::NotSupported("compressed compact layout".to_string()))
@@ -242,7 +135,6 @@ impl<I: Image> EroFS<I> {
                         inode.raw_block_addr()
                     )));
                 } else if chunk_format.is_indexes() {
-                    // don't support chunk indexes yet
                     return Err(Error::NotSupported(
                         "chunk based format with indexes".to_string(),
                     ));
@@ -257,72 +149,53 @@ impl<I: Image> EroFS<I> {
                     return Err(Error::OutOfRange(chunk_index, chunk_count));
                 }
 
-                let offset = self.get_inode_offset(inode.id());
-                let offset =
-                    offset as usize + inode.size() + inode.xattr_size() + (chunk_index * 4);
-                let chunk_addr = self
-                    .image
-                    .get(offset..offset + 4)
-                    .ok_or_else(|| Error::OutOfBounds("failed to get chunk address".to_string()))?
-                    .get_i32_le();
+                let inode_offset = self.get_inode_offset(inode.id());
+                let addr_offset =
+                    inode_offset as usize + inode.size() + inode.xattr_size() + (chunk_index * 4);
 
-                let chunk_size = if chunk_index == chunk_count - 1 {
-                    inode.data_size() % self.block_size
-                } else {
-                    self.block_size
-                };
-
-                if chunk_addr <= 0 {
-                    return Err(Error::CorruptedData(
-                        "sparse chunks are not supported".to_string(),
-                    ));
-                }
-
-                let offset = self.block_offset(chunk_addr as u32 + chunk_fixed as u32) as usize;
-                let data = self
-                    .image
-                    .get(offset..offset + chunk_size)
-                    .ok_or_else(|| Error::OutOfBounds("failed to get inode data".to_string()))?;
-
-                Ok(data)
+                Ok(BlockPlan::Chunked {
+                    addr_offset,
+                    chunk_fixed,
+                    data_size: inode.data_size(),
+                    chunk_index,
+                    chunk_count,
+                })
             }
         }
     }
 
-    pub(crate) fn get_path_inode<P: AsRef<UnixPath>>(&self, path: P) -> Result<Option<Inode>> {
-        let mut nid = self.super_block.root_nid as u64;
+    /// Resolve the final read offset and size for a chunk-based block read.
+    ///
+    /// `chunk_addr` is the i32 value read from `addr_offset` in the `Chunked` plan.
+    pub(crate) fn resolve_chunk_read(
+        &self,
+        chunk_addr: i32,
+        chunk_fixed: usize,
+        data_size: usize,
+        chunk_index: usize,
+        chunk_count: usize,
+    ) -> Result<(usize, usize)> {
+        let chunk_size = if chunk_index == chunk_count - 1 {
+            data_size % self.block_size
+        } else {
+            self.block_size
+        };
 
-        let path = path.as_ref().normalize();
-        'outer: for part in path.components() {
-            if part == UnixComponent::RootDir {
-                continue;
-            }
-
-            let inode = self.get_inode(nid)?;
-            let block_count = inode.data_size().div_ceil(self.block_size);
-            if block_count == 0 {
-                return Ok(None);
-            }
-
-            for i in 0..block_count {
-                let block = self.get_inode_block(&inode, i)?;
-                if let Some(found_nid) = dirent::find_nodeid_by_name(part.as_bytes(), block)? {
-                    nid = found_nid;
-                    continue 'outer;
-                }
-            }
-            return Ok(None);
+        if chunk_addr <= 0 {
+            return Err(Error::CorruptedData(
+                "sparse chunks are not supported".to_string(),
+            ));
         }
 
-        let inode = self.get_inode(nid)?;
-        Ok(Some(inode))
+        let offset = self.block_offset(chunk_addr as u32 + chunk_fixed as u32) as usize;
+        Ok((offset, chunk_size))
     }
 
-    fn get_inode_offset(&self, nid: u64) -> u64 {
+    pub(crate) fn get_inode_offset(&self, nid: u64) -> u64 {
         self.block_offset(self.super_block.meta_blk_addr) + (nid * InodeCompact::size() as u64)
     }
 
-    fn block_offset(&self, block: u32) -> u64 {
+    pub(crate) fn block_offset(&self, block: u32) -> u64 {
         (block as u64) << self.super_block.blk_size_bits
     }
 }

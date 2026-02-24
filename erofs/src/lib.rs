@@ -51,15 +51,14 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod r#async;
 pub mod backend;
-mod dirent;
+pub(crate) mod dirent;
 mod error;
-pub mod file;
-pub mod filesystem;
+pub(crate) mod filesystem;
+pub mod sync;
 pub mod types;
-pub mod walkdir;
 
-pub use dirent::{DirEntry, ReadDir};
+pub use dirent::DirEntry;
 pub use error::*;
-pub use filesystem::EroFS;
-pub use walkdir::{WalkDir, WalkDirEntry};
+pub use sync::{EroFS, ReadDir, WalkDir, WalkDirEntry};

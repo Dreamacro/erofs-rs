@@ -33,12 +33,19 @@
 //! ```
 
 use binrw::io::Cursor;
-use core::ops;
+use core::{future::Future, ops};
+
+use super::Result;
 
 #[cfg(feature = "std")]
 mod mmap;
 #[cfg(feature = "std")]
 pub use mmap::MmapImage;
+
+#[cfg(all(feature = "std", feature = "opendal"))]
+mod opendal;
+#[cfg(all(feature = "std", feature = "opendal"))]
+pub use opendal::OpendalImage;
 
 mod slice;
 pub use slice::SliceImage;
@@ -79,4 +86,44 @@ pub trait Image {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// A trait for asynchronously accessing EROFS image data from various sources.
+///
+/// This trait provides an async interface for reading data from different
+/// backend types. Implementations should offload blocking I/O to appropriate
+/// thread pools to avoid blocking async runtimes.
+///
+/// # Examples
+///
+/// ```no_run
+/// use erofs_rs::backend::AsyncImage;
+/// use erofs_rs::Result;
+/// use std::future::Future;
+///
+/// struct MyAsyncImage;
+///
+/// impl AsyncImage for MyAsyncImage {
+///     async fn read_at(&self, buf: &mut [u8], offset: usize) -> Result<usize> {
+///         // Implementation here
+///         Ok(0)
+///     }
+/// }
+/// ```
+pub trait AsyncImage {
+    /// Asynchronously reads data from the image at a specific offset.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The buffer to read data into
+    /// * `offset` - The byte offset in the image to start reading from
+    ///
+    /// # Returns
+    ///
+    /// The number of bytes read on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read operation fails.
+    fn read_at(&self, buf: &mut [u8], offset: usize) -> impl Future<Output = Result<usize>>;
 }

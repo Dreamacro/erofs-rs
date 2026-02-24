@@ -35,6 +35,14 @@ pub enum Error {
 
     #[error("corrupted data: {0}")]
     CorruptedData(String),
+
+    #[cfg(feature = "std")]
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[cfg(feature = "opendal")]
+    #[error("opendal error: {0}")]
+    Opendal(#[from] opendal::Error),
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

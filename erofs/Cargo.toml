@@ -24,6 +24,7 @@ std = [
   "rustix/std",
   "typed-path/std",
 ]
+opendal = ["dep:opendal"]
 
 [dependencies]
 binrw = { workspace = true }
@@ -32,4 +33,5 @@ bytes = { workspace = true }
 memmap2 = { workspace = true, default-features = true, optional = true }
 rustix = { workspace = true, features = ["fs"] }
 thiserror = { workspace = true }
+opendal = { workspace = true, optional = true }
 typed-path = { workspace = true }

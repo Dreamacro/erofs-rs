@@ -2,12 +2,11 @@ use alloc::string::{String, ToString};
 use core::{cmp, hint};
 
 use binrw::{BinRead, io::Cursor};
-use typed_path::{UnixPath, UnixPathBuf};
+use typed_path::UnixPathBuf;
 
-use crate::backend::Image;
 use crate::{
-    EroFS, Error, Result,
-    types::{Dirent, DirentFileType, Inode},
+    Error, Result,
+    types::{Dirent, DirentFileType},
 };
 
 pub fn find_nodeid_by_name(name: &[u8], data: &[u8]) -> Result<Option<u64>> {
@@ -80,17 +79,17 @@ pub fn read_nth_dirent(data: &[u8], n: usize) -> Result<Dirent> {
 }
 
 #[derive(Debug)]
-struct DirentBlock<'a> {
-    data: &'a [u8],
+pub(crate) struct DirentBlock<D: AsRef<[u8]>> {
+    data: D,
     root: UnixPathBuf,
     dirent: Dirent,
     i: usize,
     n: usize,
 }
 
-impl<'a> DirentBlock<'a> {
-    fn new(root: UnixPathBuf, data: &'a [u8]) -> Result<Self> {
-        let dirent = read_nth_dirent(data, 0)?;
+impl<D: AsRef<[u8]>> DirentBlock<D> {
+    pub(crate) fn new(root: UnixPathBuf, data: D) -> Result<Self> {
+        let dirent = read_nth_dirent(data.as_ref(), 0)?;
         let n = dirent.name_off as usize / Dirent::size();
         Ok(Self {
             root,
@@ -101,30 +100,31 @@ impl<'a> DirentBlock<'a> {
         })
     }
 
-    pub fn block_size(&self) -> usize {
-        self.data.len()
+    pub(crate) fn block_size(&self) -> usize {
+        self.data.as_ref().len()
     }
 
-    fn next_entry(&mut self) -> Result<Option<DirEntry>> {
+    pub(crate) fn next_entry(&mut self) -> Result<Option<DirEntry>> {
+        let data = self.data.as_ref();
         while self.i < self.n {
             let dirent = self.dirent;
             let name_start = dirent.name_off as usize;
             let name_end = if self.i < self.n - 1 {
-                let dirent = read_nth_dirent(self.data, self.i + 1)?;
+                let dirent = read_nth_dirent(data, self.i + 1)?;
                 self.dirent = dirent;
                 dirent.name_off as usize
             } else {
-                self.data.len()
+                data.len()
             };
 
-            if name_end < name_start || name_end > self.data.len() {
+            if name_end < name_start || name_end > data.len() {
                 return Err(Error::CorruptedData(
                     "invalid directory entry name offset".to_string(),
                 ));
             }
 
             self.i += 1;
-            let name: String = String::from_utf8_lossy(&self.data[name_start..name_end])
+            let name: String = String::from_utf8_lossy(&data[name_start..name_end])
                 .trim_end_matches('\0')
                 .into();
             if name.as_str() == "." || name.as_str() == ".." {
@@ -143,7 +143,7 @@ impl<'a> DirentBlock<'a> {
     }
 }
 
-impl Iterator for DirentBlock<'_> {
+impl<D: AsRef<[u8]>> Iterator for DirentBlock<D> {
     type Item = Result<DirEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -155,68 +155,13 @@ impl Iterator for DirentBlock<'_> {
     }
 }
 
-#[derive(Debug)]
-pub struct ReadDir<'a, I: Image> {
-    dir: UnixPathBuf,
-    inode: Inode,
-    erofs: &'a EroFS<I>,
-    dirent_block: DirentBlock<'a>,
-    offset: usize,
-}
-
-impl<'a, I: Image> ReadDir<'a, I> {
-    pub(crate) fn new<P: AsRef<UnixPath>>(
-        erofs: &'a EroFS<I>,
-        inode: Inode,
-        dir: P,
-    ) -> Result<Self> {
-        let block = erofs.get_inode_block(&inode, 0)?;
-        let dirent_block = DirentBlock::new(dir.as_ref().to_path_buf(), block)?;
-        Ok(Self {
-            dir: dir.as_ref().to_path_buf(),
-            inode,
-            erofs,
-            dirent_block,
-            offset: 0,
-        })
-    }
-
-    fn next_entry(&mut self) -> Result<Option<DirEntry>> {
-        if self.offset >= self.inode.data_size() {
-            return Ok(None);
-        }
-
-        while self.offset < self.inode.data_size() {
-            match self.dirent_block.next_entry()? {
-                Some(entry) => return Ok(Some(entry)),
-                None => {
-                    self.offset += self.dirent_block.block_size();
-                    if self.offset < self.inode.data_size() {
-                        let block = self.erofs.get_inode_block(&self.inode, self.offset)?;
-                        self.dirent_block = DirentBlock::new(self.dir.clone(), block)?;
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-}
-
-impl<'a, I: Image> Iterator for ReadDir<'a, I> {
-    type Item = Result<DirEntry>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.next_entry().transpose()
-    }
-}
-
 /// A directory entry within an EROFS filesystem.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
-    dir: UnixPathBuf,
-    nid: u64,
-    file_type: DirentFileType,
-    file_name: String,
+    pub(crate) dir: UnixPathBuf,
+    pub(crate) nid: u64,
+    pub(crate) file_type: DirentFileType,
+    pub(crate) file_name: String,
 }
 
 impl DirEntry {
