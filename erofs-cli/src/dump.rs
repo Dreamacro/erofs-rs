@@ -1,12 +1,15 @@
 use anyhow::Result;
-use clap::Args;
-
 use chrono::{DateTime, Local};
+use clap::Args;
 use erofs_rs::{
     EroFS,
+    r#async::EroFS as AsyncEroFS,
     backend::MmapImage,
+    backend::OpendalImage,
     types::{SB_EXTSLOT_SIZE, SuperBlock},
 };
+use opendal::{Operator, services};
+use url::{Position, Url};
 use uuid::Uuid;
 
 #[derive(Args, Debug)]
@@ -27,11 +30,19 @@ pub struct DumpArgs {
 // Filesystem features:                          sb_csum mtime xattr_filter
 // Filesystem UUID:                              71bd9ab4-fb8c-47b4-986c-5c901ad547c7
 
-pub fn dump(args: DumpArgs) -> Result<()> {
-    let image = MmapImage::new_from_path(args.path)?;
-    let fs = EroFS::new(image)?;
-
-    let block = fs.super_block();
+pub async fn dump(args: DumpArgs) -> Result<()> {
+    let block = if args.path.starts_with("http") {
+        let u = Url::parse(&args.path)?;
+        let builder = services::Http::default().endpoint(&u[..Position::BeforePath]);
+        let op = Operator::new(builder)?.finish();
+        let image = OpendalImage::new(op, u.path().to_string());
+        let fs = AsyncEroFS::new(image).await?;
+        fs.super_block().to_owned()
+    } else {
+        let image = MmapImage::new_from_path(args.path)?;
+        let fs = EroFS::new(image)?;
+        fs.super_block().to_owned()
+    };
 
     println!(
         "Filesystem magic number:                      {:#X}",

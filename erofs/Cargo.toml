@@ -31,7 +31,7 @@ binrw = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
 memmap2 = { workspace = true, default-features = true, optional = true }
+opendal = { workspace = true, optional = true }
 rustix = { workspace = true, features = ["fs"] }
 thiserror = { workspace = true }
-opendal = { workspace = true, optional = true }
 typed-path = { workspace = true }

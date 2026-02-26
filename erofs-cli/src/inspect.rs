@@ -5,9 +5,12 @@ use chrono::{DateTime, Datelike, Local};
 use clap::{Args, Subcommand};
 use erofs_rs::{
     EroFS,
-    backend::{Image, MmapImage},
+    r#async::EroFS as AsyncEroFS,
+    backend::{AsyncImage, Image, MmapImage, OpendalImage},
     types::Inode,
 };
+use opendal::{Operator, services};
+use url::{Position, Url};
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
@@ -29,13 +32,28 @@ enum InspectSubcommands {
     },
 }
 
-pub fn inspect(args: InspectArgs) -> Result<()> {
-    let image = MmapImage::new_from_path(args.image)?;
-    let fs = EroFS::new(image)?;
+pub async fn inspect(args: InspectArgs) -> Result<()> {
+    if args.image.starts_with("http") {
+        // Async path for remote files
+        let u = Url::parse(&args.image)?;
+        let builder = services::Http::default().endpoint(&u[..Position::BeforePath]);
+        let op = Operator::new(builder)?.finish();
+        let image = OpendalImage::new(op, u.path().to_string());
+        let fs = AsyncEroFS::new(image).await?;
 
-    match args.operation {
-        InspectSubcommands::Ls { path } => ls(&fs, &path)?,
-        InspectSubcommands::Cat { path } => cat(&fs, &path)?,
+        match args.operation {
+            InspectSubcommands::Ls { path } => ls_async(&fs, &path).await?,
+            InspectSubcommands::Cat { path } => cat_async(&fs, &path).await?,
+        }
+    } else {
+        // Sync path for local files
+        let image = MmapImage::new_from_path(args.image)?;
+        let fs = EroFS::new(image)?;
+
+        match args.operation {
+            InspectSubcommands::Ls { path } => ls(&fs, &path)?,
+            InspectSubcommands::Cat { path } => cat(&fs, &path)?,
+        }
     }
 
     Ok(())
@@ -127,5 +145,50 @@ fn cat<I: Image>(fs: &EroFS<I>, path: &str) -> Result<()> {
     }
 
     std::io::copy(&mut file, &mut std::io::stdout())?;
+    Ok(())
+}
+
+async fn ls_async<I: AsyncImage>(fs: &AsyncEroFS<I>, path: &str) -> Result<()> {
+    let mut read_dir = fs
+        .read_dir(path)
+        .await
+        .with_context(|| format!("failed to read directory: {}", path))?;
+
+    while let Some(result) = read_dir.next_entry().await {
+        let entry = result.with_context(|| "failed to read directory entry")?;
+        let inode = entry.inode;
+        println!(
+            "{} {:>8} {} {}",
+            format_mode(&inode),
+            format_size(&inode),
+            format_time(&inode),
+            entry.dir_entry.file_name()
+        );
+    }
+
+    Ok(())
+}
+
+async fn cat_async<I: AsyncImage>(fs: &AsyncEroFS<I>, path: &str) -> Result<()> {
+    let mut file = fs
+        .open(path)
+        .await
+        .with_context(|| format!("failed to open file: {}", path))?;
+
+    if file.size() > 1024 * 1024 {
+        return Err(anyhow::anyhow!("file too large to output (>{} MiB)", 1));
+    }
+
+    let mut buffer = vec![0u8; 4096];
+    let mut stdout = std::io::stdout();
+
+    loop {
+        let n = file.read(&mut buffer).await?;
+        if n == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut stdout, &buffer[..n])?;
+    }
+
     Ok(())
 }

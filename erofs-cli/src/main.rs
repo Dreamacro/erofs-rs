@@ -18,12 +18,13 @@ struct Opt {
     command: Commands,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let opt = Opt::parse();
 
     match opt.command {
-        Commands::Dump(args) => dump::dump(args),
-        Commands::Inspect(args) => inspect::inspect(args),
+        Commands::Dump(args) => dump::dump(args).await,
+        Commands::Inspect(args) => inspect::inspect(args).await,
         Commands::Convert(args) => convert::convert(args),
     }
 }

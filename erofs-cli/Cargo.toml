@@ -18,7 +18,10 @@ chrono = { workspace = true, default-features = false, features = [
     "clock",
 ] }
 clap = { workspace = true, default-features = true, features = ["derive"] }
-erofs-rs = { path = "../erofs" }
+erofs-rs = { path = "../erofs", features = ["opendal"] }
 memmap2 = { workspace = true, default-features = true }
+opendal = { workspace = true, default-features = true, features = ["services-http"] }
 tar = { workspace = true, default-features = true }
+tokio = { workspace = true, default-features = true, features = ["full"] }
+url = { workspace = true, default-features = true }
 uuid = { workspace = true, default-features = true }

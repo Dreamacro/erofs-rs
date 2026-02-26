@@ -14,11 +14,13 @@ bytes = { version = "1", default-features = false }
 chrono = { version = "0.4", default-features = false }
 clap = { version = "4", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
+opendal = { version = "0.55", default-features = false }
 rustix = { version = "1", default-features = false }
 tar = { version = "0.4", default-features = false}
 thiserror = { version = "2", default-features = false }
-opendal = { version = "0.55", default-features = false }
+tokio = { version = "1", default-features = false }
 typed-path = { version = "0.12", default-features = false }
+url = { version = "2", default-features = false }
 uuid = { version = "1", default-features = false }
 
 [profile.release]

@@ -91,6 +91,13 @@ impl<I: AsyncImage> EroFS<I> {
     pub(crate) async fn read_inode_block(&self, inode: &Inode, offset: usize) -> Result<Vec<u8>> {
         match self.core.plan_inode_block_read(inode, offset)? {
             BlockPlan::Direct { offset, size } => {
+                if size > self.core.block_size {
+                    return Err(Error::CorruptedData(format!(
+                        "invalid direct block size {} at offset {}",
+                        size, offset
+                    )));
+                }
+
                 let mut buf = vec![0u8; size];
                 self.image.read_at(&mut buf, offset).await?;
                 Ok(buf)

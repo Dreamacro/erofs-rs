@@ -1,26 +1,34 @@
-use opendal::Reader;
+use std::io::Read;
+
+use alloc::string::String;
+
+use opendal::{Operator, options::ReadOptions, raw::BytesRange};
 
 use super::AsyncImage;
 use crate::Result;
 
-pub struct OpendalImage(Reader);
+pub struct OpendalImage(Operator, String);
 
 impl OpendalImage {
-    pub fn new(reader: Reader) -> Self {
-        Self(reader)
+    pub fn new(operator: Operator, path: String) -> Self {
+        Self(operator, path)
     }
 }
 
 impl AsyncImage for OpendalImage {
     async fn read_at(&self, buf: &mut [u8], offset: usize) -> Result<usize> {
         let mut slice = &mut buf[..];
-        let n = self.0.read_into(&mut slice, offset as u64..).await?;
+        let n = self
+            .0
+            .read_options(
+                &self.1,
+                ReadOptions {
+                    range: BytesRange::new(offset as _, Some(slice.len() as _)),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .read(&mut slice)?;
         Ok(n)
-    }
-}
-
-impl From<Reader> for OpendalImage {
-    fn from(reader: Reader) -> Self {
-        Self::new(reader)
     }
 }

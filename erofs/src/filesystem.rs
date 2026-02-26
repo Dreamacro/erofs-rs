@@ -181,6 +181,13 @@ impl EroFSCore {
             self.block_size
         };
 
+        if chunk_size > self.block_size {
+            return Err(Error::CorruptedData(format!(
+                "invalid chunk size {} for chunk index {}",
+                chunk_size, chunk_index
+            )));
+        }
+
         if chunk_addr <= 0 {
             return Err(Error::CorruptedData(
                 "sparse chunks are not supported".to_string(),
