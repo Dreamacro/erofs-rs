@@ -51,11 +51,12 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub(crate) mod dirent;
+pub(crate) mod filesystem;
+
 pub mod r#async;
 pub mod backend;
-pub(crate) mod dirent;
 mod error;
-pub(crate) mod filesystem;
 pub mod sync;
 pub mod types;
 

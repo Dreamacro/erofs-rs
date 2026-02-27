@@ -79,7 +79,7 @@ pub fn read_nth_dirent(data: &[u8], n: usize) -> Result<Dirent> {
 }
 
 #[derive(Debug)]
-pub(crate) struct DirentBlock<D: AsRef<[u8]>> {
+pub struct DirentBlock<D: AsRef<[u8]>> {
     data: D,
     root: UnixPathBuf,
     dirent: Dirent,

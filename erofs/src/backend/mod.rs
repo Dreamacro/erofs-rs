@@ -110,7 +110,7 @@ pub trait Image {
 ///     }
 /// }
 /// ```
-pub trait AsyncImage {
+pub trait AsyncImage: Send + Sync {
     /// Asynchronously reads data from the image at a specific offset.
     ///
     /// # Arguments
@@ -125,5 +125,5 @@ pub trait AsyncImage {
     /// # Errors
     ///
     /// Returns an error if the read operation fails.
-    fn read_at(&self, buf: &mut [u8], offset: usize) -> impl Future<Output = Result<usize>>;
+    fn read_at(&self, buf: &mut [u8], offset: usize) -> impl Future<Output = Result<usize>> + Send;
 }

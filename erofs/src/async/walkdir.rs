@@ -25,10 +25,10 @@ pub struct WalkDirEntry {
 }
 
 impl<'a, I: AsyncImage> WalkDir<'a, I> {
-    pub(crate) async fn new<P: AsRef<UnixPath>>(erofs: &'a EroFS<I>, root: P) -> Result<Self> {
+    pub(crate) async fn new(erofs: &'a EroFS<I>, root: impl AsRef<UnixPath>) -> Result<Self> {
         let read_dir = {
             let inode = erofs
-                .get_path_inode(&root)
+                .get_path_inode(root.as_ref())
                 .await?
                 .ok_or_else(|| Error::PathNotFound(root.as_ref().to_string_lossy().into_owned()))?;
 

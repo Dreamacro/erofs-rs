@@ -33,13 +33,13 @@ impl<I: AsyncImage> EroFS<I> {
     }
 
     /// Recursively walks a directory tree starting from the given path.
-    pub async fn walk_dir<P: AsRef<UnixPath>>(&self, root: P) -> Result<WalkDir<'_, I>> {
-        WalkDir::new(self, root).await
+    pub async fn walk_dir(&self, root: impl AsRef<UnixPath>) -> Result<WalkDir<'_, I>> {
+        WalkDir::new(self, root.as_ref()).await
     }
 
     /// Lists the immediate contents of a directory.
-    pub async fn read_dir<P: AsRef<UnixPath>>(&self, path: P) -> Result<WalkDir<'_, I>> {
-        Ok(WalkDir::new(self, path).await?.max_depth(1))
+    pub async fn read_dir(&self, path: impl AsRef<UnixPath>) -> Result<WalkDir<'_, I>> {
+        Ok(WalkDir::new(self, path.as_ref()).await?.max_depth(1))
     }
 
     /// Opens a file at the given path for reading.
@@ -49,9 +49,9 @@ impl<I: AsyncImage> EroFS<I> {
     /// # Errors
     ///
     /// Returns an error if the path doesn't exist or is not a regular file.
-    pub async fn open<P: AsRef<UnixPath>>(&self, path: P) -> Result<File<'_, I>> {
+    pub async fn open(&self, path: impl AsRef<UnixPath>) -> Result<File<'_, I>> {
         let inode = self
-            .get_path_inode(&path)
+            .get_path_inode(path.as_ref())
             .await?
             .ok_or_else(|| Error::PathNotFound(path.as_ref().to_string_lossy().into_owned()))?;
 
@@ -127,13 +127,10 @@ impl<I: AsyncImage> EroFS<I> {
         }
     }
 
-    pub(crate) async fn get_path_inode<P: AsRef<UnixPath>>(
-        &self,
-        path: P,
-    ) -> Result<Option<Inode>> {
+    pub(crate) async fn get_path_inode(&self, path: &UnixPath) -> Result<Option<Inode>> {
         let mut nid = self.core.super_block.root_nid as u64;
 
-        let path = path.as_ref().normalize();
+        let path = path.normalize();
         'outer: for part in path.components() {
             if part == UnixComponent::RootDir {
                 continue;

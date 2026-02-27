@@ -17,18 +17,17 @@ impl OpendalImage {
 
 impl AsyncImage for OpendalImage {
     async fn read_at(&self, buf: &mut [u8], offset: usize) -> Result<usize> {
-        let mut slice = &mut buf[..];
         let n = self
             .0
             .read_options(
                 &self.1,
                 ReadOptions {
-                    range: BytesRange::new(offset as _, Some(slice.len() as _)),
+                    range: BytesRange::new(offset as _, Some(buf.len() as _)),
                     ..Default::default()
                 },
             )
             .await?
-            .read(&mut slice)?;
+            .read(buf)?;
         Ok(n)
     }
 }

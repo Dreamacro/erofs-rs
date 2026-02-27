@@ -12,7 +12,7 @@ use crate::{Error, Result};
 /// This struct is used by both sync and async `EroFS` implementations
 /// to avoid duplicating parsing and calculation logic.
 #[derive(Debug, Clone)]
-pub(crate) struct EroFSCore {
+pub struct EroFSCore {
     pub(crate) super_block: SuperBlock,
     pub(crate) block_size: usize,
 }
@@ -21,7 +21,7 @@ pub(crate) struct EroFSCore {
 ///
 /// Used by both sync and async implementations to share the layout
 /// calculation logic, while keeping the actual I/O separate.
-pub(crate) enum BlockPlan {
+pub enum BlockPlan {
     /// A direct read: read `size` bytes at `offset`.
     Direct { offset: usize, size: usize },
     /// A two-phase read for chunk-based layout:
