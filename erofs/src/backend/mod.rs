@@ -104,7 +104,7 @@ pub trait Image {
 /// struct MyAsyncImage;
 ///
 /// impl AsyncImage for MyAsyncImage {
-///     async fn read_at(&self, buf: &mut [u8], offset: usize) -> Result<usize> {
+///     async fn read_exact_at(&self, buf: &mut [u8], offset: usize) -> Result<usize> {
 ///         // Implementation here
 ///         Ok(0)
 ///     }
