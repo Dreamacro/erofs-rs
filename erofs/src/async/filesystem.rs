@@ -27,7 +27,9 @@ impl<I: AsyncImage> EroFS<I> {
     /// Creates a new async `EroFS` instance from an async backend image source.
     pub async fn new(image: I) -> Result<Self> {
         let mut super_block = vec![0u8; SuperBlock::size()];
-        image.read_at(&mut super_block, SUPER_BLOCK_OFFSET).await?;
+        image
+            .read_exact_at(&mut super_block, SUPER_BLOCK_OFFSET)
+            .await?;
         let core = EroFSCore::new(&super_block)?;
         Ok(Self { image, core })
     }
@@ -84,7 +86,7 @@ impl<I: AsyncImage> EroFS<I> {
     pub async fn get_inode(&self, nid: u64) -> Result<Inode> {
         let offset = self.core.get_inode_offset(nid) as usize;
         let mut buf = vec![0u8; InodeExtended::size()];
-        self.image.read_at(&mut buf, offset).await?;
+        self.image.read_exact_at(&mut buf, offset).await?;
         self.core.parse_inode(&buf, nid)
     }
 
@@ -99,7 +101,7 @@ impl<I: AsyncImage> EroFS<I> {
                 }
 
                 let mut buf = vec![0u8; size];
-                self.image.read_at(&mut buf, offset).await?;
+                self.image.read_exact_at(&mut buf, offset).await?;
                 Ok(buf)
             }
             BlockPlan::Chunked {
@@ -110,7 +112,7 @@ impl<I: AsyncImage> EroFS<I> {
                 chunk_count,
             } => {
                 let mut addr_buf = vec![0u8; 4];
-                self.image.read_at(&mut addr_buf, addr_offset).await?;
+                self.image.read_exact_at(&mut addr_buf, addr_offset).await?;
                 let chunk_addr = (&addr_buf[..]).get_i32_le();
 
                 let (offset, size) = self.core.resolve_chunk_read(
@@ -121,7 +123,7 @@ impl<I: AsyncImage> EroFS<I> {
                     chunk_count,
                 )?;
                 let mut buf = vec![0u8; size];
-                self.image.read_at(&mut buf, offset).await?;
+                self.image.read_exact_at(&mut buf, offset).await?;
                 Ok(buf)
             }
         }
@@ -143,7 +145,9 @@ impl<I: AsyncImage> EroFS<I> {
             }
 
             for i in 0..block_count {
-                let block = self.read_inode_block(&inode, i).await?;
+                let block = self
+                    .read_inode_block(&inode, i * self.core.block_size)
+                    .await?;
                 if let Some(found_nid) = dirent::find_nodeid_by_name(part.as_bytes(), &block)? {
                     nid = found_nid;
                     continue 'outer;

@@ -43,9 +43,13 @@ impl<'a, I: AsyncImage> File<'a, I> {
 
         if let Some(ref data) = self.buf {
             let offset = self.offset % self.erofs.block_size();
-            let n = cmp::min(buf.len(), data.len().saturating_sub(offset));
+            let data_remaining = data.len().saturating_sub(offset);
+            let n = cmp::min(buf.len(), data_remaining);
             buf[..n].copy_from_slice(&data[offset..offset + n]);
             self.offset += n;
+            if n == data_remaining {
+                self.buf = None;
+            }
             return Ok(n);
         }
 

@@ -201,7 +201,7 @@ impl<I: Image> EroFS<I> {
             }
 
             for i in 0..block_count {
-                let block = self.get_inode_block(&inode, i)?;
+                let block = self.get_inode_block(&inode, i * self.core.block_size)?;
                 if let Some(found_nid) = dirent::find_nodeid_by_name(part.as_bytes(), block)? {
                     nid = found_nid;
                     continue 'outer;

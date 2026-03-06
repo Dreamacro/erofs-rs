@@ -125,5 +125,9 @@ pub trait AsyncImage: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the read operation fails.
-    fn read_at(&self, buf: &mut [u8], offset: usize) -> impl Future<Output = Result<usize>> + Send;
+    fn read_exact_at(
+        &self,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> impl Future<Output = Result<usize>> + Send;
 }
