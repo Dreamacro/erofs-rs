@@ -202,3 +202,89 @@ impl EroFSCore {
         (block as u64) << self.super_block.blk_size_bits
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::size_of;
+
+    fn make_core() -> EroFSCore {
+        let super_block = SuperBlock {
+            magic: MAGIC_NUMBER,
+            checksum: 0,
+            feature_compat: 0,
+            blk_size_bits: 12,
+            ext_slots: 0,
+            root_nid: 0,
+            inos: 0,
+            build_time: 0,
+            build_time_ns: 0,
+            blocks: 0,
+            meta_blk_addr: 0,
+            xattr_blk_addr: 0,
+            uuid: [0; 16],
+            volume_name: [0; 16],
+            feature_incompat: 0,
+            compr_algs: 0,
+            extra_devices: 0,
+            devt_slot_off: 0,
+            dir_blk_bits: 0,
+            xattr_prefix_count: 0,
+            xattr_prefix_start: 0,
+            packed_nid: 0,
+            xattr_filter_res: 0,
+            reserved: [0; 23],
+        };
+
+        EroFSCore {
+            super_block,
+            block_size: 1usize << super_block.blk_size_bits,
+        }
+    }
+
+    fn make_compact_inode(layout: Layout, data_size: u32, xattr_count: u16, inode_data: u32) -> Inode {
+        let format = (layout as u16) << 1;
+        let inode = InodeCompact {
+            format,
+            xattr_count,
+            mode: 0,
+            nlink: 0,
+            size: data_size,
+            reserved: 0,
+            inode_data,
+            inode: 0,
+            uid: 0,
+            gid: 0,
+            reserved2: 0,
+        };
+        Inode::Compact((1, inode))
+    }
+
+    #[test]
+    fn xattr_size_matches_icount_formula() {
+        let inode = make_compact_inode(Layout::FlatInline, 0, 0, 0);
+        assert_eq!(inode.xattr_size(), 0);
+
+        let inode = make_compact_inode(Layout::FlatInline, 0, 1, 0);
+        assert_eq!(inode.xattr_size(), size_of::<XattrHeader>());
+
+        let inode = make_compact_inode(Layout::FlatInline, 0, 2, 0);
+        assert_eq!(inode.xattr_size(), size_of::<XattrHeader>() + size_of::<XattrEntry>());
+    }
+
+    #[test]
+    fn chunk_addr_offset_calculated_correctly() {
+        let core = make_core();
+        let inode = make_compact_inode(Layout::ChunkBased, core.block_size as u32, 0, 0);
+        let plan = core.plan_inode_block_read(&inode, 0).expect("chunk plan");
+
+        match plan {
+            BlockPlan::Chunked { addr_offset, .. } => {
+                let inode_offset = core.get_inode_offset(inode.id()) as usize;
+                let expected = inode_offset + inode.size() + inode.xattr_size();
+                assert_eq!(addr_offset, expected);
+            }
+            _ => panic!("expected chunked plan"),
+        }
+    }
+}

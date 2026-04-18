@@ -185,6 +185,13 @@ impl Inode {
         }
     }
 
+    pub fn xattr_count(&self) -> u16 {
+        match self {
+            Self::Compact((_, n)) => n.xattr_count,
+            Self::Extended((_, n)) => n.xattr_count,
+        }
+    }
+
     pub fn file_type(&self) -> FileType {
         match self {
             Self::Compact((_, n)) => FileType::from_raw_mode(n.mode as _),
