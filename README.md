@@ -121,7 +121,7 @@ erofs-cli inspect -i http://example.com/images/system.erofs cat /etc/os-release
 ### TODO
 
 - [ ] Extended attributes
-- [ ] Compressed data (lz4, lzma, deflate)
+- [-] Compressed data (lz4, lzma, deflate)
 - [ ] Image building (`mkfs.erofs` equivalent)
 
 ## License

@@ -53,6 +53,7 @@ extern crate std;
 
 pub(crate) mod dirent;
 pub(crate) mod filesystem;
+pub(crate) mod decomp;
 
 pub mod r#async;
 pub mod backend;

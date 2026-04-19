@@ -125,6 +125,8 @@ impl EroFSCore {
                 Ok(BlockPlan::Direct { offset, size: len })
             }
             Layout::CompressedFull | Layout::CompressedCompact => {
+                // TODO: Implement VLE index parsing and pcluster decompression
+                // See: decomp module, kernel fs/erofs/zmap.c + zdata.c
                 Err(Error::NotSupported("compressed compact layout".to_string()))
             }
             Layout::ChunkBased => {
