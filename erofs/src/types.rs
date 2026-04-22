@@ -5,6 +5,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use alloc::vec::Vec;
+
 use binrw::BinRead;
 use rustix::fs::FileType;
 
@@ -17,6 +19,9 @@ pub const LAYOUT_CHUNK_FORMAT_BITS: u16 = 0x001F;
 pub const LAYOUT_CHUNK_FORMAT_INDEXES: u16 = 0x0020;
 
 pub const SB_EXTSLOT_SIZE: usize = 16;
+
+/// `feature_compat` flags
+pub const FEATURE_COMPAT_PLAIN_XATTR_PFX: u32 = 0x00000010;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, BinRead)]
@@ -402,6 +407,14 @@ impl ChunkBasedFormat {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Xattr {
+    /// full xattr name: prefix bytes + name suffix bytes, no null terminator
+    /// corresponds to kernel e_name_index prefix + e_name[]
+    pub name: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, BinRead)]
 #[br(little)]
@@ -409,6 +422,13 @@ pub struct XattrHeader {
     pub name_filter: u32,
     pub shared_count: u8,
     pub reserved: [u8; 7],
+}
+
+impl XattrHeader {
+    #[inline]
+    pub const fn size() -> usize {
+        size_of::<Self>()
+    }
 }
 
 #[repr(C)]
@@ -420,19 +440,75 @@ pub struct XattrEntry {
     pub value_len: u16,
 }
 
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy, BinRead)]
-#[br(little)]
-pub struct XattrLongPrefixItem {
-    pub prefix_addr: u32,
-    pub prefix_len: u8,
+impl XattrEntry {
+    #[inline]
+    pub const fn size() -> usize {
+        size_of::<Self>()
+    }
+
+    /// bytes needed to align `body_len` (name_suffix + value) to 4 bytes
+    #[inline]
+    pub fn padding(body_len: usize) -> usize {
+        (Self::size() + body_len).wrapping_neg() & 3
+    }
 }
 
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy, BinRead)]
-#[br(little)]
+/// Runtime representation of a long xattr name prefix entry.
+///
+/// On disk at `xattr_prefix_start << 2`, each entry is a length-prefixed blob:
+/// `[ u16 len ][ u8 base_index ][ infix bytes (len-1) ]`
+///
+/// Corresponds to kernel `erofs_xattr_long_prefix` + `erofs_xattr_prefix_item`.
+#[derive(Debug, Clone)]
 pub struct XattrLongPrefix {
     pub base_index: u8,
+    pub infix: alloc::vec::Vec<u8>,
+}
+
+/// EROFS xattr name index. Corresponds to `EROFS_XATTR_INDEX_*` in erofs_fs.h.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum XattrShortPrefixIndex {
+    User = 1,
+    PosixAclAccess = 2,
+    PosixAclDefault = 3,
+    Trusted = 4,
+    Lustre = 5,
+    Security = 6,
+}
+
+impl XattrShortPrefixIndex {
+    /// bit 7 set → use long prefix table
+    pub const LONG_PREFIX: u8 = 0x80;
+    /// mask to get index into prefix table
+    pub const LONG_PREFIX_MASK: u8 = 0x7f;
+
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::User => "user.",
+            Self::PosixAclAccess => "system.posix_acl_access",
+            Self::PosixAclDefault => "system.posix_acl_default",
+            Self::Trusted => "trusted.",
+            Self::Lustre => "lustre.",
+            Self::Security => "security.",
+        }
+    }
+}
+
+impl TryFrom<u8> for XattrShortPrefixIndex {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::User),
+            2 => Ok(Self::PosixAclAccess),
+            3 => Ok(Self::PosixAclDefault),
+            4 => Ok(Self::Trusted),
+            5 => Ok(Self::Lustre),
+            6 => Ok(Self::Security),
+            v => Err(v),
+        }
+    }
 }
 
 #[repr(C)]

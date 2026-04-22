@@ -1,8 +1,8 @@
-use alloc::{format, string::ToString};
+use alloc::{format, string::ToString, vec::Vec};
 
 use binrw::BinRead;
 use binrw::BinReaderExt;
-use binrw::io::Cursor;
+use binrw::io::{Cursor, Seek, SeekFrom};
 
 use crate::types::*;
 use crate::{Error, Result};
@@ -200,6 +200,134 @@ impl EroFSCore {
 
     pub(crate) fn block_offset(&self, block: u32) -> u64 {
         (block as u64) << self.super_block.blk_size_bits
+    }
+
+    // Xattr
+
+    /// Returns true if the long xattr prefix table is stored directly in the
+    /// main image (COMPAT_PLAIN_XATTR_PFX feature).
+    ///
+    /// When false, prefixes are stored in the packed inode's data instead.
+    /// Corresponds to kernel `erofs_sb_has_plain_xattr_pfx(sbi)`.
+    pub(crate) fn has_plain_xattr_prefix(&self) -> bool {
+        self.super_block.feature_compat & FEATURE_COMPAT_PLAIN_XATTR_PFX != 0
+    }
+
+    /// Byte offset in the image where the long xattr prefix table starts.
+    ///
+    /// Corresponds to kernel: `pos = (erofs_off_t)sbi->xattr_prefix_start << 2`
+    pub(crate) fn xattr_prefix_table_offset(&self) -> usize {
+        (self.super_block.xattr_prefix_start as usize) << 2
+    }
+
+    /// Byte offset in the image for a shared xattr entry by its ID.
+    ///
+    /// Corresponds to kernel:
+    /// `it->pos = erofs_pos(sb, sbi->xattr_blkaddr) + shared_id * sizeof(__le32)`
+    pub(crate) fn shared_xattr_offset(&self, shared_id: u32) -> usize {
+        self.block_offset(self.super_block.xattr_blk_addr) as usize
+            + shared_id as usize * size_of::<u32>()
+    }
+
+    /// Byte offset of the xattr area for an inode.
+    /// = inode start + inode header size
+    /// Corresponds to kernel: `pos = erofs_iloc(inode) + vi->inode_isize`
+    pub(crate) fn xattr_area_offset(&self, inode: &Inode) -> usize {
+        self.get_inode_offset(inode.id()) as usize + inode.size()
+    }
+
+    /// Parse all inline xattr entries for an inode.
+    /// Returns a list of (full name bytes, value bytes).
+    ///
+    /// `data` starts at `xattr_area_offset(inode)` and is at least
+    /// `inode.xattr_size()` bytes long.
+    ///
+    /// Corresponds to kernel `erofs_xattr_iter_inline()` +
+    /// `erofs_listxattr_foreach()`.
+    pub(crate) fn parse_xattrs(&self, inode: &Inode, data: &[u8]) -> Result<Vec<Xattr>> {
+        let total_size = inode.xattr_size();
+        if total_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let xattr_offset = self.xattr_area_offset(inode);
+        let xattr_data = data
+            .get(xattr_offset..xattr_offset + total_size)
+            .ok_or_else(|| {
+                Error::CorruptedData(format!(
+                    "xattr area out of bounds: offset={} size={}",
+                    xattr_offset, total_size
+                ))
+            })?;
+
+        let mut cursor = Cursor::new(xattr_data);
+        let header = XattrHeader::read(&mut cursor)?;
+
+        // read shared_ids manually (variable-length tail of the header)
+        let mut shared_ids = Vec::with_capacity(header.shared_count as usize);
+        for _ in 0..header.shared_count {
+            shared_ids.push(cursor.read_le::<u32>()?);
+        }
+
+        let mut result = Vec::new();
+
+        // shared xattr: each shared_id points to a packed XattrEntry + body
+        // elsewhere in the image
+        for shared_id in &shared_ids {
+            let offset = self.shared_xattr_offset(*shared_id);
+            let shared_data = data.get(offset..).ok_or_else(|| {
+                Error::CorruptedData(format!("shared xattr offset out of bounds: {}", offset))
+            })?;
+            let mut shared_cursor = Cursor::new(shared_data);
+            if let Some(xattr) = Self::read_xattr(&mut shared_cursor)? {
+                result.push(xattr);
+            }
+        }
+
+        // inline xattr entries, each 4-byte aligned
+        while cursor.position() < xattr_data.len() as u64 {
+            if let Some(xattr) = Self::read_xattr(&mut cursor)? {
+                result.push(xattr);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Read a single xattr entry (fixed header + variable name_suffix + value
+    /// + 4-byte padding) from `cursor`, advancing past the padding.
+    ///
+    /// Returns `Ok(None)` for entries that use long prefixes or unknown
+    /// short-prefix indexes (caller chooses to skip them).
+    ///
+    /// Corresponds to one iteration of kernel `erofs_listxattr_foreach()`.
+    fn read_xattr<R: binrw::io::Read + Seek>(cursor: &mut R) -> Result<Option<Xattr>> {
+        let entry = XattrEntry::read_le(cursor)?;
+
+        let mut name_suffix = alloc::vec![0u8; entry.name_len as usize];
+        cursor.read_exact(&mut name_suffix)?;
+
+        let mut value = alloc::vec![0u8; entry.value_len as usize];
+        cursor.read_exact(&mut value)?;
+
+        let padding = XattrEntry::padding(name_suffix.len() + value.len());
+        cursor.seek(SeekFrom::Current(padding as i64))?;
+
+        // long prefix: bit 7 set — not handled in this PR
+        if entry.name_index & XattrShortPrefixIndex::LONG_PREFIX != 0 {
+            return Ok(None);
+        }
+
+        let Ok(name_index) = XattrShortPrefixIndex::try_from(entry.name_index) else {
+            return Ok(None);
+        };
+
+        let prefix = name_index.prefix().as_bytes();
+        let mut name = Vec::with_capacity(prefix.len() + name_suffix.len());
+        name.extend_from_slice(prefix);
+        name.extend_from_slice(&name_suffix);
+
+        Ok(Some(Xattr { name, value }))
     }
 }
 
