@@ -5,19 +5,13 @@ use binrw::BinReaderExt;
 use binrw::io::Cursor;
 use rustix::fs::FileType;
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
 use crate::compression::{CompressedRead, EncodedExtent};
 use crate::types::*;
 use crate::{Error, Result};
 
 // Compression and xattr flags may coexist with readable uncompressed files.
-// The 48-bit and metabox layouts, and all unknown flags, must be rejected.
-const SUPPORTED_INCOMPAT_FEATURES: u32 = 0x007f;
+// Metabox and all unknown flags must be rejected.
+const SUPPORTED_INCOMPAT_FEATURES: u32 = 0x00ff;
 const FEATURE_INCOMPAT_DEVICE_TABLE: u32 = 0x0008;
 
 /// Shared parsing and mapping logic, independent of synchronous/asynchronous I/O.
@@ -43,24 +37,17 @@ pub enum BlockPlan {
         offset_in_block: u64,
         size: usize,
     },
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
     CompressionMetadata {
         offset: u64,
         size: usize,
         reader: CompressedRead,
     },
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
     Encoded(EncodedExtent),
+    /// A range in the special packed inode, never another fragment.
+    Fragment {
+        offset: u64,
+        size: u64,
+    },
 }
 
 impl BlockPlan {
@@ -105,7 +92,7 @@ impl EroFSCore {
         {
             return Err(Error::NotSupported("multiple devices".to_string()));
         }
-        if super_block.build_time_ns >= 1_000_000_000 {
+        if super_block.fixed_nsec >= 1_000_000_000 {
             return Err(Error::InvalidSuperblock(
                 "invalid build time nanoseconds".to_string(),
             ));
@@ -120,10 +107,10 @@ impl EroFSCore {
     /// Validate the format before choosing an on-disk inode structure.
     pub(crate) fn inode_header(data: &[u8]) -> Result<(Layout, usize)> {
         let format: u16 = Cursor::new(data).read_le()?;
-        if format & !0x000f != 0 {
+        if format & !0x001f != 0 {
             return Err(Error::NotSupported(format!(
                 "inode format bits {:#06x}",
-                format & !0x000f
+                format & !0x001f
             )));
         }
         let layout = Layout::try_from(((format & 0x0e) >> 1) as u8)?;
@@ -142,8 +129,10 @@ impl EroFSCore {
             return Err(Error::CorruptedData("truncated inode".to_string()));
         }
         let mut cursor = Cursor::new(data);
-        let (mut inode, raw_data, xattr_count) = if inode_size == InodeCompact::size() {
+        let (mut inode, raw_data, xattr_count, high, wide) = if inode_size == InodeCompact::size() {
             let raw = InodeCompact::read(&mut cursor)?;
+            let nlink_one =
+                raw.format & 0x10 != 0 && !FileType::from_raw_mode(raw.mode.into()).is_dir();
             (
                 Inode {
                     nid,
@@ -152,10 +141,13 @@ impl EroFSCore {
                     mode: raw.mode & 0o7777,
                     uid: u32::from(raw.uid),
                     gid: u32::from(raw.gid),
-                    nlink: u32::from(raw.nlink),
+                    nlink: if nlink_one { 1 } else { u32::from(raw.nlink) },
                     modified: (
-                        self.super_block.build_time as i64,
-                        self.super_block.build_time_ns,
+                        self.super_block
+                            .epoch
+                            .checked_add(i64::from(raw.mtime))
+                            .ok_or(Error::Overflow("compact inode modification time"))?,
+                        self.super_block.fixed_nsec,
                     ),
                     data: InodeData::None,
                     inode_size,
@@ -163,6 +155,8 @@ impl EroFSCore {
                 },
                 raw.inode_data,
                 raw.xattr_count,
+                if nlink_one { raw.nlink } else { 0 },
+                nlink_one,
             )
         } else {
             let raw = InodeExtended::read(&mut cursor)?;
@@ -182,7 +176,19 @@ impl EroFSCore {
                 },
                 raw.inode_data,
                 raw.xattr_count,
+                if self.super_block.feature_incompat & 0x80 != 0 {
+                    raw.nb_blocks_hi
+                } else {
+                    0
+                },
+                self.super_block.feature_incompat & 0x80 != 0,
             )
+        };
+        let start_block = u64::from(raw_data) | (u64::from(high) << 32);
+        let null_block = if wide {
+            (1u64 << 48) - 1
+        } else {
+            u64::from(u32::MAX)
         };
         if inode.modified.1 >= 1_000_000_000 {
             return Err(Error::CorruptedData(
@@ -196,13 +202,9 @@ impl EroFSCore {
         };
         inode.data = match inode.file_type {
             FileType::RegularFile | FileType::Directory | FileType::Symlink => match layout {
-                Layout::FlatPlain if raw_data == u32::MAX => InodeData::Hole,
-                Layout::FlatPlain => InodeData::FlatPlain {
-                    start_block: raw_data,
-                },
-                Layout::FlatInline => InodeData::FlatInline {
-                    start_block: raw_data,
-                },
+                Layout::FlatPlain if start_block == null_block => InodeData::Hole,
+                Layout::FlatPlain => InodeData::FlatPlain { start_block },
+                Layout::FlatInline => InodeData::FlatInline { start_block },
                 Layout::CompressedFull => InodeData::CompressedFull,
                 Layout::CompressedCompact => InodeData::CompressedCompact,
                 Layout::ChunkBased => {
@@ -268,31 +270,14 @@ impl EroFSCore {
                 BlockPlan::direct(offset, size)
             }
             InodeData::FlatPlain { start_block } | InodeData::FlatInline { start_block } => {
-                let offset = self
-                    .block_offset(start_block)
-                    .checked_add(offset)
+                let offset = start_block
+                    .checked_mul(block_size)
+                    .and_then(|start| start.checked_add(offset))
                     .ok_or(Error::Overflow("file block offset"))?;
                 BlockPlan::direct(offset, size)
             }
             InodeData::CompressedFull | InodeData::CompressedCompact => {
-                #[cfg(any(
-                    feature = "lz4",
-                    feature = "lzma",
-                    feature = "deflate",
-                    feature = "zstd"
-                ))]
-                {
-                    CompressedRead::start(self, inode, offset, self.inode_tail_offset(inode)?)
-                }
-                #[cfg(not(any(
-                    feature = "lz4",
-                    feature = "lzma",
-                    feature = "deflate",
-                    feature = "zstd"
-                )))]
-                {
-                    Err(Error::NotSupported("compressed data".to_string()))
-                }
+                CompressedRead::start(self, inode, offset, self.inode_tail_offset(inode)?)
             }
             InodeData::ChunkBased { indexes: true, .. } => Err(Error::NotSupported(
                 "chunk based format with indexes".to_string(),
@@ -326,6 +311,24 @@ impl EroFSCore {
                 inode.id()
             ))),
         }
+    }
+
+    pub(crate) fn plan_fragment(
+        &self,
+        packed: &Inode,
+        offset: u64,
+        size: u64,
+    ) -> Result<BlockPlan> {
+        if !packed.is_file()
+            || offset
+                .checked_add(size)
+                .is_none_or(|end| end > packed.data_size())
+        {
+            return Err(Error::CorruptedData(
+                "fragment outside packed inode".to_string(),
+            ));
+        }
+        self.plan_inode_read(packed, offset)
     }
 
     /// Decode a disk chunk address, resolving the null address to a hole.
@@ -373,37 +376,10 @@ mod tests {
     use core::mem::size_of;
 
     fn make_core() -> EroFSCore {
-        let super_block = SuperBlock {
-            magic: MAGIC_NUMBER,
-            checksum: 0,
-            feature_compat: 0,
-            blk_size_bits: 12,
-            ext_slots: 0,
-            root_nid: 0,
-            inos: 0,
-            build_time: 0,
-            build_time_ns: 0,
-            blocks: 0,
-            meta_blk_addr: 0,
-            xattr_blk_addr: 0,
-            uuid: [0; 16],
-            volume_name: [0; 16],
-            feature_incompat: 0,
-            compr_algs: 0,
-            extra_devices: 0,
-            devt_slot_off: 0,
-            dir_blk_bits: 0,
-            xattr_prefix_count: 0,
-            xattr_prefix_start: 0,
-            packed_nid: 0,
-            xattr_filter_res: 0,
-            reserved: [0; 23],
-        };
-
-        EroFSCore {
-            super_block,
-            block_size: 1u64 << super_block.blk_size_bits,
-        }
+        let mut data = [0; 128];
+        data[..4].copy_from_slice(&MAGIC_NUMBER.to_le_bytes());
+        data[12] = 12;
+        EroFSCore::new(&data).unwrap()
     }
 
     fn make_compact_inode(
@@ -419,6 +395,82 @@ mod tests {
         raw[8..12].copy_from_slice(&data_size.to_le_bytes());
         raw[16..20].copy_from_slice(&inode_data.to_le_bytes());
         make_core().parse_inode(&raw, 1).expect("compact inode")
+    }
+
+    #[test]
+    fn superblock_creation_time_is_distinct_from_compact_inode_epoch() {
+        let mut raw = [0; 128];
+        raw[..4].copy_from_slice(&MAGIC_NUMBER.to_le_bytes());
+        raw[12] = 9;
+        raw[14..16].copy_from_slice(&13u16.to_le_bytes());
+        raw[24..32].copy_from_slice(&(-2i64).to_le_bytes());
+        raw[32..36].copy_from_slice(&123u32.to_le_bytes());
+        raw[36..40].copy_from_slice(&25u32.to_le_bytes());
+        raw[80] = 0x80;
+        raw[108..112].copy_from_slice(&5u32.to_le_bytes());
+        raw[112..120].copy_from_slice(&(1u64 << 35).to_le_bytes());
+        let mut core = EroFSCore::new(&raw).unwrap();
+        assert_eq!(core.super_block.created_unix(), Some((3, 123)));
+        assert_eq!(core.super_block.root_inode_id(), 1 << 35);
+        assert_eq!(core.super_block.block_count(), (13 << 32) | 25);
+        let mut inode = [0; 32];
+        inode[4..6].copy_from_slice(&0o100644u16.to_le_bytes());
+        inode[12] = 1;
+        assert_eq!(
+            core.parse_inode(&inode, 1).unwrap().modified_unix(),
+            (-1, 123)
+        );
+        core.super_block.epoch = i64::MAX;
+        assert!(core.super_block.created_unix().is_none());
+        raw[32..36].copy_from_slice(&1_000_000_000u32.to_le_bytes());
+        assert!(matches!(
+            EroFSCore::new(&raw),
+            Err(Error::InvalidSuperblock(_))
+        ));
+    }
+
+    #[test]
+    fn wide_addresses_root_ids_and_compact_timestamp_deltas() {
+        let mut core = make_core();
+        core.super_block.feature_incompat = 0x80;
+        core.super_block.root_nid = 13;
+        core.super_block.blocks = 25;
+        core.super_block.root_nid_wide = 1 << 35;
+        assert_eq!(core.super_block.root_inode_id(), 1 << 35);
+        assert_eq!(core.super_block.block_count(), (13 << 32) | 25);
+        let mut raw = [0; 64];
+        raw[0] = 1;
+        raw[4..6].copy_from_slice(&0o100644u16.to_le_bytes());
+        raw[6..8].copy_from_slice(&0x1234u16.to_le_bytes());
+        raw[8] = 1;
+        raw[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let inode = core.parse_inode(&raw, 1).unwrap();
+        assert!(
+            matches!(core.plan_inode_read(&inode, 0).unwrap(), BlockPlan::Direct { offset, size: 1 } if offset == 0x1234_ffff_ffff << 12)
+        );
+        raw[6..8].fill(255);
+        assert!(matches!(
+            core.parse_inode(&raw, 1).unwrap().data,
+            InodeData::Hole
+        ));
+        raw[..32].fill(0);
+        raw[0] = 0x10; // Compact nlink=1; former nlink field holds address MSBs.
+        raw[4..6].copy_from_slice(&0o100644u16.to_le_bytes());
+        raw[6] = 2;
+        raw[8] = 1;
+        raw[12] = 3;
+        raw[16] = 3;
+        core.super_block.epoch = -2;
+        let inode = core.parse_inode(&raw, 1).unwrap();
+        assert_eq!((inode.nlink(), inode.modified_unix()), (1, (1, 0)));
+        assert!(
+            matches!(core.plan_inode_read(&inode, 0).unwrap(), BlockPlan::Direct { offset, size: 1 } if offset == ((2u64 << 32) | 3) << 12)
+        );
+        core.super_block.epoch = i64::MAX;
+        assert!(matches!(core.parse_inode(&raw, 1), Err(Error::Overflow(_))));
+        core.super_block.feature_incompat = 0;
+        assert_eq!(core.super_block.root_inode_id(), 13);
+        assert_eq!(core.super_block.block_count(), 25);
     }
 
     #[test]

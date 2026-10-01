@@ -2,11 +2,11 @@ use alloc::{string::ToString, vec::Vec};
 use core::cmp::Ordering;
 
 use binrw::{BinRead, io::Cursor};
-use typed_path::UnixPathBuf;
+use typed_path::{UnixPath, UnixPathBuf};
 
 use crate::{
     Error, Result,
-    types::{Dirent, DirentFileType},
+    types::{Dirent, DirentFileType, Inode},
 };
 
 pub fn find_nodeid_by_name(name: &[u8], data: &[u8]) -> Result<Option<u64>> {
@@ -93,27 +93,21 @@ fn read_nth_dirent(data: &[u8], n: usize) -> Result<Dirent> {
 #[derive(Debug)]
 pub struct DirentBlock<D: AsRef<[u8]>> {
     data: D,
-    root: UnixPathBuf,
     i: usize,
     n: usize,
 }
 
 impl<D: AsRef<[u8]>> DirentBlock<D> {
-    pub(crate) fn new(root: UnixPathBuf, data: D) -> Result<Self> {
+    pub(crate) fn new(data: D) -> Result<Self> {
         let n = validate_dirent_block(data.as_ref())?;
-        Ok(Self {
-            root,
-            data,
-            i: 0,
-            n,
-        })
+        Ok(Self { data, i: 0, n })
     }
 
     pub(crate) fn block_size(&self) -> usize {
         self.data.as_ref().len()
     }
 
-    pub(crate) fn next_entry(&mut self) -> Result<Option<DirEntry>> {
+    pub(crate) fn next_entry(&mut self, root: &UnixPath) -> Result<Option<DirEntry>> {
         let data = self.data.as_ref();
         while self.i < self.n {
             let index = self.i;
@@ -124,7 +118,7 @@ impl<D: AsRef<[u8]>> DirentBlock<D> {
             }
 
             let entry = DirEntry {
-                dir: self.root.clone(),
+                dir: root.to_path_buf(),
                 nid: dirent.nid,
                 file_type: dirent.file_type.try_into()?,
                 file_name: name.to_vec(),
@@ -135,12 +129,15 @@ impl<D: AsRef<[u8]>> DirentBlock<D> {
     }
 }
 
-impl<D: AsRef<[u8]>> Iterator for DirentBlock<D> {
-    type Item = Result<DirEntry>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.next_entry().transpose()
-    }
+/// An entry returned by synchronous or asynchronous directory traversal.
+#[derive(Debug, Clone)]
+pub struct WalkDirEntry {
+    /// The depth relative to the starting directory (1-indexed).
+    pub depth: usize,
+    /// The directory entry containing file name and advisory type.
+    pub dir_entry: DirEntry,
+    /// The inode containing validated file metadata.
+    pub inode: Inode,
 }
 
 /// A directory entry within an EROFS filesystem.

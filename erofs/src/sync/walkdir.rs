@@ -4,7 +4,8 @@ use super::EroFS;
 use super::dirent::ReadDir;
 use crate::backend::Image;
 use crate::dirent::DirEntry;
-use crate::{Error, Result, types::Inode};
+pub use crate::dirent::WalkDirEntry;
+use crate::{Error, Result};
 use typed_path::UnixPath;
 
 /// An iterator for recursively walking a directory tree.
@@ -13,18 +14,8 @@ use typed_path::UnixPath;
 #[derive(Debug)]
 pub struct WalkDir<'a, I: Image> {
     erofs: &'a EroFS<I>,
-    dir_stack: Vec<(usize, ReadDir<'a, I>)>,
+    dir_stack: Vec<ReadDir<'a, I>>,
     max_depth: usize,
-}
-
-/// A single entry returned by [`WalkDir`].
-pub struct WalkDirEntry {
-    /// The depth of this entry relative to the starting directory (1-indexed).
-    pub depth: usize,
-    /// The directory entry containing file name and type.
-    pub dir_entry: DirEntry,
-    /// The inode containing file metadata.
-    pub inode: Inode,
 }
 
 impl<'a, I: Image> WalkDir<'a, I> {
@@ -44,7 +35,7 @@ impl<'a, I: Image> WalkDir<'a, I> {
         };
         Ok(WalkDir {
             erofs,
-            dir_stack: vec![(1, read_dir)],
+            dir_stack: vec![read_dir],
             max_depth: 0,
         })
     }
@@ -61,9 +52,18 @@ impl<'a, I: Image> WalkDir<'a, I> {
     fn get_walk_dir_entry(&mut self, dir_entry: DirEntry, depth: usize) -> Result<WalkDirEntry> {
         let inode = self.erofs.get_inode(dir_entry.nid())?;
 
-        if (depth < self.max_depth || self.max_depth == 0) && inode.is_dir() {
-            let child_dir = ReadDir::new(self.erofs, inode, dir_entry.path())?;
-            self.dir_stack.push((depth + 1, child_dir));
+        if inode.is_dir() {
+            if self
+                .dir_stack
+                .iter()
+                .any(|dir| dir.inode.id() == inode.id())
+            {
+                return Err(Error::CorruptedData("directory cycle".into()));
+            }
+            if depth < self.max_depth || self.max_depth == 0 {
+                let child_dir = ReadDir::new(self.erofs, inode, dir_entry.path())?;
+                self.dir_stack.push(child_dir);
+            }
         }
 
         Ok(WalkDirEntry {
@@ -75,10 +75,8 @@ impl<'a, I: Image> WalkDir<'a, I> {
 
     fn next_entry(&mut self) -> Option<Result<WalkDirEntry>> {
         loop {
-            let (depth, next_item) = {
-                let (depth, dir) = self.dir_stack.last_mut()?;
-                (*depth, dir.next())
-            };
+            let depth = self.dir_stack.len();
+            let next_item = self.dir_stack.last_mut()?.next();
 
             match next_item {
                 Some(Ok(entry)) => return Some(self.get_walk_dir_entry(entry, depth)),

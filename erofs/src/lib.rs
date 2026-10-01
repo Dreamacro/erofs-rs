@@ -5,14 +5,18 @@
 //!
 //! # Features
 //!
-//! - **no_std support**: Can be used in embedded systems with `alloc`
+//! - **no_std support**: Uses `alloc` on supported targets
 //! - **Zero-copy parsing**: Via mmap (std) or byte slices (no_std)
 //! - **Multiple backends**: Memory-mapped files (std) or raw byte slices (no_std)
 //! - **Multiple layouts**: Flat plain, flat inline, and chunk-based data layouts
 //! - **Optional compression**: `lz4`, `lzma` (MicroLZMA), `deflate`, and `zstd` support
-//!   Full/Compact indexes and single-block physical clusters. Only `lzma` requires
-//!   `std`; the other codec features work with `no_std + alloc`. Multi-block pclusters,
-//!   compressed inline tails, fragments and partial references remain unsupported.
+//!   Full/Compact indexes, multi-block pclusters, inline tails, packed fragments,
+//!   partial references, and 4/8/16/32-byte extent records. Non-default logical
+//!   clusters and legacy LZ4 trailing padding are supported. Physical clusters are
+//!   limited to 1 MiB encoded / 12 MiB decoded. Only `lzma` requires `std`; the other
+//!   codec features work with `no_std + alloc` on supported targets. Mapping and
+//!   uncompressed extents do not require codecs. Partial references do not
+//!   necessarily verify unreferenced suffix data or its checksum.
 //!
 //! # Examples
 //!
@@ -59,15 +63,11 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
 pub(crate) mod compression;
 pub(crate) mod dirent;
 pub(crate) mod filesystem;
+#[cfg(test)]
+mod tests;
 
 pub mod r#async;
 pub mod backend;

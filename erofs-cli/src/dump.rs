@@ -54,7 +54,7 @@ pub async fn dump(args: DumpArgs) -> Result<()> {
     );
     println!(
         "Filesystem blocks:                            {}",
-        block.blocks
+        block.block_count()
     );
     println!(
         "Filesystem inode metadata start block:        {}",
@@ -66,7 +66,7 @@ pub async fn dump(args: DumpArgs) -> Result<()> {
     );
     println!(
         "Filesystem root nid:                          {}",
-        block.root_nid
+        block.root_inode_id()
     );
     // println!(
     //     "Filesystem lz4_max_distance:                  {}",
@@ -80,18 +80,13 @@ pub async fn dump(args: DumpArgs) -> Result<()> {
         "Filesystem inode count:                       {}",
         block.inos
     );
-    let created = (block.build_time_ns < 1_000_000_000)
-        .then(|| DateTime::from_timestamp(block.build_time as i64, block.build_time_ns))
-        .flatten()
+    let created = block
+        .created_unix()
+        .and_then(|(seconds, nanos)| DateTime::from_timestamp(seconds, nanos))
         .map(|dt| dt.with_timezone(&Local))
         .and_then(|dt| dt.naive_utc().checked_add_offset(*dt.offset()))
         .map(|dt| dt.format("%a %b %e %H:%M:%S %Y").to_string())
-        .unwrap_or_else(|| {
-            format!(
-                "<invalid timestamp: {}.{}>",
-                block.build_time, block.build_time_ns
-            )
-        });
+        .unwrap_or_else(|| "<invalid timestamp>".to_string());
     println!("Filesystem created:                           {}", created);
     println!(
         "Filesystem features:                          {}",

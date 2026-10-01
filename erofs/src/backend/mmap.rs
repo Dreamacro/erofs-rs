@@ -1,8 +1,4 @@
-use std::{
-    fs, io,
-    ops::{Bound, RangeBounds},
-    path,
-};
+use std::{fs, io, ops::RangeBounds, path};
 
 use memmap2::Mmap;
 
@@ -39,18 +35,7 @@ pub struct MmapImage(Mmap);
 
 impl Image for MmapImage {
     fn get<R: RangeBounds<u64>>(&self, range: R) -> Option<&[u8]> {
-        let start = match range.start_bound() {
-            Bound::Included(&s) => usize::try_from(s).ok()?,
-            Bound::Excluded(&s) => usize::try_from(s).ok()?.checked_add(1)?,
-            Bound::Unbounded => 0,
-        };
-
-        let end = match range.end_bound() {
-            Bound::Included(&e) => usize::try_from(e).ok()?.checked_add(1)?,
-            Bound::Excluded(&e) => usize::try_from(e).ok()?,
-            Bound::Unbounded => self.0.len(),
-        };
-        self.0.get(start..end)
+        super::slice_get(&self.0, range)
     }
 
     fn len(&self) -> u64 {

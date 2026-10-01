@@ -4,24 +4,15 @@ use super::EroFS;
 use super::dirent::ReadDir;
 use crate::backend::AsyncImage;
 use crate::dirent::DirEntry;
-use crate::{Error, Result, types::Inode};
+pub use crate::dirent::WalkDirEntry;
+use crate::{Error, Result};
 use typed_path::UnixPath;
 
 /// An async iterator for recursively walking a directory tree.
 pub struct WalkDir<'a, I: AsyncImage> {
     erofs: &'a EroFS<I>,
-    dir_stack: Vec<(usize, ReadDir<'a, I>)>,
+    dir_stack: Vec<ReadDir<'a, I>>,
     max_depth: usize,
-}
-
-/// A single entry returned by [`WalkDir`].
-pub struct WalkDirEntry {
-    /// The depth of this entry relative to the starting directory (1-indexed).
-    pub depth: usize,
-    /// The directory entry containing file name and type.
-    pub dir_entry: DirEntry,
-    /// The inode containing file metadata.
-    pub inode: Inode,
 }
 
 impl<'a, I: AsyncImage> WalkDir<'a, I> {
@@ -42,7 +33,7 @@ impl<'a, I: AsyncImage> WalkDir<'a, I> {
         };
         Ok(WalkDir {
             erofs,
-            dir_stack: vec![(1, read_dir)],
+            dir_stack: vec![read_dir],
             max_depth: 0,
         })
     }
@@ -63,9 +54,18 @@ impl<'a, I: AsyncImage> WalkDir<'a, I> {
     ) -> Result<WalkDirEntry> {
         let inode = self.erofs.get_inode(dir_entry.nid()).await?;
 
-        if (depth < self.max_depth || self.max_depth == 0) && inode.is_dir() {
-            let child_dir = ReadDir::new(self.erofs, inode, dir_entry.path()).await?;
-            self.dir_stack.push((depth + 1, child_dir));
+        if inode.is_dir() {
+            if self
+                .dir_stack
+                .iter()
+                .any(|dir| dir.inode.id() == inode.id())
+            {
+                return Err(Error::CorruptedData("directory cycle".into()));
+            }
+            if depth < self.max_depth || self.max_depth == 0 {
+                let child_dir = ReadDir::new(self.erofs, inode, dir_entry.path()).await?;
+                self.dir_stack.push(child_dir);
+            }
         }
 
         Ok(WalkDirEntry {
@@ -77,11 +77,8 @@ impl<'a, I: AsyncImage> WalkDir<'a, I> {
 
     pub async fn next_entry(&mut self) -> Option<Result<WalkDirEntry>> {
         loop {
-            let (depth, next_item) = {
-                let (depth, dir) = self.dir_stack.last_mut()?;
-                let next = dir.next_entry().await;
-                (*depth, next)
-            };
+            let depth = self.dir_stack.len();
+            let next_item = self.dir_stack.last_mut()?.next_entry().await;
 
             match next_item {
                 Ok(Some(entry)) => return Some(self.get_walk_dir_entry(entry, depth).await),

@@ -54,6 +54,22 @@ pub use opendal::OpendalImage;
 mod slice;
 pub use slice::SliceImage;
 
+fn slice_get(data: &[u8], range: impl ops::RangeBounds<u64>) -> Option<&[u8]> {
+    use ops::Bound::{Excluded, Included, Unbounded};
+
+    let start = match range.start_bound() {
+        Included(&start) => usize::try_from(start).ok()?,
+        Excluded(&start) => usize::try_from(start).ok()?.checked_add(1)?,
+        Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Included(&end) => usize::try_from(end).ok()?.checked_add(1)?,
+        Excluded(&end) => usize::try_from(end).ok()?,
+        Unbounded => data.len(),
+    };
+    data.get(start..end)
+}
+
 /// A trait for accessing EROFS image data from various sources.
 ///
 /// This trait provides a common interface for reading data from different

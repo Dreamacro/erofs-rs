@@ -6,11 +6,13 @@ A pure Rust library for reading and building [EROFS](https://docs.kernel.org/fil
 
 ## Features
 
-- **no_std support** with `alloc` for embedded systems
+- **no_std support** with `alloc` on supported targets
 - Zero-copy parsing via mmap (std) or byte slices (no_std)
 - Directory traversal and file reading
 - Multiple data layouts: flat plain, flat inline, chunk-based
 - Optional LZ4, MicroLZMA, DEFLATE, and Zstd decoding with shared sync/async mapping and per-file decoded-extent caching
+- Full/Compact compression indexes, multi-block pclusters, inline tails, packed fragments, partial references, and 4/8/16/32-byte extent records
+- Non-default logical cluster sizes and legacy LZ4 trailing padding
 
 ## Usage
 
@@ -124,14 +126,14 @@ erofs-cli inspect -i http://example.com/images/system.erofs cat /etc/os-release
 - [x] Flat plain layout
 - [x] Flat inline layout
 - [x] Chunk-based layout (without chunk indexes)
-- [x] LZ4, MicroLZMA, DEFLATE, and Zstd compressed data (subset described above)
+- [x] LZ4, MicroLZMA, DEFLATE, and Zstd compressed data (layouts and limits above)
 - [x] Directory walk (`walk_dir`)
 - [x] Convert to tar archive
 
 ### TODO
 
 - [ ] Extended attributes
-- [ ] Remaining compression layouts
+- [ ] Indexed chunks, additional devices, and metabox metadata
 - [ ] Image building (`mkfs.erofs` equivalent)
 
 ## License

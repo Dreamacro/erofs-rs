@@ -28,11 +28,13 @@ pub struct SuperBlock {
     pub feature_compat: u32,
     pub blk_size_bits: u8,
     pub ext_slots: u8,
+    /// Legacy root ID, or high block-count bits; use [`Self::root_inode_id`].
     pub root_nid: u16,
     pub inos: u64,
-    /// Raw two's-complement Unix seconds used by compact inodes.
-    pub build_time: u64,
-    pub build_time_ns: u32,
+    /// Base Unix seconds used by compact inode and filesystem timestamps.
+    pub epoch: i64,
+    pub fixed_nsec: u32,
+    /// Low block-count bits; use [`Self::block_count`].
     pub blocks: u32,
     pub meta_blk_addr: u32,
     pub xattr_blk_addr: u32,
@@ -47,10 +49,41 @@ pub struct SuperBlock {
     pub xattr_prefix_start: u32,
     pub packed_nid: u64,
     pub xattr_filter_res: u8,
-    pub reserved: [u8; 23],
+    pub ishare_xattr_prefix_id: u8,
+    pub reserved: [u8; 2],
+    /// Seconds added to `epoch` for the filesystem creation time.
+    pub build_time: u32,
+    pub root_nid_wide: u64,
+    pub reserved2: u64,
 }
 
 impl SuperBlock {
+    /// Filesystem creation time as signed Unix seconds and nanoseconds.
+    /// Returns `None` if the raw fields overflow or contain invalid nanoseconds.
+    pub fn created_unix(&self) -> Option<(i64, u32)> {
+        let seconds = self.epoch.checked_add(i64::from(self.build_time))?;
+        (self.fixed_nsec < 1_000_000_000).then_some((seconds, self.fixed_nsec))
+    }
+
+    /// Root inode ID, including the 64-bit field advertised by the 48-bit feature.
+    pub fn root_inode_id(&self) -> u64 {
+        if self.feature_incompat & 0x80 != 0 && self.root_nid_wide != 0 {
+            self.root_nid_wide
+        } else {
+            u64::from(self.root_nid)
+        }
+    }
+
+    /// Total filesystem blocks, including the high 16 bits when present.
+    pub fn block_count(&self) -> u64 {
+        u64::from(self.blocks)
+            | if self.feature_incompat & 0x80 != 0 && self.root_nid_wide != 0 {
+                u64::from(self.root_nid) << 32
+            } else {
+                0
+            }
+    }
+
     #[inline]
     pub const fn size() -> usize {
         size_of::<Self>()
@@ -140,8 +173,8 @@ pub struct Inode {
 /// Decoded interpretation of the inode's data union.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum InodeData {
-    FlatPlain { start_block: u32 },
-    FlatInline { start_block: u32 },
+    FlatPlain { start_block: u64 },
+    FlatInline { start_block: u64 },
     Hole,
     ChunkBased { chunk_size: u64, indexes: bool },
     CompressedFull,
@@ -255,7 +288,8 @@ pub struct InodeCompact {
     pub mode: u16,
     pub nlink: u16,
     pub size: u32,
-    pub reserved: u32,
+    /// Modification-time delta relative to the superblock epoch.
+    pub mtime: u32,
     pub inode_data: u32,
     pub inode: u32,
     pub uid: u16,
@@ -277,7 +311,8 @@ pub struct InodeExtended {
     pub format: u16,
     pub xattr_count: u16,
     pub mode: u16,
-    pub reserved: u16,
+    /// High address/block-count bits with the 48-bit feature.
+    pub nb_blocks_hi: u16,
     pub size: u64,
     pub inode_data: u32,
     pub inode: u32,
@@ -415,6 +450,6 @@ impl MapHeader {
     }
 
     pub fn fragmentoff(&self) -> u32 {
-        u32::from_le((self._reserved as u32) << 16 | u32::from(self.data_size))
+        u32::from(self._reserved) | (u32::from(self.data_size) << 16)
     }
 }

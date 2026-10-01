@@ -30,7 +30,7 @@ impl<I: AsyncImage> EroFS<I> {
     ///
     /// Rejects images requiring unsupported incompatible features or extra devices.
     pub async fn new(image: I) -> Result<Self> {
-        let mut super_block = vec![0u8; SuperBlock::size()];
+        let mut super_block = [0; SuperBlock::size()];
         image
             .read_exact_at(&mut super_block, SUPER_BLOCK_OFFSET)
             .await?;
@@ -123,14 +123,20 @@ impl<I: AsyncImage> EroFS<I> {
 
     pub(crate) async fn read_inode_data(&self, inode: &Inode, offset: u64) -> Result<Vec<u8>> {
         let mut plan = self.core.plan_inode_read(inode, offset)?;
+        let mut limit = usize::MAX;
         loop {
             match plan {
                 BlockPlan::Direct { offset, size } => {
-                    let mut buf = vec![0u8; size];
+                    let mut buf = vec![0u8; size.min(limit)];
                     self.image.read_exact_at(&mut buf, offset).await?;
                     return Ok(buf);
                 }
-                BlockPlan::Hole { size } => return Ok(vec![0; size]),
+                BlockPlan::Hole { size } => return Ok(vec![0; size.min(limit)]),
+                BlockPlan::Fragment { offset, size } => {
+                    let packed = self.get_inode(self.core.super_block.packed_nid).await?;
+                    plan = self.core.plan_fragment(&packed, offset, size)?;
+                    limit = usize::try_from(size).unwrap_or(usize::MAX);
+                }
                 BlockPlan::Chunked {
                     addr_offset,
                     block_index,
@@ -148,12 +154,6 @@ impl<I: AsyncImage> EroFS<I> {
                         size,
                     )?;
                 }
-                #[cfg(any(
-                    feature = "lz4",
-                    feature = "lzma",
-                    feature = "deflate",
-                    feature = "zstd"
-                ))]
                 BlockPlan::CompressionMetadata {
                     offset,
                     size,
@@ -163,23 +163,17 @@ impl<I: AsyncImage> EroFS<I> {
                     self.image.read_exact_at(&mut data, offset).await?;
                     plan = reader.resume(&self.core, offset, &data)?;
                 }
-                #[cfg(any(
-                    feature = "lz4",
-                    feature = "lzma",
-                    feature = "deflate",
-                    feature = "zstd"
-                ))]
                 BlockPlan::Encoded(extent) => {
                     let mut data = vec![0; extent.size];
                     self.image.read_exact_at(&mut data, extent.offset).await?;
-                    return extent.decode(&data);
+                    return extent.decode(&data, limit);
                 }
             }
         }
     }
 
     pub(crate) async fn get_path_inode(&self, path: &UnixPath) -> Result<Option<Inode>> {
-        let mut nid = self.core.super_block.root_nid as u64;
+        let mut nid = self.core.super_block.root_inode_id();
 
         'outer: for part in path
             .as_bytes()
@@ -189,6 +183,9 @@ impl<I: AsyncImage> EroFS<I> {
             let inode = self.get_inode(nid).await?;
             if !inode.is_dir() {
                 return Err(Error::NotADirectory(path.to_string_lossy().into_owned()));
+            }
+            if part == b"." {
+                continue;
             }
             let block_count = inode.data_size().div_ceil(self.core.block_size);
             if block_count == 0 {

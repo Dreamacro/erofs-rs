@@ -9,7 +9,7 @@ use crate::{Result, types::Inode};
 #[derive(Debug)]
 pub struct ReadDir<'a, I: Image> {
     dir: UnixPathBuf,
-    inode: Inode,
+    pub(super) inode: Inode,
     erofs: &'a EroFS<I>,
     dirent_block: DirentBlock<Cow<'a, [u8]>>,
     offset: u64,
@@ -22,7 +22,7 @@ impl<'a, I: Image> ReadDir<'a, I> {
         dir: P,
     ) -> Result<Self> {
         let block = erofs.get_inode_block(&inode, 0)?;
-        let dirent_block = DirentBlock::new(dir.as_ref().to_path_buf(), block)?;
+        let dirent_block = DirentBlock::new(block)?;
         Ok(Self {
             dir: dir.as_ref().to_path_buf(),
             inode,
@@ -33,21 +33,16 @@ impl<'a, I: Image> ReadDir<'a, I> {
     }
 
     fn next_entry(&mut self) -> Result<Option<DirEntry>> {
-        if self.offset >= self.inode.data_size() {
-            return Ok(None);
-        }
-
         while self.offset < self.inode.data_size() {
-            match self.dirent_block.next_entry()? {
-                Some(entry) => return Ok(Some(entry)),
-                None => {
-                    self.offset += self.dirent_block.block_size() as u64;
-                    if self.offset < self.inode.data_size() {
-                        let block = self.erofs.get_inode_block(&self.inode, self.offset)?;
-                        self.dirent_block = DirentBlock::new(self.dir.clone(), block)?;
-                    }
-                }
+            if let Some(entry) = self.dirent_block.next_entry(&self.dir)? {
+                return Ok(Some(entry));
             }
+            let offset = self.offset + self.dirent_block.block_size() as u64;
+            if offset < self.inode.data_size() {
+                let block = self.erofs.get_inode_block(&self.inode, offset)?;
+                self.dirent_block = DirentBlock::new(block)?;
+            }
+            self.offset = offset;
         }
         Ok(None)
     }
