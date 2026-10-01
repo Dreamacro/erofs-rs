@@ -1,21 +1,23 @@
 use std::{io::Write, os::unix::fs::PermissionsExt};
 
+use crate::source;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local};
 use clap::{Args, Subcommand};
 use erofs_rs::{
     EroFS, Xattrs,
     r#async::EroFS as AsyncEroFS,
-    backend::{AsyncImage, Image, MmapImage, OpendalImage},
+    backend::{AsyncImage, Image},
     types::Inode,
 };
-use opendal::{Operator, services};
-use url::{Position, Url};
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
     #[clap(short, long)]
     image: String,
+    /// Additional images in device-table order (repeat for each device).
+    #[clap(long = "device", value_name = "PATH_OR_URL")]
+    devices: Vec<String>,
 
     #[command(subcommand)]
     operation: InspectSubcommands,
@@ -37,13 +39,14 @@ enum InspectSubcommands {
 }
 
 pub async fn inspect(args: InspectArgs) -> Result<()> {
-    if args.image.starts_with("http") {
-        // Async path for remote files
-        let u = Url::parse(&args.image)?;
-        let builder = services::Http::default().endpoint(&u[..Position::BeforePath]);
-        let op = Operator::new(builder)?;
-        let image = OpendalImage::new(op, u.path().to_string());
-        let fs = AsyncEroFS::new(image).await?;
+    if source::is_remote(&args.image) {
+        let image = source::http_image(&args.image)?;
+        let devices = args
+            .devices
+            .iter()
+            .map(|path| source::http_image(path))
+            .collect::<Result<Vec<_>>>()?;
+        let fs = AsyncEroFS::new_with_devices(image, devices).await?;
 
         match args.operation {
             InspectSubcommands::Ls { path } => ls_async(&fs, &path).await?,
@@ -54,10 +57,13 @@ pub async fn inspect(args: InspectArgs) -> Result<()> {
             }
         }
     } else {
-        // Sync path for local files
-        // SAFETY: the CLI requires local images to remain unmodified while mapped.
-        let image = unsafe { MmapImage::new_from_path(args.image)? };
-        let fs = EroFS::new(image)?;
+        let image = source::mmap_image(&args.image)?;
+        let devices = args
+            .devices
+            .iter()
+            .map(|path| source::mmap_image(path))
+            .collect::<Result<Vec<_>>>()?;
+        let fs = EroFS::new_with_devices(image, devices)?;
 
         match args.operation {
             InspectSubcommands::Ls { path } => ls(&fs, &path)?,

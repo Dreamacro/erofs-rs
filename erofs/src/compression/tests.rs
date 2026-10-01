@@ -181,6 +181,102 @@ fn plain_holes_and_fragments_do_not_require_codecs() {
 }
 
 #[test]
+fn external_compressed_data_and_primary_inline_tails() {
+    for (algorithm, encoding, payload) in samples() {
+        for inline in [false, true] {
+            let mut data = image(algorithm, payload);
+            let blob = data[4096..5120].to_vec();
+            data[1060] = 10;
+            data[1104] |= 8;
+            data[1110] = 1;
+            data[1112] = 10;
+            data[1344] = 2;
+            data[1348] = if inline { 4 } else { 8 };
+            let wanted = if inline {
+                data[1104] |= 0x10;
+                data[2088..2092].copy_from_slice(&1025u32.to_le_bytes());
+                data[2114..2116].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+                data[2116] = 8;
+                data[2144..2152].copy_from_slice(&[2, 0, 0, 0, 2, 0, 0, 0]);
+                data[2152..2152 + payload.len()].copy_from_slice(payload);
+                expected()
+            } else {
+                data[4096..5120].fill(0xcc); // Must read the blob, not the primary payload.
+                [expected(), vec![b'C'; 475]].concat()
+            };
+            let sources = [&data, &blob].map(|data| Source {
+                data: SliceImage::new(data),
+                reads: AtomicUsize::new(0),
+                fail: AtomicBool::new(false),
+            });
+            let fs = crate::EroFS::new_with_devices(&sources[0], vec![&sources[1]]).unwrap();
+            let afs = ready(crate::r#async::EroFS::new_with_devices(
+                &sources[0],
+                vec![&sources[1]],
+            ))
+            .unwrap();
+            let inode = fs.get_inode(1).unwrap();
+            if !inline {
+                assert_eq!(&*fs.get_inode_data(&inode, 1025).unwrap(), &[b'C'; 475]);
+                assert_eq!(
+                    ready(afs.read_inode_data(&inode, 1025)).unwrap(),
+                    [b'C'; 475]
+                );
+            }
+            if encoding.require_enabled().is_err() {
+                assert!(matches!(
+                    fs.get_inode_data(&inode, 0),
+                    Err(Error::NotSupported(_))
+                ));
+                assert!(matches!(
+                    ready(afs.read_inode_data(&inode, 0)),
+                    Err(Error::NotSupported(_))
+                ));
+                continue;
+            }
+            for offset in [0, 699, 1024] {
+                let bytes = fs.get_inode_data(&inode, offset).unwrap();
+                assert!(!bytes.is_empty());
+                assert_eq!(
+                    &*bytes,
+                    &wanted[offset as usize..offset as usize + bytes.len()]
+                );
+                assert_eq!(ready(afs.read_inode_data(&inode, offset)).unwrap(), &*bytes);
+            }
+        }
+    }
+    // A whole-file fragment can also refer to a flat packed inode on a device.
+    let mut data = image(0, &[]);
+    data[1060] = 10;
+    data[1104] |= 0x28;
+    data[1110] = 1;
+    data[1112] = 10;
+    data[1344] = 1;
+    data[1348] = 8;
+    data[1120..1128].copy_from_slice(&16u64.to_le_bytes());
+    data[2088..2092].copy_from_slice(&17u32.to_le_bytes());
+    data[2112..2120].copy_from_slice(&((1u64 << 63) | 7).to_le_bytes());
+    data[2564..2566].copy_from_slice(&0o100644u16.to_le_bytes());
+    data[2568..2572].copy_from_slice(&512u32.to_le_bytes());
+    data[2576] = 8;
+    let blob: Vec<u8> = (0..512).map(|n| n as u8).collect();
+    let sources = [&data, &blob].map(|data| Source {
+        data: SliceImage::new(data),
+        reads: AtomicUsize::new(0),
+        fail: AtomicBool::new(false),
+    });
+    let fs = crate::EroFS::new_with_devices(&sources[0], vec![&sources[1]]).unwrap();
+    let afs = ready(crate::r#async::EroFS::new_with_devices(
+        &sources[0],
+        vec![&sources[1]],
+    ))
+    .unwrap();
+    let inode = fs.get_inode(1).unwrap();
+    assert_eq!(&*fs.get_inode_data(&inode, 0).unwrap(), &blob[7..24]);
+    assert_eq!(ready(afs.read_inode_data(&inode, 0)).unwrap(), &blob[7..24]);
+}
+
+#[test]
 fn compact_pack_boundaries_and_entry_decoding() {
     let (core, mut inode) = metadata(&image(0, &[]));
     inode.data = InodeData::CompressedCompact;
@@ -448,6 +544,7 @@ fn codec_samples_require_complete_input_and_exact_output() {
     let wanted = expected();
     for (algorithm, encoding, payload) in enabled_samples() {
         let mut extent = EncodedExtent {
+            device_id: 0,
             offset: 0,
             size: 512,
             decoded_size: 1025,
@@ -523,11 +620,13 @@ fn plain_extent_mapping_and_interlaced_crop() {
     assert!(matches!(
         plan(&data, 1030).unwrap(),
         BlockPlan::Direct {
+            device_id: 0,
             offset: 4613,
             size: 470
         }
     ));
     let extent = EncodedExtent {
+        device_id: 0,
         offset: 0,
         size: 8,
         decoded_size: 6,
@@ -562,6 +661,7 @@ fn plain_extent_mapping_and_interlaced_crop() {
 fn partial_references_stop_inside_literals_and_matches() {
     for (algorithm, encoding, payload) in enabled_samples() {
         let mut extent = EncodedExtent {
+            device_id: 0,
             offset: 0,
             size: 512,
             decoded_size: 1,
@@ -711,6 +811,7 @@ fn legacy_lz4_uses_trailing_padding() {
     let mut input = vec![0; 512];
     input[..payload.len()].copy_from_slice(payload);
     let extent = EncodedExtent {
+        device_id: 0,
         offset: 0,
         size: 512,
         decoded_size: 1025,

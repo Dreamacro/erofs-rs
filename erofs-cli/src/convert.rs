@@ -23,6 +23,9 @@ pub struct ConvertArgs {
     output: String,
     #[clap(short, long)]
     format: Option<String>,
+    /// Additional local images in device-table order (repeat for each device).
+    #[clap(long = "device", value_name = "PATH")]
+    devices: Vec<String>,
 }
 
 pub fn convert(args: ConvertArgs) -> Result<()> {
@@ -31,11 +34,18 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
         "only tar output is supported"
     );
     let input = File::open(&args.path)?;
-    let input_meta = input.metadata()?;
+    let mut input_meta = vec![input.metadata()?];
     // SAFETY: input immutability is a CLI precondition. The identity check below
-    // prevents this command from truncating its own input.
+    // covers every backing image before the output can be truncated.
     let image = unsafe { MmapImage::new_from_file(&input)? };
-    let fs = EroFS::new(image)?;
+    let mut devices = Vec::new();
+    for path in &args.devices {
+        let file = File::open(path)?;
+        input_meta.push(file.metadata()?);
+        // SAFETY: the same immutability and output-alias checks apply to each device.
+        devices.push(unsafe { MmapImage::new_from_file(&file)? });
+    }
+    let fs = EroFS::new_with_devices(image, devices)?;
     let entries = fs.walk_dir(format!("/{}", args.root))?;
 
     // Check file identity before truncating, including hard links to the input.
@@ -46,7 +56,9 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
         .open(&args.output)?;
     let output_meta = out_file.metadata()?;
     ensure!(
-        (input_meta.dev(), input_meta.ino()) != (output_meta.dev(), output_meta.ino()),
+        input_meta
+            .iter()
+            .all(|meta| (meta.dev(), meta.ino()) != (output_meta.dev(), output_meta.ino())),
         "input and output refer to the same file"
     );
     if output_meta.is_file() {

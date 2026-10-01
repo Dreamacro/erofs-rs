@@ -1,19 +1,20 @@
+use crate::source;
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use clap::Args;
 use erofs_rs::{
     EroFS,
     r#async::EroFS as AsyncEroFS,
-    backend::{MmapImage, OpendalImage},
     types::{SB_EXTSLOT_SIZE, SuperBlock},
 };
-use opendal::{Operator, services};
-use url::{Position, Url};
 use uuid::Uuid;
 
 #[derive(Args, Debug)]
 pub struct DumpArgs {
     path: String,
+    /// Additional images in device-table order (repeat for each device).
+    #[clap(long = "device", value_name = "PATH_OR_URL")]
+    devices: Vec<String>,
 }
 
 // Filesystem magic number:                      0xE0F5E1E2
@@ -30,18 +31,24 @@ pub struct DumpArgs {
 // Filesystem UUID:                              71bd9ab4-fb8c-47b4-986c-5c901ad547c7
 
 pub async fn dump(args: DumpArgs) -> Result<()> {
-    let block = if args.path.starts_with("http") {
-        let u = Url::parse(&args.path)?;
-        let builder = services::Http::default().endpoint(&u[..Position::BeforePath]);
-        let op = Operator::new(builder)?;
-        let image = OpendalImage::new(op, u.path().to_string());
-        let fs = AsyncEroFS::new(image).await?;
-        fs.super_block().to_owned()
+    let (block, devices) = if source::is_remote(&args.path) {
+        let image = source::http_image(&args.path)?;
+        let devices = args
+            .devices
+            .iter()
+            .map(|path| source::http_image(path))
+            .collect::<Result<Vec<_>>>()?;
+        let fs = AsyncEroFS::new_with_devices(image, devices).await?;
+        (*fs.super_block(), fs.devices().to_vec())
     } else {
-        // SAFETY: the CLI requires local images to remain unmodified while mapped.
-        let image = unsafe { MmapImage::new_from_path(args.path)? };
-        let fs = EroFS::new(image)?;
-        fs.super_block().to_owned()
+        let image = source::mmap_image(&args.path)?;
+        let devices = args
+            .devices
+            .iter()
+            .map(|path| source::mmap_image(path))
+            .collect::<Result<Vec<_>>>()?;
+        let fs = EroFS::new_with_devices(image, devices)?;
+        (*fs.super_block(), fs.devices().to_vec())
     };
 
     println!(
@@ -56,6 +63,19 @@ pub async fn dump(args: DumpArgs) -> Result<()> {
         "Filesystem blocks:                            {}",
         block.block_count()
     );
+    println!(
+        "Filesystem additional devices:                {}",
+        devices.len()
+    );
+    for (index, device) in devices.iter().enumerate() {
+        println!(
+            "Device {}: blocks={}, unified_start={}, tag=b\"{}\"",
+            index + 1,
+            device.blocks,
+            device.unified_start_block,
+            device.tag.escape_ascii()
+        );
+    }
     println!(
         "Filesystem inode metadata start block:        {}",
         block.meta_blk_addr

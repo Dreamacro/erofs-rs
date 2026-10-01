@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 mod convert;
 mod dump;
 mod inspect;
+mod source;
 
 #[derive(Subcommand, Debug)]
 enum Commands {

@@ -1,5 +1,4 @@
 use alloc::{borrow::Cow, format, string::ToString, sync::Arc, vec::Vec};
-use bytes::Buf;
 use typed_path::{UnixPath, UnixPathBuf};
 
 use super::file::File;
@@ -9,7 +8,7 @@ use crate::dirent;
 use crate::filesystem::{BlockPlan, EroFSCore};
 use crate::types::*;
 use crate::xattr::XattrRead;
-use crate::{Error, Result, Xattrs};
+use crate::{DeviceInfo, Error, Result, Xattrs};
 
 /// The main entry point for reading EROFS filesystem images.
 ///
@@ -58,6 +57,7 @@ use crate::{Error, Result, Xattrs};
 #[derive(Debug)]
 pub struct EroFS<I: Image> {
     image: Arc<I>,
+    devices: Arc<[I]>,
     core: EroFSCore,
 }
 
@@ -65,6 +65,7 @@ impl<I: Image> Clone for EroFS<I> {
     fn clone(&self) -> Self {
         Self {
             image: Arc::clone(&self.image),
+            devices: Arc::clone(&self.devices),
             core: self.core.clone(),
         }
     }
@@ -83,7 +84,7 @@ impl<I: Image> EroFS<I> {
     /// - The superblock cannot be read
     /// - The magic number doesn't match EROFS format (0xE0F5E1E2)
     /// - The block size is invalid (must be 2^n where 9 ≤ n ≤ 24)
-    /// - The image requires an unsupported incompatible feature or extra devices
+    /// - The image requires an unsupported incompatible feature or additional images
     ///
     /// # Examples
     ///
@@ -101,14 +102,44 @@ impl<I: Image> EroFS<I> {
     /// # }
     /// ```
     pub fn new(image: I) -> Result<Self> {
+        Self::new_with_devices(image, Vec::new())
+    }
+
+    /// Opens an image with additional backing images in on-disk device-table order.
+    /// The number of supplied images must match the active device table.
+    /// All mappings, including additional devices, must remain immutable.
+    pub fn new_with_devices(image: I, devices: Vec<I>) -> Result<Self> {
         let sb_data = image
             .get(SUPER_BLOCK_OFFSET..SUPER_BLOCK_OFFSET + SuperBlock::size() as u64)
             .ok_or_else(|| Error::InvalidSuperblock("failed to read super block".to_string()))?;
-        let core = EroFSCore::new(sb_data)?;
+        let mut core = EroFSCore::new(sb_data)?;
+        let range = core.device_table_range(devices.len())?;
+        if !range.is_empty() {
+            let data = image
+                .get(range.clone())
+                .filter(|data| data.len() as u64 == range.end - range.start)
+                .ok_or_else(|| Error::OutOfBounds("truncated device table".into()))?;
+            core.set_device_table(data)?;
+        }
         Ok(Self {
             image: image.into(),
+            devices: devices.into(),
             core,
         })
+    }
+
+    /// Additional device descriptors; the first entry has device ID 1.
+    pub fn devices(&self) -> &[DeviceInfo] {
+        self.core.devices()
+    }
+
+    fn image_for_device(&self, id: u16) -> Result<&I> {
+        if id == 0 {
+            return Ok(&self.image);
+        }
+        self.devices
+            .get(usize::from(id) - 1)
+            .ok_or_else(|| Error::OutOfBounds(format!("missing image for device {id}")))
     }
 
     /// Recursively walks a directory tree starting from the given path.
@@ -284,10 +315,14 @@ impl<I: Image> EroFS<I> {
         let mut limit = usize::MAX;
         loop {
             match plan {
-                BlockPlan::Direct { offset, size } => {
+                BlockPlan::Direct {
+                    device_id,
+                    offset,
+                    size,
+                } => {
                     let size = size.min(limit);
                     return self
-                        .image
+                        .image_for_device(device_id)?
                         .get(offset..offset + size as u64)
                         .map(Cow::Borrowed)
                         .ok_or_else(|| Error::OutOfBounds("failed to get inode data".to_string()));
@@ -300,20 +335,19 @@ impl<I: Image> EroFS<I> {
                 }
                 BlockPlan::Chunked {
                     addr_offset,
+                    format,
                     block_index,
                     offset_in_block,
                     size,
                 } => {
-                    let chunk_addr = self
+                    let entry_size = EroFSCore::chunk_entry_size(format);
+                    let data = self
                         .image
-                        .get(addr_offset..addr_offset + 4)
-                        .ok_or_else(|| {
-                            Error::OutOfBounds("failed to get chunk address".to_string())
-                        })?
-                        .get_u32_le();
-
+                        .get(addr_offset..addr_offset + entry_size as u64)
+                        .ok_or_else(|| Error::OutOfBounds("failed to get chunk index".into()))?;
                     plan = self.core.resolve_chunk_read(
-                        chunk_addr,
+                        data,
+                        format,
                         block_index,
                         offset_in_block,
                         size,
@@ -334,7 +368,7 @@ impl<I: Image> EroFS<I> {
                 }
                 BlockPlan::Encoded(extent) => {
                     let data = self
-                        .image
+                        .image_for_device(extent.device_id)?
                         .get(extent.offset..extent.offset + extent.size as u64)
                         .ok_or_else(|| {
                             Error::OutOfBounds("failed to read compressed data".to_string())

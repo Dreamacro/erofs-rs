@@ -353,6 +353,8 @@ struct PhysicalExtent {
     offset: u64,
     size: u64,
     format: ExtentFormat,
+    /// Inline payload stays in primary metadata, outside device address translation.
+    inline: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -669,7 +671,8 @@ impl CompressedRead {
         } else {
             u64::from(blocks.unwrap_or(1)) * core.block_size
         };
-        if end == layout.file_size && layout.inline_size != 0 {
+        let inline = end == layout.file_size && layout.inline_size != 0;
+        if inline {
             offset = layout.end;
             size = u64::from(layout.inline_size);
             if size > core.block_size - offset % core.block_size {
@@ -704,6 +707,7 @@ impl CompressedRead {
                 offset,
                 size,
                 format,
+                inline,
             },
         )
     }
@@ -956,6 +960,7 @@ impl CompressedRead {
                 offset: head.offset,
                 size: u64::from(head.plen & 0x1f_ffff),
                 format,
+                inline: false,
             },
         )
     }
@@ -975,6 +980,7 @@ impl CompressedRead {
             offset,
             size,
             format,
+            inline,
         } = physical;
         if size == 0 {
             return Ok(BlockPlan::Hole {
@@ -998,6 +1004,11 @@ impl CompressedRead {
         offset
             .checked_add(size)
             .ok_or(Error::Overflow("compressed data range"))?;
+        let (device_id, offset) = if inline {
+            (0, offset)
+        } else {
+            core.resolve_device(0, offset, size)?
+        };
         let (encoding, partial, zero_padding) = match format {
             ExtentFormat::Plain { interlaced } => {
                 if length > size {
@@ -1006,7 +1017,7 @@ impl CompressedRead {
                     ));
                 }
                 if !interlaced {
-                    return BlockPlan::direct(offset + skip as u64, decoded_size - skip);
+                    return BlockPlan::direct(device_id, offset + skip as u64, decoded_size - skip);
                 }
                 let start = logical.start % core.block_size;
                 if size > core.block_size
@@ -1049,6 +1060,7 @@ impl CompressedRead {
             }
         };
         Ok(BlockPlan::Encoded(EncodedExtent {
+            device_id,
             offset,
             size: size as usize,
             decoded_size,
@@ -1097,6 +1109,7 @@ impl Encoding {
 }
 
 pub struct EncodedExtent {
+    pub(crate) device_id: u16,
     pub(crate) offset: u64,
     pub(crate) size: usize,
     decoded_size: usize,

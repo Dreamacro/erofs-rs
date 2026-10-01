@@ -1,7 +1,6 @@
 use alloc::format;
 use alloc::vec::Vec;
 
-use bytes::Buf;
 use typed_path::UnixPath;
 
 use super::file::File;
@@ -11,7 +10,7 @@ use crate::dirent;
 use crate::filesystem::{BlockPlan, EroFSCore};
 use crate::types::*;
 use crate::xattr::XattrRead;
-use crate::{Error, Result, Xattrs};
+use crate::{DeviceInfo, Error, Result, Xattrs};
 
 /// The async entry point for reading EROFS filesystem images.
 ///
@@ -23,20 +22,55 @@ use crate::{Error, Result, Xattrs};
 #[derive(Debug, Clone)]
 pub struct EroFS<I: AsyncImage> {
     image: I,
+    devices: Vec<I>,
     core: EroFSCore,
 }
 
 impl<I: AsyncImage> EroFS<I> {
     /// Creates a new async `EroFS` instance from an async backend image source.
     ///
-    /// Rejects images requiring unsupported incompatible features or extra devices.
+    /// Rejects images requiring unsupported incompatible features or additional images.
     pub async fn new(image: I) -> Result<Self> {
+        Self::new_with_devices(image, Vec::new()).await
+    }
+
+    /// Opens an image with additional backing images in on-disk device-table order.
+    /// The number of supplied images must match the active device table.
+    pub async fn new_with_devices(image: I, devices: Vec<I>) -> Result<Self> {
         let mut super_block = [0; SuperBlock::size()];
         image
             .read_exact_at(&mut super_block, SUPER_BLOCK_OFFSET)
             .await?;
-        let core = EroFSCore::new(&super_block)?;
-        Ok(Self { image, core })
+        let mut core = EroFSCore::new(&super_block)?;
+        let range = core.device_table_range(devices.len())?;
+        if !range.is_empty() {
+            let size = (range.end - range.start) as usize; // At most 65535 device slots.
+            let mut data = Vec::new();
+            data.try_reserve_exact(size)
+                .map_err(|_| Error::OutOfBounds("cannot allocate device table".into()))?;
+            data.resize(size, 0);
+            image.read_exact_at(&mut data, range.start).await?;
+            core.set_device_table(&data)?;
+        }
+        Ok(Self {
+            image,
+            devices,
+            core,
+        })
+    }
+
+    /// Additional device descriptors; the first entry has device ID 1.
+    pub fn devices(&self) -> &[DeviceInfo] {
+        self.core.devices()
+    }
+
+    fn image_for_device(&self, id: u16) -> Result<&I> {
+        if id == 0 {
+            return Ok(&self.image);
+        }
+        self.devices
+            .get(usize::from(id) - 1)
+            .ok_or_else(|| Error::OutOfBounds(format!("missing image for device {id}")))
     }
 
     /// Recursively walks a directory tree starting from the given path.
@@ -174,9 +208,15 @@ impl<I: AsyncImage> EroFS<I> {
         let mut limit = usize::MAX;
         loop {
             match plan {
-                BlockPlan::Direct { offset, size } => {
+                BlockPlan::Direct {
+                    device_id,
+                    offset,
+                    size,
+                } => {
                     let mut buf = vec![0u8; size.min(limit)];
-                    self.image.read_exact_at(&mut buf, offset).await?;
+                    self.image_for_device(device_id)?
+                        .read_exact_at(&mut buf, offset)
+                        .await?;
                     return Ok(buf);
                 }
                 BlockPlan::Hole { size } => return Ok(vec![0; size.min(limit)]),
@@ -187,16 +227,17 @@ impl<I: AsyncImage> EroFS<I> {
                 }
                 BlockPlan::Chunked {
                     addr_offset,
+                    format,
                     block_index,
                     offset_in_block,
                     size,
                 } => {
-                    let mut addr_buf = [0u8; 4];
-                    self.image.read_exact_at(&mut addr_buf, addr_offset).await?;
-                    let chunk_addr = (&addr_buf[..]).get_u32_le();
-
+                    let mut data = [0u8; 8];
+                    let data = &mut data[..EroFSCore::chunk_entry_size(format)];
+                    self.image.read_exact_at(data, addr_offset).await?;
                     plan = self.core.resolve_chunk_read(
-                        chunk_addr,
+                        data,
+                        format,
                         block_index,
                         offset_in_block,
                         size,
@@ -213,7 +254,9 @@ impl<I: AsyncImage> EroFS<I> {
                 }
                 BlockPlan::Encoded(extent) => {
                     let mut data = vec![0; extent.size];
-                    self.image.read_exact_at(&mut data, extent.offset).await?;
+                    self.image_for_device(extent.device_id)?
+                        .read_exact_at(&mut data, extent.offset)
+                        .await?;
                     return extent.decode(&data, limit);
                 }
             }

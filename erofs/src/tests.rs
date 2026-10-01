@@ -58,7 +58,7 @@ pub fn ready<T>(future: impl Future<Output = T>) -> T {
     }
 }
 
-fn directory(data: &mut [u8], entries: &[(u64, &[u8], u8)]) {
+pub fn directory(data: &mut [u8], entries: &[(u64, &[u8], u8)]) {
     data.fill(0);
     let mut name_offset = entries.len() * 12;
     for (index, &(nid, name, kind)) in entries.iter().enumerate() {
@@ -71,7 +71,7 @@ fn directory(data: &mut [u8], entries: &[(u64, &[u8], u8)]) {
     }
 }
 
-fn image() -> Vec<u8> {
+pub fn image() -> Vec<u8> {
     let mut data = vec![0; 6656];
     data[1024..1028].copy_from_slice(&MAGIC_NUMBER.to_le_bytes());
     data[1036] = 9;

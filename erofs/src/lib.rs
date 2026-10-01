@@ -66,6 +66,7 @@ extern crate alloc;
 extern crate std;
 
 pub(crate) mod compression;
+mod devices;
 pub(crate) mod dirent;
 pub(crate) mod filesystem;
 #[cfg(test)]
@@ -78,6 +79,7 @@ mod error;
 pub mod sync;
 pub mod types;
 
+pub use devices::DeviceInfo;
 pub use dirent::DirEntry;
 pub use error::*;
 pub use sync::{EroFS, ReadDir, WalkDir, WalkDirEntry};

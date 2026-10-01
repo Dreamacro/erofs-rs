@@ -16,6 +16,7 @@ pub const SUPER_BLOCK_OFFSET: u64 = 1024;
 
 pub const LAYOUT_CHUNK_FORMAT_BITS: u16 = 0x001F;
 pub const LAYOUT_CHUNK_FORMAT_INDEXES: u16 = 0x0020;
+pub const LAYOUT_CHUNK_FORMAT_48BIT: u16 = 0x0040;
 
 pub const SB_EXTSLOT_SIZE: usize = 16;
 
@@ -74,7 +75,7 @@ impl SuperBlock {
         }
     }
 
-    /// Total filesystem blocks, including the high 16 bits when present.
+    /// Blocks in the primary image, including the high 16 bits when present.
     pub fn block_count(&self) -> u64 {
         u64::from(self.blocks)
             | if self.feature_incompat & 0x80 != 0 && self.root_nid_wide != 0 {
@@ -176,7 +177,7 @@ pub(crate) enum InodeData {
     FlatPlain { start_block: u64 },
     FlatInline { start_block: u64 },
     Hole,
-    ChunkBased { chunk_size: u64, indexes: bool },
+    ChunkBased { chunk_size: u64, format: u16 },
     CompressedFull,
     CompressedCompact,
     Device { major: u32, minor: u32 },
