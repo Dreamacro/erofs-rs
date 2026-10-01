@@ -1,10 +1,10 @@
-use std::os::unix::fs::PermissionsExt;
+use std::{io::Write, os::unix::fs::PermissionsExt};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local};
 use clap::{Args, Subcommand};
 use erofs_rs::{
-    EroFS,
+    EroFS, Xattrs,
     r#async::EroFS as AsyncEroFS,
     backend::{AsyncImage, Image, MmapImage, OpendalImage},
     types::Inode,
@@ -30,6 +30,10 @@ enum InspectSubcommands {
     Cat {
         path: String,
     },
+    /// Show extended attributes as escaped byte names and values.
+    Xattrs {
+        path: String,
+    },
 }
 
 pub async fn inspect(args: InspectArgs) -> Result<()> {
@@ -44,6 +48,10 @@ pub async fn inspect(args: InspectArgs) -> Result<()> {
         match args.operation {
             InspectSubcommands::Ls { path } => ls_async(&fs, &path).await?,
             InspectSubcommands::Cat { path } => cat_async(&fs, &path).await?,
+            InspectSubcommands::Xattrs { path } => {
+                let attrs = fs.xattrs(&path).await?;
+                write_xattrs(std::io::stdout().lock(), attrs)?;
+            }
         }
     } else {
         // Sync path for local files
@@ -54,9 +62,24 @@ pub async fn inspect(args: InspectArgs) -> Result<()> {
         match args.operation {
             InspectSubcommands::Ls { path } => ls(&fs, &path)?,
             InspectSubcommands::Cat { path } => cat(&fs, &path)?,
+            InspectSubcommands::Xattrs { path } => {
+                write_xattrs(std::io::stdout().lock(), fs.xattrs(&path)?)?;
+            }
         }
     }
 
+    Ok(())
+}
+
+fn write_xattrs(mut output: impl Write, attrs: Xattrs) -> std::io::Result<()> {
+    for (name, value) in attrs {
+        writeln!(
+            output,
+            "b\"{}\"=b\"{}\"",
+            name.escape_ascii(),
+            value.escape_ascii()
+        )?;
+    }
     Ok(())
 }
 

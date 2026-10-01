@@ -9,6 +9,8 @@
 //! - **Zero-copy parsing**: Via mmap (std) or byte slices (no_std)
 //! - **Multiple backends**: Memory-mapped files (std) or raw byte slices (no_std)
 //! - **Multiple layouts**: Flat plain, flat inline, and chunk-based data layouts
+//! - **Extended attributes**: Inline/shared entries and long name prefixes,
+//!   exposed through `xattrs` / `xattrs_inode` as lossless byte maps ([`Xattrs`]).
 //! - **Optional compression**: `lz4`, `lzma` (MicroLZMA), `deflate`, and `zstd` support
 //!   Full/Compact indexes, multi-block pclusters, inline tails, packed fragments,
 //!   partial references, and 4/8/16/32-byte extent records. Non-default logical
@@ -68,6 +70,7 @@ pub(crate) mod dirent;
 pub(crate) mod filesystem;
 #[cfg(test)]
 mod tests;
+mod xattr;
 
 pub mod r#async;
 pub mod backend;
@@ -78,3 +81,4 @@ pub mod types;
 pub use dirent::DirEntry;
 pub use error::*;
 pub use sync::{EroFS, ReadDir, WalkDir, WalkDirEntry};
+pub use xattr::Xattrs;

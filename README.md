@@ -9,6 +9,7 @@ A pure Rust library for reading and building [EROFS](https://docs.kernel.org/fil
 - **no_std support** with `alloc` on supported targets
 - Zero-copy parsing via mmap (std) or byte slices (no_std)
 - Directory traversal and file reading
+- Inline/shared extended attributes and long name prefixes, with lossless byte names and values
 - Multiple data layouts: flat plain, flat inline, chunk-based
 - Optional LZ4, MicroLZMA, DEFLATE, and Zstd decoding with shared sync/async mapping and per-file decoded-extent caching
 - Full/Compact compression indexes, multi-block pclusters, inline tails, packed fragments, partial references, and 4/8/16/32-byte extent records
@@ -109,6 +110,9 @@ erofs-cli inspect -i image.erofs ls /
 # Read file content
 erofs-cli inspect -i image.erofs cat /etc/passwd
 
+# Inspect extended attributes (escaped byte names and values)
+erofs-cli inspect -i image.erofs xattrs /etc/os-release
+
 # Convert to tar
 erofs-cli convert image.erofs -o out.tar
 
@@ -123,6 +127,7 @@ erofs-cli inspect -i http://example.com/images/system.erofs cat /etc/os-release
 ### Implemented
 
 - [x] Superblock / inode / dirent parsing
+- [x] Extended attribute reading (inline, shared, and long prefixes)
 - [x] Flat plain layout
 - [x] Flat inline layout
 - [x] Chunk-based layout (without chunk indexes)
@@ -132,7 +137,6 @@ erofs-cli inspect -i http://example.com/images/system.erofs cat /etc/os-release
 
 ### TODO
 
-- [ ] Extended attributes
 - [ ] Indexed chunks, additional devices, and metabox metadata
 - [ ] Image building (`mkfs.erofs` equivalent)
 

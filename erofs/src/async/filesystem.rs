@@ -10,7 +10,8 @@ use crate::backend::AsyncImage;
 use crate::dirent;
 use crate::filesystem::{BlockPlan, EroFSCore};
 use crate::types::*;
-use crate::{Error, Result};
+use crate::xattr::XattrRead;
+use crate::{Error, Result, Xattrs};
 
 /// The async entry point for reading EROFS filesystem images.
 ///
@@ -76,6 +77,53 @@ impl<I: AsyncImage> EroFS<I> {
         }
 
         Ok(File::new(inode, self))
+    }
+
+    /// Reads all visible extended attributes without following symbolic links.
+    /// Names and values are preserved as bytes; absent attributes yield an empty map.
+    pub async fn xattrs(&self, path: impl AsRef<UnixPath>) -> Result<Xattrs> {
+        let inode = self
+            .get_path_inode(path.as_ref())
+            .await?
+            .ok_or_else(|| Error::PathNotFound(path.as_ref().to_string_lossy().into_owned()))?;
+        self.xattrs_inode(inode).await
+    }
+
+    /// Reads extended attributes of an inode obtained from this filesystem.
+    /// Attribute values are copied; file contents are not read unless long name
+    /// prefixes reside in the special packed inode.
+    pub async fn xattrs_inode(&self, inode: Inode) -> Result<Xattrs> {
+        let mut reader = XattrRead::new(&self.core, &inode)?;
+        let packed = match reader.packed_nid {
+            Some(nid) => Some(self.get_inode(nid).await?),
+            None => None,
+        };
+        let mut cached = Vec::new();
+        let mut cached_offset = 0;
+        while let Some(request) = reader.request() {
+            if request.packed {
+                let inode = packed
+                    .as_ref()
+                    .ok_or_else(|| Error::CorruptedData("missing xattr prefix inode".into()))?;
+                request.validate_inode(inode)?;
+                if request.in_buffer(cached_offset, &cached).is_none() {
+                    cached_offset = request.offset;
+                    cached = self.read_inode_data(inode, request.offset).await?;
+                    if cached.len() < request.size {
+                        cached = self.read_inode_block(inode, request.offset).await?;
+                    }
+                }
+                let data = request
+                    .in_buffer(cached_offset, &cached)
+                    .ok_or_else(|| Error::OutOfBounds("failed to read xattr metadata".into()))?;
+                reader.resume(data)?;
+            } else {
+                let mut data = vec![0; request.size];
+                self.image.read_exact_at(&mut data, request.offset).await?;
+                reader.resume(&data)?;
+            }
+        }
+        Ok(reader.finish())
     }
 
     /// Returns a reference to the filesystem superblock.
