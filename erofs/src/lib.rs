@@ -9,6 +9,10 @@
 //! - **Zero-copy parsing**: Via mmap (std) or byte slices (no_std)
 //! - **Multiple backends**: Memory-mapped files (std) or raw byte slices (no_std)
 //! - **Multiple layouts**: Flat plain, flat inline, and chunk-based data layouts
+//! - **Optional compression**: `lz4`, `lzma` (MicroLZMA), `deflate`, and `zstd` support
+//!   Full/Compact indexes and single-block physical clusters. Only `lzma` requires
+//!   `std`; the other codec features work with `no_std + alloc`. Multi-block pclusters,
+//!   compressed inline tails, fragments and partial references remain unsupported.
 //!
 //! # Examples
 //!
@@ -55,6 +59,13 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+pub(crate) mod compression;
 pub(crate) mod dirent;
 pub(crate) mod filesystem;
 

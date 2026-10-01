@@ -5,6 +5,13 @@ use binrw::BinReaderExt;
 use binrw::io::Cursor;
 use rustix::fs::FileType;
 
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+use crate::compression::{CompressedRead, EncodedExtent};
 use crate::types::*;
 use crate::{Error, Result};
 
@@ -20,7 +27,7 @@ pub struct EroFSCore {
     pub(crate) block_size: u64,
 }
 
-/// A bounded block read, or a chunk reference that must first be resolved.
+/// A data extent, or metadata needed to resolve its location.
 pub enum BlockPlan {
     Direct {
         offset: u64,
@@ -33,12 +40,31 @@ pub enum BlockPlan {
     Chunked {
         addr_offset: u64,
         block_index: u32,
+        offset_in_block: u64,
         size: usize,
     },
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    CompressionMetadata {
+        offset: u64,
+        size: usize,
+        reader: CompressedRead,
+    },
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    Encoded(EncodedExtent),
 }
 
 impl BlockPlan {
-    fn direct(offset: u64, size: usize) -> Result<Self> {
+    pub(crate) fn direct(offset: u64, size: usize) -> Result<Self> {
         offset
             .checked_add(size as u64)
             .ok_or(Error::Overflow("block read range"))?;
@@ -213,32 +239,60 @@ impl EroFSCore {
         Ok(inode)
     }
 
-    /// Map a logical file offset to at most one block of data.
-    /// For `Chunked`, the caller reads the address and calls `resolve_chunk_read()`.
-    pub(crate) fn plan_inode_block_read(&self, inode: &Inode, offset: u64) -> Result<BlockPlan> {
+    /// Size of a logical block requested by directory and symlink readers.
+    pub(crate) fn block_read_size(&self, inode: &Inode, offset: u64) -> Result<usize> {
+        if offset >= inode.data_size() {
+            return Err(Error::OutOfRange(offset, inode.data_size()));
+        }
+        usize::try_from((inode.data_size() - offset).min(self.block_size))
+            .map_err(|_| Error::Overflow("block read size"))
+    }
+
+    /// Plan data starting exactly at `offset`. Compressed extents can span blocks.
+    pub(crate) fn plan_inode_read(&self, inode: &Inode, offset: u64) -> Result<BlockPlan> {
         let data_size = inode.data_size();
         if offset >= data_size {
             return Err(Error::OutOfRange(offset, data_size));
         }
         let block_size = self.block_size;
-        let block_start = offset / block_size * block_size;
-        // Narrow only the bounded size of the buffer to be materialized.
-        let size = usize::try_from((data_size - block_start).min(block_size))
+        let offset_in_block = offset % block_size;
+        let size = usize::try_from((data_size - offset).min(block_size - offset_in_block))
             .map_err(|_| Error::Overflow("block read size"))?;
         match inode.data {
             InodeData::Hole => Ok(BlockPlan::Hole { size }),
-            InodeData::FlatInline { .. } if data_size - block_start <= block_size => {
-                BlockPlan::direct(self.inode_tail_offset(inode)?, size)
+            InodeData::FlatInline { .. } if offset / block_size == (data_size - 1) / block_size => {
+                let offset = self
+                    .inode_tail_offset(inode)?
+                    .checked_add(offset_in_block)
+                    .ok_or(Error::Overflow("inline data offset"))?;
+                BlockPlan::direct(offset, size)
             }
             InodeData::FlatPlain { start_block } | InodeData::FlatInline { start_block } => {
                 let offset = self
                     .block_offset(start_block)
-                    .checked_add(block_start)
+                    .checked_add(offset)
                     .ok_or(Error::Overflow("file block offset"))?;
                 BlockPlan::direct(offset, size)
             }
             InodeData::CompressedFull | InodeData::CompressedCompact => {
-                Err(Error::NotSupported("compressed data".to_string()))
+                #[cfg(any(
+                    feature = "lz4",
+                    feature = "lzma",
+                    feature = "deflate",
+                    feature = "zstd"
+                ))]
+                {
+                    CompressedRead::start(self, inode, offset, self.inode_tail_offset(inode)?)
+                }
+                #[cfg(not(any(
+                    feature = "lz4",
+                    feature = "lzma",
+                    feature = "deflate",
+                    feature = "zstd"
+                )))]
+                {
+                    Err(Error::NotSupported("compressed data".to_string()))
+                }
             }
             InodeData::ChunkBased { indexes: true, .. } => Err(Error::NotSupported(
                 "chunk based format with indexes".to_string(),
@@ -247,8 +301,8 @@ impl EroFSCore {
                 chunk_size,
                 indexes: false,
             } => {
-                let chunk_index = block_start / chunk_size;
-                let block_index = u32::try_from(block_start % chunk_size / block_size)
+                let chunk_index = offset / chunk_size;
+                let block_index = u32::try_from(offset % chunk_size / block_size)
                     .map_err(|_| Error::Overflow("chunk block index"))?;
                 let index_offset = chunk_index
                     .checked_mul(4)
@@ -263,6 +317,7 @@ impl EroFSCore {
                 Ok(BlockPlan::Chunked {
                     addr_offset,
                     block_index,
+                    offset_in_block,
                     size,
                 })
             }
@@ -278,6 +333,7 @@ impl EroFSCore {
         &self,
         chunk_addr: u32,
         block_index: u32,
+        offset_in_block: u64,
         size: usize,
     ) -> Result<BlockPlan> {
         if chunk_addr == u32::MAX {
@@ -286,7 +342,11 @@ impl EroFSCore {
         let block = chunk_addr
             .checked_add(block_index)
             .ok_or(Error::Overflow("chunk block address"))?;
-        BlockPlan::direct(self.block_offset(block), size)
+        let offset = self
+            .block_offset(block)
+            .checked_add(offset_in_block)
+            .ok_or(Error::Overflow("chunk data offset"))?;
+        BlockPlan::direct(offset, size)
     }
 
     pub(crate) fn get_inode_offset(&self, nid: u64) -> Result<u64> {
@@ -380,7 +440,7 @@ mod tests {
     fn chunk_addr_offset_calculated_correctly() {
         let core = make_core();
         let inode = make_compact_inode(Layout::ChunkBased, core.block_size as u32, 0, 0);
-        let plan = core.plan_inode_block_read(&inode, 0).expect("chunk plan");
+        let plan = core.plan_inode_read(&inode, 0).expect("chunk plan");
 
         match plan {
             BlockPlan::Chunked { addr_offset, .. } => {

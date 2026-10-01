@@ -25,13 +25,21 @@ std = [
   "typed-path/std",
 ]
 opendal = ["std", "dep:opendal"]
+lz4 = ["dep:lz4_flex"]
+lzma = ["std", "dep:lzma-rs"]
+deflate = ["dep:miniz_oxide"]
+zstd = ["dep:ruzstd"]
 
 [dependencies]
 binrw = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
+lz4_flex = { workspace = true, optional = true, features = ["safe-decode", "checked-decode"] }
+lzma-rs = { workspace = true, optional = true, features = ["raw_decoder"] }
 memmap2 = { workspace = true, default-features = true, optional = true }
+miniz_oxide = { workspace = true, optional = true }
 opendal = { workspace = true, optional = true }
 rustix = { workspace = true, features = ["fs"] }
+ruzstd = { workspace = true, optional = true, features = ["hash"] }
 thiserror = { workspace = true }
 typed-path = { workspace = true }

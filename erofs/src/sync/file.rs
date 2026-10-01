@@ -73,7 +73,7 @@ impl<'a, I: Image> Read for File<'a, I> {
         }
 
         if self.buf.is_empty() {
-            let block = self.erofs.get_inode_block(&self.inode, self.offset);
+            let block = self.erofs.get_inode_data(&self.inode, self.offset);
             #[cfg(feature = "std")]
             let block = block.map_err(std::io::Error::other);
             self.buf = block?;

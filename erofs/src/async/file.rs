@@ -43,7 +43,7 @@ impl<'a, I: AsyncImage> File<'a, I> {
         if self.buf.is_empty() {
             self.buf = self
                 .erofs
-                .read_inode_block(&self.inode, self.offset)
+                .read_inode_data(&self.inode, self.offset)
                 .await?
                 .into();
         }

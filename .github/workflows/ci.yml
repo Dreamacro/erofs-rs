@@ -15,6 +15,12 @@ jobs:
           toolchain: 1.91.0
           components: clippy
 
-      - run: cargo build --workspace --all-targets --locked
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --all-targets --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-features --locked
+      - name: Isolated codec features (only lzma enables std)
+        run: |
+          for features in '' lz4 lzma deflate zstd lz4,deflate,zstd; do
+            cargo test -p erofs-rs --no-default-features --features "$features" --locked
+            cargo clippy -p erofs-rs --all-targets --no-default-features --features "$features" --locked -- -D warnings
+          done

@@ -106,7 +106,23 @@ impl<I: AsyncImage> EroFS<I> {
     }
 
     pub(crate) async fn read_inode_block(&self, inode: &Inode, offset: u64) -> Result<Vec<u8>> {
-        let mut plan = self.core.plan_inode_block_read(inode, offset)?;
+        let size = self.core.block_read_size(inode, offset)?;
+        let mut data = self.read_inode_data(inode, offset).await?;
+        data.truncate(size);
+        data.try_reserve_exact(size - data.len())
+            .map_err(|_| Error::OutOfBounds("cannot allocate inode block".into()))?;
+        while data.len() < size {
+            let next = self
+                .read_inode_data(inode, offset + data.len() as u64)
+                .await?;
+            let n = next.len().min(size - data.len());
+            data.extend_from_slice(&next[..n]);
+        }
+        Ok(data)
+    }
+
+    pub(crate) async fn read_inode_data(&self, inode: &Inode, offset: u64) -> Result<Vec<u8>> {
+        let mut plan = self.core.plan_inode_read(inode, offset)?;
         loop {
             match plan {
                 BlockPlan::Direct { offset, size } => {
@@ -118,15 +134,45 @@ impl<I: AsyncImage> EroFS<I> {
                 BlockPlan::Chunked {
                     addr_offset,
                     block_index,
+                    offset_in_block,
                     size,
                 } => {
                     let mut addr_buf = [0u8; 4];
                     self.image.read_exact_at(&mut addr_buf, addr_offset).await?;
                     let chunk_addr = (&addr_buf[..]).get_u32_le();
 
-                    plan = self
-                        .core
-                        .resolve_chunk_read(chunk_addr, block_index, size)?;
+                    plan = self.core.resolve_chunk_read(
+                        chunk_addr,
+                        block_index,
+                        offset_in_block,
+                        size,
+                    )?;
+                }
+                #[cfg(any(
+                    feature = "lz4",
+                    feature = "lzma",
+                    feature = "deflate",
+                    feature = "zstd"
+                ))]
+                BlockPlan::CompressionMetadata {
+                    offset,
+                    size,
+                    reader,
+                } => {
+                    let mut data = vec![0; size];
+                    self.image.read_exact_at(&mut data, offset).await?;
+                    plan = reader.resume(&self.core, offset, &data)?;
+                }
+                #[cfg(any(
+                    feature = "lz4",
+                    feature = "lzma",
+                    feature = "deflate",
+                    feature = "zstd"
+                ))]
+                BlockPlan::Encoded(extent) => {
+                    let mut data = vec![0; extent.size];
+                    self.image.read_exact_at(&mut data, extent.offset).await?;
+                    return extent.decode(&data);
                 }
             }
         }

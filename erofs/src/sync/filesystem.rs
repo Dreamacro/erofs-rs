@@ -210,8 +210,32 @@ impl<I: Image> EroFS<I> {
         self.core.parse_inode(data, nid)
     }
 
+    /// Assemble exactly one logical block, even when it crosses compressed extents.
+    // Block consumers may decode an extent again; add iterator-local
+    // caching if compressed directory traversal becomes a bottleneck.
     pub(crate) fn get_inode_block(&self, inode: &Inode, offset: u64) -> Result<Cow<'_, [u8]>> {
-        let mut plan = self.core.plan_inode_block_read(inode, offset)?;
+        let size = self.core.block_read_size(inode, offset)?;
+        let mut data = self.get_inode_data(inode, offset)?;
+        if data.len() >= size {
+            match &mut data {
+                Cow::Borrowed(bytes) => *bytes = &bytes[..size],
+                Cow::Owned(bytes) => bytes.truncate(size),
+            }
+        } else {
+            let buf = data.to_mut();
+            buf.try_reserve_exact(size - buf.len())
+                .map_err(|_| Error::OutOfBounds("cannot allocate inode block".to_string()))?;
+            while buf.len() < size {
+                let next = self.get_inode_data(inode, offset + buf.len() as u64)?;
+                let n = next.len().min(size - buf.len());
+                buf.extend_from_slice(&next[..n]);
+            }
+        }
+        Ok(data)
+    }
+
+    pub(crate) fn get_inode_data(&self, inode: &Inode, offset: u64) -> Result<Cow<'_, [u8]>> {
+        let mut plan = self.core.plan_inode_read(inode, offset)?;
         loop {
             match plan {
                 BlockPlan::Direct { offset, size } => {
@@ -225,6 +249,7 @@ impl<I: Image> EroFS<I> {
                 BlockPlan::Chunked {
                     addr_offset,
                     block_index,
+                    offset_in_block,
                     size,
                 } => {
                     let chunk_addr = self
@@ -235,9 +260,46 @@ impl<I: Image> EroFS<I> {
                         })?
                         .get_u32_le();
 
-                    plan = self
-                        .core
-                        .resolve_chunk_read(chunk_addr, block_index, size)?;
+                    plan = self.core.resolve_chunk_read(
+                        chunk_addr,
+                        block_index,
+                        offset_in_block,
+                        size,
+                    )?;
+                }
+                #[cfg(any(
+                    feature = "lz4",
+                    feature = "lzma",
+                    feature = "deflate",
+                    feature = "zstd"
+                ))]
+                BlockPlan::CompressionMetadata {
+                    offset,
+                    size,
+                    reader,
+                } => {
+                    let data = self
+                        .image
+                        .get(offset..offset + size as u64)
+                        .ok_or_else(|| {
+                            Error::OutOfBounds("failed to read compression metadata".to_string())
+                        })?;
+                    plan = reader.resume(&self.core, offset, data)?;
+                }
+                #[cfg(any(
+                    feature = "lz4",
+                    feature = "lzma",
+                    feature = "deflate",
+                    feature = "zstd"
+                ))]
+                BlockPlan::Encoded(extent) => {
+                    let data = self
+                        .image
+                        .get(extent.offset..extent.offset + extent.size as u64)
+                        .ok_or_else(|| {
+                            Error::OutOfBounds("failed to read compressed data".to_string())
+                        })?;
+                    return extent.decode(data).map(Cow::Owned);
                 }
             }
         }

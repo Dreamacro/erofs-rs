@@ -19,7 +19,7 @@ chrono = { workspace = true, default-features = false, features = [
     "clock",
 ] }
 clap = { workspace = true, default-features = true, features = ["derive"] }
-erofs-rs = { path = "../erofs", features = ["opendal"] }
+erofs-rs = { path = "../erofs", features = ["opendal", "lz4", "lzma", "deflate", "zstd"] }
 memmap2 = { workspace = true, default-features = true }
 opendal = { workspace = true, default-features = true, features = ["services-http"] }
 tar = { workspace = true, default-features = true }

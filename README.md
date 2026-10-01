@@ -10,6 +10,7 @@ A pure Rust library for reading and building [EROFS](https://docs.kernel.org/fil
 - Zero-copy parsing via mmap (std) or byte slices (no_std)
 - Directory traversal and file reading
 - Multiple data layouts: flat plain, flat inline, chunk-based
+- Optional LZ4, MicroLZMA, DEFLATE, and Zstd decoding with shared sync/async mapping and per-file decoded-extent caching
 
 ## Usage
 
@@ -71,6 +72,11 @@ fn main() -> erofs_rs::Result<()> {
 
 - `std` (default): Enables standard library support, including mmap backend
 - `opendal`: Enables async I/O via [Apache OpenDAL](https://opendal.apache.org/), supporting remote backends (HTTP, S3, etc.)
+- `lz4`: Enables LZ4 decoding via `lz4_flex`, without requiring `std`
+- `lzma`: Enables EROFS MicroLZMA decoding via `lzma-rs`; implies `std`
+- `deflate`: Enables raw DEFLATE decoding via `miniz_oxide`, without requiring `std`
+- `zstd`: Enables Zstd decoding via `ruzstd`, without requiring `std`
+- All four codec features are enabled in the CLI
 - Without `std`: Operates in `no_std` mode with `alloc`
 
 ```toml
@@ -118,13 +124,14 @@ erofs-cli inspect -i http://example.com/images/system.erofs cat /etc/os-release
 - [x] Flat plain layout
 - [x] Flat inline layout
 - [x] Chunk-based layout (without chunk indexes)
+- [x] LZ4, MicroLZMA, DEFLATE, and Zstd compressed data (subset described above)
 - [x] Directory walk (`walk_dir`)
 - [x] Convert to tar archive
 
 ### TODO
 
 - [ ] Extended attributes
-- [ ] Compressed data (lz4, lzma, deflate)
+- [ ] Remaining compression layouts
 - [ ] Image building (`mkfs.erofs` equivalent)
 
 ## License
