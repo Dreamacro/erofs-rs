@@ -61,7 +61,7 @@ impl<'a, I: Image> WalkDir<'a, I> {
     fn get_walk_dir_entry(&mut self, dir_entry: DirEntry, depth: usize) -> Result<WalkDirEntry> {
         let inode = self.erofs.get_inode(dir_entry.nid())?;
 
-        if (depth < self.max_depth || self.max_depth == 0) && dir_entry.file_type().is_dir() {
+        if (depth < self.max_depth || self.max_depth == 0) && inode.is_dir() {
             let child_dir = ReadDir::new(self.erofs, inode, dir_entry.path())?;
             self.dir_stack.push((depth + 1, child_dir));
         }

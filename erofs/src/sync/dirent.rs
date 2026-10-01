@@ -1,3 +1,4 @@
+use alloc::borrow::Cow;
 use typed_path::{UnixPath, UnixPathBuf};
 
 use super::EroFS;
@@ -10,8 +11,8 @@ pub struct ReadDir<'a, I: Image> {
     dir: UnixPathBuf,
     inode: Inode,
     erofs: &'a EroFS<I>,
-    dirent_block: DirentBlock<&'a [u8]>,
-    offset: usize,
+    dirent_block: DirentBlock<Cow<'a, [u8]>>,
+    offset: u64,
 }
 
 impl<'a, I: Image> ReadDir<'a, I> {
@@ -40,7 +41,7 @@ impl<'a, I: Image> ReadDir<'a, I> {
             match self.dirent_block.next_entry()? {
                 Some(entry) => return Ok(Some(entry)),
                 None => {
-                    self.offset += self.dirent_block.block_size();
+                    self.offset += self.dirent_block.block_size() as u64;
                     if self.offset < self.inode.data_size() {
                         let block = self.erofs.get_inode_block(&self.inode, self.offset)?;
                         self.dirent_block = DirentBlock::new(self.dir.clone(), block)?;

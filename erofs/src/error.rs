@@ -9,9 +9,6 @@ pub enum Error {
     #[error("invalid dirent file type: {0}")]
     InvalidDirentFileType(u8),
 
-    #[error("invalid layout: {0}")]
-    InvalidLayout(u8),
-
     #[error("path not found: {0}")]
     PathNotFound(String),
 
@@ -34,7 +31,7 @@ pub enum Error {
     BinRead(#[cfg_attr(feature = "std", from)] binrw::Error),
 
     #[error("out of range {0} of {1}")]
-    OutOfRange(usize, usize),
+    OutOfRange(u64, u64),
 
     #[error("{0} not supported yet")]
     NotSupported(String),

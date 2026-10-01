@@ -1,6 +1,4 @@
-use core::cmp;
-
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 
 use super::EroFS;
 use crate::Result;
@@ -14,8 +12,8 @@ use crate::types::Inode;
 pub struct File<'a, I: AsyncImage> {
     inode: Inode,
     erofs: &'a EroFS<I>,
-    offset: usize,
-    buf: Option<Bytes>,
+    offset: u64,
+    buf: Bytes,
 }
 
 impl<'a, I: AsyncImage> File<'a, I> {
@@ -24,50 +22,38 @@ impl<'a, I: AsyncImage> File<'a, I> {
             inode,
             erofs,
             offset: 0,
-            buf: None,
+            buf: Bytes::new(),
         }
     }
 
     /// Returns the size of the file in bytes.
-    pub fn size(&self) -> usize {
+    pub fn size(&self) -> u64 {
         self.inode.data_size()
     }
 
     /// Asynchronously reads file contents into `buf`.
     ///
-    /// Returns the number of bytes read, or `0` if EOF has been reached.
+    /// Returns the number of bytes read, or `0` at EOF or for an empty buffer.
+    /// A successful read may fill only part of `buf`. Errors do not advance the position.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        if self.offset >= self.inode.data_size() {
+        if buf.is_empty() || self.offset >= self.inode.data_size() {
             return Ok(0);
         }
 
-        if let Some(ref data) = self.buf {
-            let offset = self.offset % self.erofs.block_size();
-            let data_remaining = data.len().saturating_sub(offset);
-            let n = cmp::min(buf.len(), data_remaining);
-            buf[..n].copy_from_slice(&data[offset..offset + n]);
-            self.offset += n;
-            if n == data_remaining {
-                self.buf = None;
-            }
-            return Ok(n);
+        if self.buf.is_empty() {
+            self.buf = self
+                .erofs
+                .read_inode_block(&self.inode, self.offset)
+                .await?
+                .into();
         }
 
-        let block_size = self.erofs.block_size();
-        let cur_offset = self.offset;
-        let block = self.erofs.read_inode_block(&self.inode, cur_offset).await?;
-        if buf.len() >= block.len() {
-            let n = block.len();
-            buf[..n].copy_from_slice(&block);
-            self.offset += n;
-            Ok(n)
-        } else {
-            let offset = cur_offset % block_size;
-            let n = cmp::min(buf.len(), block.len().saturating_sub(offset));
-            buf[..n].copy_from_slice(&block[offset..offset + n]);
-            self.buf = Some(Bytes::from(block));
-            self.offset += n;
-            Ok(n)
+        let n = buf.len().min(self.buf.len());
+        self.buf.copy_to_slice(&mut buf[..n]);
+        self.offset += n as u64;
+        if self.buf.is_empty() {
+            self.buf = Bytes::new();
         }
+        Ok(n)
     }
 }

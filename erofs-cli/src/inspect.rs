@@ -1,4 +1,4 @@
-use std::{os::unix::fs::PermissionsExt, time::UNIX_EPOCH};
+use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local};
@@ -102,15 +102,8 @@ fn format_size(inode: &Inode) -> String {
 }
 
 fn format_time(inode: &Inode) -> String {
-    let Some(time) = inode
-        .modified()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-    else {
-        return String::new();
-    };
-    let dt = i64::try_from(time.as_secs())
-        .ok()
-        .and_then(|secs| DateTime::from_timestamp(secs, time.subsec_nanos()))
+    let (secs, nanos) = inode.modified_unix();
+    let dt = DateTime::from_timestamp(secs, nanos)
         .map(|dt| dt.with_timezone(&Local))
         .and_then(|dt| dt.naive_utc().checked_add_offset(*dt.offset()));
     let Some(dt) = dt else {

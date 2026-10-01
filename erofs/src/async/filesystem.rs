@@ -1,9 +1,8 @@
 use alloc::format;
 use alloc::vec::Vec;
-use typed_path::Component;
 
 use bytes::Buf;
-use typed_path::{UnixComponent, UnixPath};
+use typed_path::UnixPath;
 
 use super::file::File;
 use super::walkdir::WalkDir;
@@ -17,6 +16,9 @@ use crate::{Error, Result};
 ///
 /// `EroFS` provides async methods to traverse directories, open files, and access
 /// filesystem metadata from EROFS images.
+///
+/// Paths are resolved component by component from the image root, including `.`
+/// and `..`. Symbolic links are not followed; a trailing slash requires a directory.
 #[derive(Debug, Clone)]
 pub struct EroFS<I: AsyncImage> {
     image: I,
@@ -25,6 +27,8 @@ pub struct EroFS<I: AsyncImage> {
 
 impl<I: AsyncImage> EroFS<I> {
     /// Creates a new async `EroFS` instance from an async backend image source.
+    ///
+    /// Rejects images requiring unsupported incompatible features or extra devices.
     pub async fn new(image: I) -> Result<Self> {
         let mut super_block = vec![0u8; SuperBlock::size()];
         image
@@ -62,7 +66,7 @@ impl<I: AsyncImage> EroFS<I> {
 
     /// Opens a file from an inode directly.
     ///
-    /// This is useful when you already have an inode from directory traversal.
+    /// The inode must originate from this filesystem, for example from directory traversal.
     pub fn open_inode_file(&self, inode: Inode) -> Result<File<'_, I>> {
         if !inode.is_file() {
             return Err(Error::NotAFile(format!(
@@ -71,7 +75,6 @@ impl<I: AsyncImage> EroFS<I> {
             )));
         }
 
-        inode.try_data_size()?;
         Ok(File::new(inode, self))
     }
 
@@ -80,55 +83,51 @@ impl<I: AsyncImage> EroFS<I> {
         &self.core.super_block
     }
 
-    pub(crate) fn block_size(&self) -> usize {
-        self.core.block_size
-    }
-
     pub async fn get_inode(&self, nid: u64) -> Result<Inode> {
         let offset = self.core.get_inode_offset(nid)?;
-        offset
-            .checked_add(InodeExtended::size())
+        let compact_size = InodeCompact::size();
+        let extended_offset = offset
+            .checked_add(compact_size as u64)
             .ok_or(Error::Overflow("inode read range"))?;
-        let mut buf = vec![0u8; InodeExtended::size()];
-        self.image.read_exact_at(&mut buf, offset).await?;
-        self.core.parse_inode(&buf, nid)
+        let mut buf = [0u8; InodeExtended::size()];
+        self.image
+            .read_exact_at(&mut buf[..compact_size], offset)
+            .await?;
+        let (_, size) = EroFSCore::inode_header(&buf[..compact_size])?;
+        if size > compact_size {
+            offset
+                .checked_add(size as u64)
+                .ok_or(Error::Overflow("inode read range"))?;
+            self.image
+                .read_exact_at(&mut buf[compact_size..size], extended_offset)
+                .await?;
+        }
+        self.core.parse_inode(&buf[..size], nid)
     }
 
-    pub(crate) async fn read_inode_block(&self, inode: &Inode, offset: usize) -> Result<Vec<u8>> {
-        match self.core.plan_inode_block_read(inode, offset)? {
-            BlockPlan::Direct { offset, size } => {
-                if size > self.core.block_size {
-                    return Err(Error::CorruptedData(format!(
-                        "invalid direct block size {} at offset {}",
-                        size, offset
-                    )));
+    pub(crate) async fn read_inode_block(&self, inode: &Inode, offset: u64) -> Result<Vec<u8>> {
+        let mut plan = self.core.plan_inode_block_read(inode, offset)?;
+        loop {
+            match plan {
+                BlockPlan::Direct { offset, size } => {
+                    let mut buf = vec![0u8; size];
+                    self.image.read_exact_at(&mut buf, offset).await?;
+                    return Ok(buf);
                 }
+                BlockPlan::Hole { size } => return Ok(vec![0; size]),
+                BlockPlan::Chunked {
+                    addr_offset,
+                    block_index,
+                    size,
+                } => {
+                    let mut addr_buf = [0u8; 4];
+                    self.image.read_exact_at(&mut addr_buf, addr_offset).await?;
+                    let chunk_addr = (&addr_buf[..]).get_u32_le();
 
-                let mut buf = vec![0u8; size];
-                self.image.read_exact_at(&mut buf, offset).await?;
-                Ok(buf)
-            }
-            BlockPlan::Chunked {
-                addr_offset,
-                chunk_fixed,
-                chunk_size,
-                data_size,
-                chunk_index,
-            } => {
-                let mut addr_buf = vec![0u8; 4];
-                self.image.read_exact_at(&mut addr_buf, addr_offset).await?;
-                let chunk_addr = (&addr_buf[..]).get_i32_le();
-
-                let (offset, size) = self.core.resolve_chunk_read(
-                    chunk_addr,
-                    chunk_fixed,
-                    chunk_size,
-                    data_size,
-                    chunk_index,
-                )?;
-                let mut buf = vec![0u8; size];
-                self.image.read_exact_at(&mut buf, offset).await?;
-                Ok(buf)
+                    plan = self
+                        .core
+                        .resolve_chunk_read(chunk_addr, block_index, size)?;
+                }
             }
         }
     }
@@ -136,13 +135,15 @@ impl<I: AsyncImage> EroFS<I> {
     pub(crate) async fn get_path_inode(&self, path: &UnixPath) -> Result<Option<Inode>> {
         let mut nid = self.core.super_block.root_nid as u64;
 
-        let path = path.normalize();
-        'outer: for part in path.components() {
-            if part == UnixComponent::RootDir {
-                continue;
-            }
-
+        'outer: for part in path
+            .as_bytes()
+            .split(|&b| b == b'/')
+            .filter(|p| !p.is_empty())
+        {
             let inode = self.get_inode(nid).await?;
+            if !inode.is_dir() {
+                return Err(Error::NotADirectory(path.to_string_lossy().into_owned()));
+            }
             let block_count = inode.data_size().div_ceil(self.core.block_size);
             if block_count == 0 {
                 return Ok(None);
@@ -152,7 +153,7 @@ impl<I: AsyncImage> EroFS<I> {
                 let block = self
                     .read_inode_block(&inode, i * self.core.block_size)
                     .await?;
-                if let Some(found_nid) = dirent::find_nodeid_by_name(part.as_bytes(), &block)? {
+                if let Some(found_nid) = dirent::find_nodeid_by_name(part, &block)? {
                     nid = found_nid;
                     continue 'outer;
                 }
@@ -161,6 +162,9 @@ impl<I: AsyncImage> EroFS<I> {
         }
 
         let inode = self.get_inode(nid).await?;
+        if path.as_bytes().ends_with(b"/") && !inode.is_dir() {
+            return Err(Error::NotADirectory(path.to_string_lossy().into_owned()));
+        }
         Ok(Some(inode))
     }
 }

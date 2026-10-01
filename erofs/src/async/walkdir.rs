@@ -63,7 +63,7 @@ impl<'a, I: AsyncImage> WalkDir<'a, I> {
     ) -> Result<WalkDirEntry> {
         let inode = self.erofs.get_inode(dir_entry.nid()).await?;
 
-        if (depth < self.max_depth || self.max_depth == 0) && dir_entry.file_type().is_dir() {
+        if (depth < self.max_depth || self.max_depth == 0) && inode.is_dir() {
             let child_dir = ReadDir::new(self.erofs, inode, dir_entry.path()).await?;
             self.dir_stack.push((depth + 1, child_dir));
         }

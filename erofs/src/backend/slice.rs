@@ -45,17 +45,17 @@ impl<'a> SliceImage<'a> {
 }
 
 impl<'a> Image for SliceImage<'a> {
-    fn get<R: ops::RangeBounds<usize>>(&self, range: R) -> Option<&[u8]> {
+    fn get<R: ops::RangeBounds<u64>>(&self, range: R) -> Option<&[u8]> {
         let start = match range.start_bound() {
-            core::ops::Bound::Included(&s) => s,
-            core::ops::Bound::Excluded(&s) => s.checked_add(1)?,
-            core::ops::Bound::Unbounded => 0,
+            ops::Bound::Included(&s) => usize::try_from(s).ok()?,
+            ops::Bound::Excluded(&s) => usize::try_from(s).ok()?.checked_add(1)?,
+            ops::Bound::Unbounded => 0,
         };
 
         let end = match range.end_bound() {
-            core::ops::Bound::Included(&e) => e.checked_add(1)?,
-            core::ops::Bound::Excluded(&e) => e,
-            core::ops::Bound::Unbounded => self.0.len(),
+            ops::Bound::Included(&e) => usize::try_from(e).ok()?.checked_add(1)?,
+            ops::Bound::Excluded(&e) => usize::try_from(e).ok()?,
+            ops::Bound::Unbounded => self.0.len(),
         };
 
         self.0.get(start..end)

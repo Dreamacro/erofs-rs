@@ -51,7 +51,7 @@ fn validate_dirent_block(data: &[u8]) -> Result<usize> {
 
 fn read_entry(data: &[u8], index: usize, count: usize) -> Result<(Dirent, &[u8])> {
     if index >= count {
-        return Err(Error::OutOfRange(index, count));
+        return Err(Error::OutOfRange(index as u64, count as u64));
     }
     let dirent = read_nth_dirent(data, index)?;
     let name_start = usize::from(dirent.name_off);

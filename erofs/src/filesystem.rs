@@ -3,56 +3,54 @@ use alloc::{format, string::ToString};
 use binrw::BinRead;
 use binrw::BinReaderExt;
 use binrw::io::Cursor;
+use rustix::fs::FileType;
 
 use crate::types::*;
 use crate::{Error, Result};
 
-/// Shared core data and pure computation logic for EROFS filesystem.
-///
-/// This struct is used by both sync and async `EroFS` implementations
-/// to avoid duplicating parsing and calculation logic.
+// Compression and xattr flags may coexist with readable uncompressed files.
+// The 48-bit and metabox layouts, and all unknown flags, must be rejected.
+const SUPPORTED_INCOMPAT_FEATURES: u32 = 0x007f;
+const FEATURE_INCOMPAT_DEVICE_TABLE: u32 = 0x0008;
+
+/// Shared parsing and mapping logic, independent of synchronous/asynchronous I/O.
 #[derive(Debug, Clone)]
 pub struct EroFSCore {
     pub(crate) super_block: SuperBlock,
-    pub(crate) block_size: usize,
+    pub(crate) block_size: u64,
 }
 
-/// Describes a planned block read operation.
-///
-/// Used by both sync and async implementations to share the layout
-/// calculation logic, while keeping the actual I/O separate.
+/// A bounded block read, or a chunk reference that must first be resolved.
 pub enum BlockPlan {
-    /// A direct read: read `size` bytes at `offset`.
-    Direct { offset: usize, size: usize },
-    /// A two-phase read for chunk-based layout:
-    /// 1. Read 4 bytes at `addr_offset` to get chunk address
-    /// 2. Call `resolve_chunk_read()` with the chunk address
+    Direct {
+        offset: u64,
+        size: usize,
+    },
+    Hole {
+        size: usize,
+    },
+    /// Read a u32 at `addr_offset`, then call `resolve_chunk_read()`.
     Chunked {
-        addr_offset: usize,
-        chunk_fixed: usize,
-        chunk_size: usize,
-        data_size: usize,
-        chunk_index: usize,
+        addr_offset: u64,
+        block_index: u32,
+        size: usize,
     },
 }
 
 impl BlockPlan {
-    fn direct(offset: usize, size: usize) -> Result<Self> {
+    fn direct(offset: u64, size: usize) -> Result<Self> {
         offset
-            .checked_add(size)
+            .checked_add(size as u64)
             .ok_or(Error::Overflow("block read range"))?;
         Ok(Self::Direct { offset, size })
     }
 }
 
 impl EroFSCore {
-    /// Parse and validate a superblock from raw bytes.
-    ///
-    /// `data` should be the bytes starting at `SUPER_BLOCK_OFFSET`.
+    /// Parse and validate a superblock starting at `SUPER_BLOCK_OFFSET`.
     pub(crate) fn new(data: &[u8]) -> Result<Self> {
         let mut cursor = Cursor::new(data);
         let super_block = SuperBlock::read(&mut cursor)?;
-
         let magic_number = super_block.magic;
         let blk_size_bits = super_block.blk_size_bits;
 
@@ -62,187 +60,250 @@ impl EroFSCore {
                 magic_number
             )));
         }
-
         if !(9..=24).contains(&blk_size_bits) {
             return Err(Error::InvalidSuperblock(format!(
                 "invalid block size bits: {}",
                 blk_size_bits
             )));
         }
-
-        let block_size = 1usize << blk_size_bits;
+        let unsupported = super_block.feature_incompat & !SUPPORTED_INCOMPAT_FEATURES;
+        if unsupported != 0 {
+            return Err(Error::NotSupported(format!(
+                "incompatible filesystem features {:#010x}",
+                unsupported
+            )));
+        }
+        // This bit also advertises compression HEAD2, so check the device count.
+        if super_block.feature_incompat & FEATURE_INCOMPAT_DEVICE_TABLE != 0
+            && super_block.extra_devices != 0
+        {
+            return Err(Error::NotSupported("multiple devices".to_string()));
+        }
+        if super_block.build_time_ns >= 1_000_000_000 {
+            return Err(Error::InvalidSuperblock(
+                "invalid build time nanoseconds".to_string(),
+            ));
+        }
+        let block_size = 1u64 << blk_size_bits;
         Ok(Self {
             super_block,
             block_size,
         })
     }
 
-    /// Parse an inode from raw bytes.
-    pub(crate) fn parse_inode(&self, data: &[u8], nid: u64) -> Result<Inode> {
-        let mut inode_buf = Cursor::new(data);
-        let layout: u16 = inode_buf.read_le()?;
-        inode_buf.set_position(0);
-        let inode = if Inode::is_compact_format(layout) {
-            Inode::Compact((nid, InodeCompact::read(&mut inode_buf)?))
+    /// Validate the format before choosing an on-disk inode structure.
+    pub(crate) fn inode_header(data: &[u8]) -> Result<(Layout, usize)> {
+        let format: u16 = Cursor::new(data).read_le()?;
+        if format & !0x000f != 0 {
+            return Err(Error::NotSupported(format!(
+                "inode format bits {:#06x}",
+                format & !0x000f
+            )));
+        }
+        let layout = Layout::try_from(((format & 0x0e) >> 1) as u8)?;
+        let size = if format & 1 == 0 {
+            InodeCompact::size()
         } else {
-            Inode::Extended((nid, InodeExtended::read(&mut inode_buf)?))
+            InodeExtended::size()
         };
-        inode.try_data_size()?;
+        Ok((layout, size))
+    }
+
+    /// Parse raw disk fields into validated, version-independent metadata.
+    pub(crate) fn parse_inode(&self, data: &[u8], nid: u64) -> Result<Inode> {
+        let (layout, inode_size) = Self::inode_header(data)?;
+        if data.len() < inode_size {
+            return Err(Error::CorruptedData("truncated inode".to_string()));
+        }
+        let mut cursor = Cursor::new(data);
+        let (mut inode, raw_data, xattr_count) = if inode_size == InodeCompact::size() {
+            let raw = InodeCompact::read(&mut cursor)?;
+            (
+                Inode {
+                    nid,
+                    data_size: u64::from(raw.size),
+                    file_type: FileType::from_raw_mode(raw.mode.into()),
+                    mode: raw.mode & 0o7777,
+                    uid: u32::from(raw.uid),
+                    gid: u32::from(raw.gid),
+                    nlink: u32::from(raw.nlink),
+                    modified: (
+                        self.super_block.build_time as i64,
+                        self.super_block.build_time_ns,
+                    ),
+                    data: InodeData::None,
+                    inode_size,
+                    xattr_size: 0,
+                },
+                raw.inode_data,
+                raw.xattr_count,
+            )
+        } else {
+            let raw = InodeExtended::read(&mut cursor)?;
+            (
+                Inode {
+                    nid,
+                    data_size: raw.size,
+                    file_type: FileType::from_raw_mode(raw.mode.into()),
+                    mode: raw.mode & 0o7777,
+                    uid: raw.uid,
+                    gid: raw.gid,
+                    nlink: raw.nlink,
+                    modified: (raw.mtime as i64, raw.mtime_ns),
+                    data: InodeData::None,
+                    inode_size,
+                    xattr_size: 0,
+                },
+                raw.inode_data,
+                raw.xattr_count,
+            )
+        };
+        if inode.modified.1 >= 1_000_000_000 {
+            return Err(Error::CorruptedData(
+                "invalid inode modification time".to_string(),
+            ));
+        }
+        inode.xattr_size = if xattr_count == 0 {
+            0
+        } else {
+            usize::from(xattr_count - 1) * size_of::<XattrEntry>() + size_of::<XattrHeader>()
+        };
+        inode.data = match inode.file_type {
+            FileType::RegularFile | FileType::Directory | FileType::Symlink => match layout {
+                Layout::FlatPlain if raw_data == u32::MAX => InodeData::Hole,
+                Layout::FlatPlain => InodeData::FlatPlain {
+                    start_block: raw_data,
+                },
+                Layout::FlatInline => InodeData::FlatInline {
+                    start_block: raw_data,
+                },
+                Layout::CompressedFull => InodeData::CompressedFull,
+                Layout::CompressedCompact => InodeData::CompressedCompact,
+                Layout::ChunkBased => {
+                    let format = raw_data as u16;
+                    if format & !(LAYOUT_CHUNK_FORMAT_BITS | LAYOUT_CHUNK_FORMAT_INDEXES) != 0 {
+                        return Err(Error::NotSupported(format!(
+                            "chunk based format {format:#06x}"
+                        )));
+                    }
+                    let bits =
+                        (format & LAYOUT_CHUNK_FORMAT_BITS) as u8 + self.super_block.blk_size_bits;
+                    InodeData::ChunkBased {
+                        chunk_size: 1u64 << bits,
+                        indexes: format & LAYOUT_CHUNK_FORMAT_INDEXES != 0,
+                    }
+                }
+            },
+            FileType::CharacterDevice | FileType::BlockDevice => InodeData::Device {
+                major: (raw_data >> 8) & 0xfff,
+                minor: (raw_data & 0xff) | ((raw_data >> 12) & 0xfff00),
+            },
+            FileType::Fifo | FileType::Socket => InodeData::None,
+            _ => return Err(Error::CorruptedData("invalid inode file type".to_string())),
+        };
+        if matches!(inode.data, InodeData::FlatInline { .. }) && inode.data_size != 0 {
+            let size = (inode.data_size - 1) % self.block_size + 1;
+            let offset = self.inode_tail_offset(&inode)?;
+            if size > self.block_size - offset % self.block_size {
+                return Err(Error::CorruptedData(
+                    "inline data crosses metadata block boundary".to_string(),
+                ));
+            }
+        }
         Ok(inode)
     }
 
-    /// Plan a block read operation for the given inode and offset.
-    ///
-    /// Returns a `BlockPlan` describing what bytes to read.
-    /// For `BlockPlan::Chunked`, the caller must perform an additional
-    /// read and call `resolve_chunk_read()`.
-    pub(crate) fn plan_inode_block_read(&self, inode: &Inode, offset: usize) -> Result<BlockPlan> {
-        let data_size = inode.try_data_size()?;
-        match inode.layout()? {
-            Layout::FlatPlain => {
-                let block_count = data_size.div_ceil(self.block_size);
-                let block_index = offset / self.block_size;
-                if block_index >= block_count {
-                    return Err(Error::OutOfRange(block_index, block_count));
-                }
-
-                let block_start = block_index * self.block_size;
-                let size = (data_size - block_start).min(self.block_size);
+    /// Map a logical file offset to at most one block of data.
+    /// For `Chunked`, the caller reads the address and calls `resolve_chunk_read()`.
+    pub(crate) fn plan_inode_block_read(&self, inode: &Inode, offset: u64) -> Result<BlockPlan> {
+        let data_size = inode.data_size();
+        if offset >= data_size {
+            return Err(Error::OutOfRange(offset, data_size));
+        }
+        let block_size = self.block_size;
+        let block_start = offset / block_size * block_size;
+        // Narrow only the bounded size of the buffer to be materialized.
+        let size = usize::try_from((data_size - block_start).min(block_size))
+            .map_err(|_| Error::Overflow("block read size"))?;
+        match inode.data {
+            InodeData::Hole => Ok(BlockPlan::Hole { size }),
+            InodeData::FlatInline { .. } if data_size - block_start <= block_size => {
+                BlockPlan::direct(self.inode_tail_offset(inode)?, size)
+            }
+            InodeData::FlatPlain { start_block } | InodeData::FlatInline { start_block } => {
                 let offset = self
-                    .block_offset(inode.raw_block_addr())?
+                    .block_offset(start_block)
                     .checked_add(block_start)
                     .ok_or(Error::Overflow("file block offset"))?;
                 BlockPlan::direct(offset, size)
             }
-            Layout::FlatInline => {
-                let block_count = data_size.div_ceil(self.block_size);
-                let block_index = offset / self.block_size;
-                if block_index >= block_count {
-                    return Err(Error::OutOfRange(block_index, block_count));
-                }
-
-                if block_index == block_count - 1 {
-                    let size = data_size % self.block_size;
-                    if size == 0 {
-                        return Err(Error::CorruptedData("empty inline tail".to_string()));
-                    }
-                    return BlockPlan::direct(self.inode_tail_offset(inode)?, size);
-                }
-
-                let offset = self
-                    .block_offset(inode.raw_block_addr())?
-                    .checked_add(block_index * self.block_size)
-                    .ok_or(Error::Overflow("file block offset"))?;
-                BlockPlan::direct(offset, self.block_size)
+            InodeData::CompressedFull | InodeData::CompressedCompact => {
+                Err(Error::NotSupported("compressed data".to_string()))
             }
-            Layout::CompressedFull | Layout::CompressedCompact => {
-                Err(Error::NotSupported("compressed compact layout".to_string()))
-            }
-            Layout::ChunkBased => {
-                let chunk_format = ChunkBasedFormat::new(inode.raw_block_addr());
-                if !chunk_format.is_valid() {
-                    return Err(Error::CorruptedData(format!(
-                        "invalid chunk based format {}",
-                        inode.raw_block_addr()
-                    )));
-                } else if chunk_format.is_indexes() {
-                    return Err(Error::NotSupported(
-                        "chunk based format with indexes".to_string(),
-                    ));
-                }
-
-                let chunk_bits = chunk_format.chunk_size_bits() + self.super_block.blk_size_bits;
-                let chunk_size = 1usize
-                    .checked_shl(u32::from(chunk_bits))
-                    .ok_or(Error::Overflow("chunk size"))?;
-                let chunk_count = data_size.div_ceil(chunk_size);
-                let chunk_index = offset / chunk_size;
-                let chunk_fixed = offset % chunk_size / self.block_size;
-                if chunk_index >= chunk_count {
-                    return Err(Error::OutOfRange(chunk_index, chunk_count));
-                }
-
+            InodeData::ChunkBased { indexes: true, .. } => Err(Error::NotSupported(
+                "chunk based format with indexes".to_string(),
+            )),
+            InodeData::ChunkBased {
+                chunk_size,
+                indexes: false,
+            } => {
+                let chunk_index = block_start / chunk_size;
+                let block_index = u32::try_from(block_start % chunk_size / block_size)
+                    .map_err(|_| Error::Overflow("chunk block index"))?;
+                let index_offset = chunk_index
+                    .checked_mul(4)
+                    .ok_or(Error::Overflow("chunk index offset"))?;
                 let addr_offset = self
                     .inode_tail_offset(inode)?
-                    .checked_add(chunk_index * 4)
+                    .checked_add(index_offset)
                     .ok_or(Error::Overflow("chunk address offset"))?;
                 addr_offset
                     .checked_add(4)
                     .ok_or(Error::Overflow("chunk address range"))?;
-
                 Ok(BlockPlan::Chunked {
                     addr_offset,
-                    chunk_fixed,
-                    chunk_size,
-                    data_size,
-                    chunk_index,
+                    block_index,
+                    size,
                 })
             }
+            InodeData::Device { .. } | InodeData::None => Err(Error::NotAFile(format!(
+                "inode {} has no file data",
+                inode.id()
+            ))),
         }
     }
 
-    /// Resolve the final read offset and size for a chunk-based block read.
-    ///
-    /// `chunk_addr` is the i32 value read from `addr_offset` in the `Chunked` plan.
-    /// `chunk_size` is the full chunk size in bytes (may span multiple blocks).
+    /// Decode a disk chunk address, resolving the null address to a hole.
     pub(crate) fn resolve_chunk_read(
         &self,
-        chunk_addr: i32,
-        chunk_fixed: usize,
-        chunk_size: usize,
-        data_size: usize,
-        chunk_index: usize,
-    ) -> Result<(usize, usize)> {
-        if chunk_addr <= 0 {
-            return Err(Error::CorruptedData(
-                "sparse chunks are not supported".to_string(),
-            ));
+        chunk_addr: u32,
+        block_index: u32,
+        size: usize,
+    ) -> Result<BlockPlan> {
+        if chunk_addr == u32::MAX {
+            return Ok(BlockPlan::Hole { size });
         }
-
-        let chunk_offset = chunk_fixed
-            .checked_mul(self.block_size)
-            .ok_or(Error::Overflow("chunk offset"))?;
-        let file_byte_offset = chunk_index
-            .checked_mul(chunk_size)
-            .and_then(|offset| offset.checked_add(chunk_offset))
-            .ok_or(Error::Overflow("file chunk offset"))?;
-        let remaining = data_size.saturating_sub(file_byte_offset);
-        let read_size = remaining.min(self.block_size);
-
-        if read_size == 0 {
-            return Err(Error::OutOfRange(file_byte_offset, data_size));
-        }
-
-        let chunk_fixed =
-            u32::try_from(chunk_fixed).map_err(|_| Error::Overflow("chunk block index"))?;
-        let block = (chunk_addr as u32)
-            .checked_add(chunk_fixed)
+        let block = chunk_addr
+            .checked_add(block_index)
             .ok_or(Error::Overflow("chunk block address"))?;
-        let offset = self.block_offset(block)?;
-        offset
-            .checked_add(read_size)
-            .ok_or(Error::Overflow("chunk read range"))?;
-        Ok((offset, read_size))
+        BlockPlan::direct(self.block_offset(block), size)
     }
 
-    pub(crate) fn get_inode_offset(&self, nid: u64) -> Result<usize> {
-        let base = self.block_offset(self.super_block.meta_blk_addr)?;
-        usize::try_from(nid)
-            .ok()
-            .and_then(|nid| nid.checked_mul(InodeCompact::size()))
+    pub(crate) fn get_inode_offset(&self, nid: u64) -> Result<u64> {
+        let base = self.block_offset(self.super_block.meta_blk_addr);
+        nid.checked_mul(InodeCompact::size() as u64)
             .and_then(|offset| base.checked_add(offset))
             .ok_or(Error::Overflow("inode offset"))
     }
 
-    fn inode_tail_offset(&self, inode: &Inode) -> Result<usize> {
+    fn inode_tail_offset(&self, inode: &Inode) -> Result<u64> {
         self.get_inode_offset(inode.id())?
-            .checked_add(inode.size() + inode.xattr_size())
+            .checked_add((inode.inode_size + inode.xattr_size()) as u64)
             .ok_or(Error::Overflow("inode tail offset"))
     }
 
-    pub(crate) fn block_offset(&self, block: u32) -> Result<usize> {
-        let offset = u64::from(block) << self.super_block.blk_size_bits;
-        usize::try_from(offset).map_err(|_| Error::Overflow("block offset"))
+    pub(crate) fn block_offset(&self, block: u32) -> u64 {
+        u64::from(block) << self.super_block.blk_size_bits
     }
 }
 
@@ -281,7 +342,7 @@ mod tests {
 
         EroFSCore {
             super_block,
-            block_size: 1usize << super_block.blk_size_bits,
+            block_size: 1u64 << super_block.blk_size_bits,
         }
     }
 
@@ -291,21 +352,13 @@ mod tests {
         xattr_count: u16,
         inode_data: u32,
     ) -> Inode {
-        let format = (layout as u16) << 1;
-        let inode = InodeCompact {
-            format,
-            xattr_count,
-            mode: 0,
-            nlink: 0,
-            size: data_size,
-            reserved: 0,
-            inode_data,
-            inode: 0,
-            uid: 0,
-            gid: 0,
-            reserved2: 0,
-        };
-        Inode::Compact((1, inode))
+        let mut raw = [0u8; InodeCompact::size()];
+        raw[..2].copy_from_slice(&((layout as u16) << 1).to_le_bytes());
+        raw[2..4].copy_from_slice(&xattr_count.to_le_bytes());
+        raw[4..6].copy_from_slice(&0o100644u16.to_le_bytes());
+        raw[8..12].copy_from_slice(&data_size.to_le_bytes());
+        raw[16..20].copy_from_slice(&inode_data.to_le_bytes());
+        make_core().parse_inode(&raw, 1).expect("compact inode")
     }
 
     #[test]
@@ -332,7 +385,7 @@ mod tests {
         match plan {
             BlockPlan::Chunked { addr_offset, .. } => {
                 let inode_offset = core.get_inode_offset(inode.id()).expect("inode offset");
-                let expected = inode_offset + inode.size() + inode.xattr_size();
+                let expected = inode_offset + (InodeCompact::size() + inode.xattr_size()) as u64;
                 assert_eq!(addr_offset, expected);
             }
             _ => panic!("expected chunked plan"),

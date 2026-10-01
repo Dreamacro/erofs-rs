@@ -11,7 +11,7 @@ pub struct ReadDir<'a, I: AsyncImage> {
     inode: Inode,
     erofs: &'a EroFS<I>,
     dirent_block: DirentBlock<Vec<u8>>,
-    offset: usize,
+    offset: u64,
 }
 
 impl<'a, I: AsyncImage> ReadDir<'a, I> {
@@ -40,7 +40,7 @@ impl<'a, I: AsyncImage> ReadDir<'a, I> {
             match self.dirent_block.next_entry()? {
                 Some(entry) => return Ok(Some(entry)),
                 None => {
-                    self.offset += self.dirent_block.block_size();
+                    self.offset += self.dirent_block.block_size() as u64;
                     if self.offset < self.inode.data_size() {
                         let block_data = self
                             .erofs

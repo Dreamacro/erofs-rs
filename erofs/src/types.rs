@@ -5,13 +5,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use alloc::format;
 use binrw::BinRead;
 use rustix::fs::FileType;
 
 use crate::Error;
 
 pub const MAGIC_NUMBER: u32 = 0xe0f5e1e2;
-pub const SUPER_BLOCK_OFFSET: usize = 1024;
+pub const SUPER_BLOCK_OFFSET: u64 = 1024;
 
 pub const LAYOUT_CHUNK_FORMAT_BITS: u16 = 0x001F;
 pub const LAYOUT_CHUNK_FORMAT_INDEXES: u16 = 0x0020;
@@ -29,6 +30,7 @@ pub struct SuperBlock {
     pub ext_slots: u8,
     pub root_nid: u16,
     pub inos: u64,
+    /// Raw two's-complement Unix seconds used by compact inodes.
     pub build_time: u64,
     pub build_time_ns: u32,
     pub blocks: u32,
@@ -55,7 +57,7 @@ impl SuperBlock {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Layout {
     FlatPlain = 0,
@@ -75,7 +77,7 @@ impl TryFrom<u8> for Layout {
             2 => Ok(FlatInline),
             3 => Ok(CompressedCompact),
             4 => Ok(ChunkBased),
-            x => Err(Error::InvalidLayout(x)),
+            x => Err(Error::NotSupported(format!("inode data layout {x}"))),
         }
     }
 }
@@ -115,148 +117,131 @@ impl FileMode {
     }
 }
 
+/// Validated inode metadata, independent of the on-disk inode version.
+///
+/// Obtained from a filesystem or directory entry. Raw disk structures remain
+/// available as [`InodeCompact`] and [`InodeExtended`], but cannot be used as
+/// file handles without parsing and validation.
 #[derive(Debug, Clone, Copy)]
-pub enum Inode {
-    Compact((u64, InodeCompact)),
-    Extended((u64, InodeExtended)),
+pub struct Inode {
+    pub(crate) nid: u64,
+    pub(crate) data_size: u64,
+    pub(crate) file_type: FileType,
+    pub(crate) mode: u16,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) nlink: u32,
+    pub(crate) modified: (i64, u32),
+    pub(crate) data: InodeData,
+    pub(crate) inode_size: usize,
+    pub(crate) xattr_size: usize,
+}
+
+/// Decoded interpretation of the inode's data union.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InodeData {
+    FlatPlain { start_block: u32 },
+    FlatInline { start_block: u32 },
+    Hole,
+    ChunkBased { chunk_size: u64, indexes: bool },
+    CompressedFull,
+    CompressedCompact,
+    Device { major: u32, minor: u32 },
+    None,
 }
 
 impl Inode {
-    pub fn is_compact_format(layout: u16) -> bool {
-        (layout & 0x01) == 0
-    }
-
     pub fn id(&self) -> u64 {
-        match self {
-            Self::Compact((nid, _)) => *nid,
-            Self::Extended((nid, _)) => *nid,
+        self.nid
+    }
+
+    /// Returns the data layout, or `None` for device nodes, FIFOs and sockets.
+    pub fn layout(&self) -> Option<Layout> {
+        match self.data {
+            InodeData::FlatPlain { .. } | InodeData::Hole => Some(Layout::FlatPlain),
+            InodeData::FlatInline { .. } => Some(Layout::FlatInline),
+            InodeData::ChunkBased { .. } => Some(Layout::ChunkBased),
+            InodeData::CompressedFull => Some(Layout::CompressedFull),
+            InodeData::CompressedCompact => Some(Layout::CompressedCompact),
+            InodeData::Device { .. } | InodeData::None => None,
         }
     }
 
-    pub fn layout(&self) -> Result<Layout, Error> {
-        let format_layout = match self {
-            Self::Compact((_, n)) => n.format,
-            Self::Extended((_, n)) => n.format,
-        };
-
-        let layout = ((format_layout & 0x0E) >> 1) as u8;
-        layout.try_into()
+    /// Returns the logical file size, without narrowing to the host pointer width.
+    pub fn data_size(&self) -> u64 {
+        self.data_size
     }
 
-    pub fn size(&self) -> usize {
-        match self {
-            Self::Compact(_) => size_of::<InodeCompact>(),
-            Self::Extended(_) => size_of::<InodeExtended>(),
-        }
-    }
-
-    #[inline]
-    pub fn data_size(&self) -> usize {
-        match self {
-            Self::Compact((_, n)) => n.size as usize,
-            Self::Extended((_, n)) => n.size as usize,
-        }
-    }
-
-    pub(crate) fn try_data_size(&self) -> Result<usize, Error> {
-        let size = match self {
-            Self::Compact((_, n)) => u64::from(n.size),
-            Self::Extended((_, n)) => n.size,
-        };
-        usize::try_from(size).map_err(|_| Error::Overflow("file size"))
-    }
-
-    pub fn raw_block_addr(&self) -> u32 {
-        match self {
-            Self::Compact((_, n)) => n.inode_data,
-            Self::Extended((_, n)) => n.inode_data,
-        }
-    }
-
+    /// Returns the size of the inode's on-disk xattr body in bytes.
     pub fn xattr_size(&self) -> usize {
-        let count = match self {
-            Self::Compact((_, n)) => n.xattr_count,
-            Self::Extended((_, n)) => n.xattr_count,
-        };
-        if count == 0 {
-            0
-        } else {
-            (count - 1) as usize * size_of::<XattrEntry>() + size_of::<XattrHeader>()
-        }
-    }
-
-    pub fn xattr_count(&self) -> u16 {
-        match self {
-            Self::Compact((_, n)) => n.xattr_count,
-            Self::Extended((_, n)) => n.xattr_count,
-        }
+        self.xattr_size
     }
 
     pub fn file_type(&self) -> FileType {
-        match self {
-            Self::Compact((_, n)) => FileType::from_raw_mode(n.mode as _),
-            Self::Extended((_, n)) => FileType::from_raw_mode(n.mode as _),
-        }
+        self.file_type
     }
 
     pub fn is_dir(&self) -> bool {
-        self.file_type().is_dir()
+        self.file_type.is_dir()
     }
 
     pub fn is_file(&self) -> bool {
-        self.file_type().is_file()
+        self.file_type.is_file()
     }
 
     pub fn is_symlink(&self) -> bool {
-        self.file_type().is_symlink()
+        self.file_type.is_symlink()
     }
 
+    /// Returns permission and special mode bits, without the file type bits.
     #[cfg(feature = "std")]
     pub fn permissions(&self) -> Permissions {
-        match self {
-            Self::Compact((_, n)) => Permissions::from_mode(n.mode.into()),
-            Self::Extended((_, n)) => Permissions::from_mode(n.mode.into()),
-        }
+        Permissions::from_mode(self.mode.into())
     }
 
+    /// Returns permission and special mode bits, without the file type bits.
     #[cfg(not(feature = "std"))]
     pub fn permissions(&self) -> u16 {
-        match self {
-            Self::Compact((_, n)) => n.mode,
-            Self::Extended((_, n)) => n.mode,
-        }
+        self.mode
     }
 
-    /// Returns the extended inode's timestamp, or `None` if absent or invalid.
+    /// Returns signed Unix seconds plus nanoseconds in `0..1_000_000_000`.
+    /// Compact inode timestamps are resolved from the superblock during parsing.
+    pub fn modified_unix(&self) -> (i64, u32) {
+        self.modified
+    }
+
+    /// Returns the timestamp, or `None` if the platform cannot represent it.
     #[cfg(feature = "std")]
     pub fn modified(&self) -> Option<SystemTime> {
-        match self {
-            Self::Extended((_, n)) if n.mtime_ns < 1_000_000_000 => {
-                SystemTime::UNIX_EPOCH.checked_add(Duration::new(n.mtime, n.mtime_ns))
-            }
-            _ => None,
-        }
-    }
-
-    #[cfg(not(feature = "std"))]
-    pub fn modified(&self) -> Option<(u64, u32)> {
-        match self {
-            Self::Extended((_, n)) if n.mtime_ns < 1_000_000_000 => Some((n.mtime, n.mtime_ns)),
-            _ => None,
-        }
+        let (secs, nanos) = self.modified;
+        let duration = Duration::from_secs(secs.unsigned_abs());
+        let time = if secs < 0 {
+            SystemTime::UNIX_EPOCH.checked_sub(duration)?
+        } else {
+            SystemTime::UNIX_EPOCH.checked_add(duration)?
+        };
+        time.checked_add(Duration::from_nanos(u64::from(nanos)))
     }
 
     pub fn gid(&self) -> u32 {
-        match self {
-            Self::Compact((_, n)) => n.gid as u32,
-            Self::Extended((_, n)) => n.gid,
-        }
+        self.gid
     }
 
     pub fn uid(&self) -> u32 {
-        match self {
-            Self::Compact((_, n)) => n.uid as u32,
-            Self::Extended((_, n)) => n.uid,
+        self.uid
+    }
+
+    /// Returns the inode's hard link count.
+    pub fn nlink(&self) -> u32 {
+        self.nlink
+    }
+
+    /// Returns `(major, minor)` for character and block devices, otherwise `None`.
+    pub fn device(&self) -> Option<(u32, u32)> {
+        match self.data {
+            InodeData::Device { major, minor } => Some((major, minor)),
+            _ => None,
         }
     }
 }
@@ -298,6 +283,7 @@ pub struct InodeExtended {
     pub inode: u32,
     pub uid: u32,
     pub gid: u32,
+    /// Raw two's-complement Unix seconds; see [`Inode::modified_unix`].
     pub mtime: u64,
     pub mtime_ns: u32,
     pub nlink: u32,
@@ -369,27 +355,6 @@ impl Dirent {
     #[inline]
     pub const fn size() -> usize {
         size_of::<Self>()
-    }
-}
-
-pub struct ChunkBasedFormat(u16);
-
-impl ChunkBasedFormat {
-    pub fn new(format: u32) -> Self {
-        Self(format as u16)
-    }
-
-    pub fn is_valid(&self) -> bool {
-        let allowed_bits = LAYOUT_CHUNK_FORMAT_BITS | LAYOUT_CHUNK_FORMAT_INDEXES;
-        (self.0 & !allowed_bits) == 0
-    }
-
-    pub fn is_indexes(&self) -> bool {
-        (self.0 & LAYOUT_CHUNK_FORMAT_INDEXES) != 0
-    }
-
-    pub fn chunk_size_bits(&self) -> u8 {
-        (self.0 & LAYOUT_CHUNK_FORMAT_BITS) as u8
     }
 }
 

@@ -1,3 +1,4 @@
+use alloc::borrow::Cow;
 use core::cmp;
 
 #[cfg(feature = "std")]
@@ -43,8 +44,9 @@ pub trait Read {
 pub struct File<'a, I: Image> {
     inode: Inode,
     erofs: &'a EroFS<I>,
-    offset: usize,
-    buf: Option<&'a [u8]>,
+    offset: u64,
+    buf: Cow<'a, [u8]>,
+    buf_pos: usize,
 }
 
 impl<'a, I: Image> File<'a, I> {
@@ -53,55 +55,39 @@ impl<'a, I: Image> File<'a, I> {
             inode,
             erofs,
             offset: 0,
-            buf: None,
+            buf: Cow::Borrowed(&[]),
+            buf_pos: 0,
         }
     }
 
     /// Returns the size of the file in bytes.
-    pub fn size(&self) -> usize {
+    pub fn size(&self) -> u64 {
         self.inode.data_size()
     }
 }
 
 impl<'a, I: Image> Read for File<'a, I> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        if self.offset >= self.inode.data_size() {
+        if buf.is_empty() || self.offset >= self.inode.data_size() {
             return Ok(0);
         }
 
-        if let Some(data) = self.buf {
-            let offset = self.offset % self.erofs.block_size();
-            let data_remaining = data.len().saturating_sub(offset);
-            let n = cmp::min(buf.len(), data_remaining);
-            buf[..n].copy_from_slice(&data[offset..offset + n]);
-            self.offset += n;
-            if n == data_remaining {
-                self.buf = None;
-            }
-            return Ok(n);
+        if self.buf.is_empty() {
+            let block = self.erofs.get_inode_block(&self.inode, self.offset);
+            #[cfg(feature = "std")]
+            let block = block.map_err(std::io::Error::other);
+            self.buf = block?;
         }
 
-        let block_size = self.erofs.block_size();
-        let cur_offset = self.offset;
-        let block = self.erofs.get_inode_block(&self.inode, cur_offset);
-
-        #[cfg(feature = "std")]
-        let block = block.map_err(std::io::Error::other)?;
-        #[cfg(not(feature = "std"))]
-        let block = block?;
-
-        if buf.len() >= block.len() {
-            let n = block.len();
-            buf[..n].copy_from_slice(block);
-            self.offset += n;
-            Ok(n)
-        } else {
-            let offset = cur_offset % block_size;
-            let n = cmp::min(buf.len(), block.len().saturating_sub(offset));
-            buf[..n].copy_from_slice(&block[offset..offset + n]);
-            self.buf = Some(block);
-            self.offset += n;
-            Ok(n)
+        let data = &self.buf[self.buf_pos..];
+        let n = cmp::min(buf.len(), data.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        self.buf_pos += n;
+        self.offset += n as u64;
+        if self.buf_pos == self.buf.len() {
+            self.buf = Cow::Borrowed(&[]);
+            self.buf_pos = 0;
         }
+        Ok(n)
     }
 }

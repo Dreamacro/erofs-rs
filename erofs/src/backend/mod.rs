@@ -61,7 +61,9 @@ pub use slice::SliceImage;
 pub trait Image {
     /// Gets a slice of data at the specified range.
     ///
-    /// Returns `None` if the range is out of bounds.
+    /// The range uses `u64` image offsets, not memory indices. Returns the entire
+    /// requested range, or `None` if it is out of bounds or cannot be represented
+    /// as a borrowed slice on this platform.
     ///
     /// # Examples
     ///
@@ -73,13 +75,13 @@ pub trait Image {
     /// assert_eq!(image.get(0..5), Some(&b"Hello"[..]));
     /// assert_eq!(image.get(100..), None);
     /// ```
-    fn get<R: ops::RangeBounds<usize>>(&self, range: R) -> Option<&[u8]>;
+    fn get<R: ops::RangeBounds<u64>>(&self, range: R) -> Option<&[u8]>;
 
     /// Gets a cursor for reading data starting at the specified offset.
     ///
     /// This is a convenience method for creating a `Cursor` that can be used
     /// with binary parsing libraries like `binrw`.
-    fn get_cursor(&self, offset: usize) -> Option<Cursor<&[u8]>> {
+    fn get_cursor(&self, offset: u64) -> Option<Cursor<&[u8]>> {
         self.get(offset..).map(Cursor::new)
     }
 
@@ -107,7 +109,12 @@ pub trait Image {
 /// struct MyAsyncImage(Vec<u8>);
 ///
 /// impl AsyncImage for MyAsyncImage {
-///     async fn read_exact_at(&self, buf: &mut [u8], offset: usize) -> Result<()> {
+///     async fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+///         if buf.is_empty() {
+///             return Ok(());
+///         }
+///         // Convert only when indexing the in-memory byte vector.
+///         let offset = usize::try_from(offset).map_err(|_| Error::Overflow("slice offset"))?;
 ///         let data = self.0.get(offset..)
 ///             .and_then(|data| data.get(..buf.len()))
 ///             .ok_or_else(|| Error::OutOfBounds("read exceeds image".into()))?;
@@ -122,20 +129,18 @@ pub trait AsyncImage: Send + Sync {
     /// # Arguments
     ///
     /// * `buf` - The buffer to read data into
-    /// * `offset` - The byte offset in the image to start reading from
+    /// * `offset` - The `u64` byte offset in the image, independent of host pointer width
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` only after all `buf.len()` bytes have been read.
     /// Implementations must not report a short read as success.
+    /// An empty buffer returns `Ok(())` without backend I/O.
     ///
     /// # Errors
     ///
     /// Returns an error if the read operation fails or the image ends before
     /// `buf` is filled. On error, `buf` may have been partially modified.
-    fn read_exact_at(
-        &self,
-        buf: &mut [u8],
-        offset: usize,
-    ) -> impl Future<Output = Result<()>> + Send;
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64)
+    -> impl Future<Output = Result<()>> + Send;
 }

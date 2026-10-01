@@ -80,10 +80,9 @@ pub async fn dump(args: DumpArgs) -> Result<()> {
         "Filesystem inode count:                       {}",
         block.inos
     );
-    let created = i64::try_from(block.build_time)
-        .ok()
-        .filter(|_| block.build_time_ns < 1_000_000_000)
-        .and_then(|secs| DateTime::from_timestamp(secs, block.build_time_ns))
+    let created = (block.build_time_ns < 1_000_000_000)
+        .then(|| DateTime::from_timestamp(block.build_time as i64, block.build_time_ns))
+        .flatten()
         .map(|dt| dt.with_timezone(&Local))
         .and_then(|dt| dt.naive_utc().checked_add_offset(*dt.offset()))
         .map(|dt| dt.format("%a %b %e %H:%M:%S %Y").to_string())

@@ -1,7 +1,6 @@
-use alloc::{format, string::ToString, sync::Arc, vec::Vec};
+use alloc::{borrow::Cow, format, string::ToString, sync::Arc, vec::Vec};
 use bytes::Buf;
-use typed_path::Component;
-use typed_path::{UnixComponent, UnixPath, UnixPathBuf};
+use typed_path::{UnixPath, UnixPathBuf};
 
 use super::file::File;
 use super::walkdir::WalkDir;
@@ -16,6 +15,9 @@ use crate::{Error, Result};
 /// `EroFS` provides methods to traverse directories, open files, and access
 /// filesystem metadata from EROFS images. It supports both standard (mmap-based)
 /// and no_std (slice-based) backends.
+///
+/// Paths are resolved component by component from the image root, including `.`
+/// and `..`. Symbolic links are not followed; a trailing slash requires a directory.
 ///
 /// # Examples
 ///
@@ -80,6 +82,7 @@ impl<I: Image> EroFS<I> {
     /// - The superblock cannot be read
     /// - The magic number doesn't match EROFS format (0xE0F5E1E2)
     /// - The block size is invalid (must be 2^n where 9 ≤ n ≤ 24)
+    /// - The image requires an unsupported incompatible feature or extra devices
     ///
     /// # Examples
     ///
@@ -98,7 +101,7 @@ impl<I: Image> EroFS<I> {
     /// ```
     pub fn new(image: I) -> Result<Self> {
         let sb_data = image
-            .get(SUPER_BLOCK_OFFSET..)
+            .get(SUPER_BLOCK_OFFSET..SUPER_BLOCK_OFFSET + SuperBlock::size() as u64)
             .ok_or_else(|| Error::InvalidSuperblock("failed to read super block".to_string()))?;
         let core = EroFSCore::new(sb_data)?;
         Ok(Self {
@@ -139,7 +142,7 @@ impl<I: Image> EroFS<I> {
 
     /// Opens a file from an inode directly.
     ///
-    /// This is useful when you already have an inode from directory traversal.
+    /// The inode must originate from this filesystem, for example from directory traversal.
     pub fn open_inode_file(&self, inode: Inode) -> Result<File<'_, I>> {
         if !inode.is_file() {
             return Err(Error::NotAFile(format!(
@@ -148,25 +151,29 @@ impl<I: Image> EroFS<I> {
             )));
         }
 
-        inode.try_data_size()?;
         Ok(File::new(inode, self))
     }
 
-    /// Reads the target of a symbolic link inode without following it.
+    /// Reads the target of a symbolic link inode from this filesystem without following it.
     pub fn read_link_inode(&self, inode: Inode) -> Result<UnixPathBuf> {
         if !inode.is_symlink() {
             return Err(Error::NotASymlink(inode.id()));
         }
-        let size = inode.try_data_size()?;
+        let size = inode.data_size();
         let mut target = Vec::new();
-        for offset in (0..size).step_by(self.core.block_size) {
-            let block = self.get_inode_block(&inode, offset)?;
+        for block_index in 0..size.div_ceil(self.core.block_size) {
+            let block = self.get_inode_block(&inode, block_index * self.core.block_size)?;
+            if block.contains(&0) {
+                return Err(Error::CorruptedData(
+                    "invalid symbolic link target".to_string(),
+                ));
+            }
             target
                 .try_reserve(block.len())
                 .map_err(|_| Error::OutOfBounds("symbolic link target is too large".to_string()))?;
-            target.extend_from_slice(block);
+            target.extend_from_slice(&block);
         }
-        if target.is_empty() || target.contains(&0) {
+        if target.is_empty() {
             return Err(Error::CorruptedData(
                 "invalid symbolic link target".to_string(),
             ));
@@ -179,48 +186,59 @@ impl<I: Image> EroFS<I> {
         &self.core.super_block
     }
 
-    pub(crate) fn block_size(&self) -> usize {
-        self.core.block_size
-    }
-
     pub fn get_inode(&self, nid: u64) -> Result<Inode> {
         let offset = self.core.get_inode_offset(nid)?;
+        let compact_size = InodeCompact::size();
+        let end = offset
+            .checked_add(compact_size as u64)
+            .ok_or(Error::Overflow("inode read range"))?;
         let data = self
             .image
-            .get(offset..)
+            .get(offset..end)
             .ok_or_else(|| Error::OutOfBounds("failed to read inode format".to_string()))?;
+        let (_, size) = EroFSCore::inode_header(data)?;
+        let data = if size > compact_size {
+            let end = offset
+                .checked_add(size as u64)
+                .ok_or(Error::Overflow("inode read range"))?;
+            self.image
+                .get(offset..end)
+                .ok_or_else(|| Error::OutOfBounds("failed to read inode".to_string()))?
+        } else {
+            data
+        };
         self.core.parse_inode(data, nid)
     }
 
-    pub(crate) fn get_inode_block(&self, inode: &Inode, offset: usize) -> Result<&[u8]> {
-        match self.core.plan_inode_block_read(inode, offset)? {
-            BlockPlan::Direct { offset, size } => self
-                .image
-                .get(offset..offset + size)
-                .ok_or_else(|| Error::OutOfBounds("failed to get inode data".to_string())),
-            BlockPlan::Chunked {
-                addr_offset,
-                chunk_fixed,
-                chunk_size,
-                data_size,
-                chunk_index,
-            } => {
-                let chunk_addr = self
-                    .image
-                    .get(addr_offset..addr_offset + 4)
-                    .ok_or_else(|| Error::OutOfBounds("failed to get chunk address".to_string()))?
-                    .get_i32_le();
+    pub(crate) fn get_inode_block(&self, inode: &Inode, offset: u64) -> Result<Cow<'_, [u8]>> {
+        let mut plan = self.core.plan_inode_block_read(inode, offset)?;
+        loop {
+            match plan {
+                BlockPlan::Direct { offset, size } => {
+                    return self
+                        .image
+                        .get(offset..offset + size as u64)
+                        .map(Cow::Borrowed)
+                        .ok_or_else(|| Error::OutOfBounds("failed to get inode data".to_string()));
+                }
+                BlockPlan::Hole { size } => return Ok(Cow::Owned(vec![0; size])),
+                BlockPlan::Chunked {
+                    addr_offset,
+                    block_index,
+                    size,
+                } => {
+                    let chunk_addr = self
+                        .image
+                        .get(addr_offset..addr_offset + 4)
+                        .ok_or_else(|| {
+                            Error::OutOfBounds("failed to get chunk address".to_string())
+                        })?
+                        .get_u32_le();
 
-                let (offset, size) = self.core.resolve_chunk_read(
-                    chunk_addr,
-                    chunk_fixed,
-                    chunk_size,
-                    data_size,
-                    chunk_index,
-                )?;
-                self.image
-                    .get(offset..offset + size)
-                    .ok_or_else(|| Error::OutOfBounds("failed to get inode data".to_string()))
+                    plan = self
+                        .core
+                        .resolve_chunk_read(chunk_addr, block_index, size)?;
+                }
             }
         }
     }
@@ -228,13 +246,16 @@ impl<I: Image> EroFS<I> {
     pub(crate) fn get_path_inode<P: AsRef<UnixPath>>(&self, path: P) -> Result<Option<Inode>> {
         let mut nid = self.core.super_block.root_nid as u64;
 
-        let path = path.as_ref().normalize();
-        'outer: for part in path.components() {
-            if part == UnixComponent::RootDir {
-                continue;
-            }
-
+        let path = path.as_ref();
+        'outer: for part in path
+            .as_bytes()
+            .split(|&b| b == b'/')
+            .filter(|p| !p.is_empty())
+        {
             let inode = self.get_inode(nid)?;
+            if !inode.is_dir() {
+                return Err(Error::NotADirectory(path.to_string_lossy().into_owned()));
+            }
             let block_count = inode.data_size().div_ceil(self.core.block_size);
             if block_count == 0 {
                 return Ok(None);
@@ -242,7 +263,7 @@ impl<I: Image> EroFS<I> {
 
             for i in 0..block_count {
                 let block = self.get_inode_block(&inode, i * self.core.block_size)?;
-                if let Some(found_nid) = dirent::find_nodeid_by_name(part.as_bytes(), block)? {
+                if let Some(found_nid) = dirent::find_nodeid_by_name(part, &block)? {
                     nid = found_nid;
                     continue 'outer;
                 }
@@ -251,6 +272,9 @@ impl<I: Image> EroFS<I> {
         }
 
         let inode = self.get_inode(nid)?;
+        if path.as_bytes().ends_with(b"/") && !inode.is_dir() {
+            return Err(Error::NotADirectory(path.to_string_lossy().into_owned()));
+        }
         Ok(Some(inode))
     }
 }
