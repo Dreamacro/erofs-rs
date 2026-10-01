@@ -1,7 +1,7 @@
-use alloc::{format, string::ToString, sync::Arc};
+use alloc::{format, string::ToString, sync::Arc, vec::Vec};
 use bytes::Buf;
 use typed_path::Component;
-use typed_path::{UnixComponent, UnixPath};
+use typed_path::{UnixComponent, UnixPath, UnixPathBuf};
 
 use super::file::File;
 use super::walkdir::WalkDir;
@@ -22,15 +22,19 @@ use crate::{Error, Result};
 /// ## Standard usage with mmap
 ///
 /// ```no_run
+/// # #[cfg(feature = "std")]
+/// # {
 /// use std::io::Read;
 /// use erofs_rs::{EroFS, backend::MmapImage};
 ///
-/// let image = MmapImage::new_from_path("image.erofs").unwrap();
+/// // SAFETY: assume the file remains immutable until the filesystem is dropped.
+/// let image = unsafe { MmapImage::new_from_path("image.erofs").unwrap() };
 /// let fs = EroFS::new(image).unwrap();
 ///
 /// let mut file = fs.open("/etc/passwd").unwrap();
 /// let mut content = String::new();
 /// file.read_to_string(&mut content).unwrap();
+/// # }
 /// ```
 ///
 /// ## no_std usage with byte slice
@@ -48,10 +52,19 @@ use crate::{Error, Result};
 ///     // Process directory entry...
 /// }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EroFS<I: Image> {
     image: Arc<I>,
     core: EroFSCore,
+}
+
+impl<I: Image> Clone for EroFS<I> {
+    fn clone(&self) -> Self {
+        Self {
+            image: Arc::clone(&self.image),
+            core: self.core.clone(),
+        }
+    }
 }
 
 impl<I: Image> EroFS<I> {
@@ -71,12 +84,16 @@ impl<I: Image> EroFS<I> {
     /// # Examples
     ///
     /// ```no_run
+    /// # #[cfg(feature = "std")]
+    /// # {
     /// use erofs_rs::{EroFS, backend::MmapImage};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let image = MmapImage::new_from_path("image.erofs")?;
+    /// // SAFETY: assume the file remains immutable until the filesystem is dropped.
+    /// let image = unsafe { MmapImage::new_from_path("image.erofs")? };
     /// let fs = EroFS::new(image)?;
     /// # Ok(())
+    /// # }
     /// # }
     /// ```
     pub fn new(image: I) -> Result<Self> {
@@ -131,7 +148,30 @@ impl<I: Image> EroFS<I> {
             )));
         }
 
+        inode.try_data_size()?;
         Ok(File::new(inode, self))
+    }
+
+    /// Reads the target of a symbolic link inode without following it.
+    pub fn read_link_inode(&self, inode: Inode) -> Result<UnixPathBuf> {
+        if !inode.is_symlink() {
+            return Err(Error::NotASymlink(inode.id()));
+        }
+        let size = inode.try_data_size()?;
+        let mut target = Vec::new();
+        for offset in (0..size).step_by(self.core.block_size) {
+            let block = self.get_inode_block(&inode, offset)?;
+            target
+                .try_reserve(block.len())
+                .map_err(|_| Error::OutOfBounds("symbolic link target is too large".to_string()))?;
+            target.extend_from_slice(block);
+        }
+        if target.is_empty() || target.contains(&0) {
+            return Err(Error::CorruptedData(
+                "invalid symbolic link target".to_string(),
+            ));
+        }
+        Ok(UnixPathBuf::from(target))
     }
 
     /// Returns a reference to the filesystem superblock.
@@ -144,7 +184,7 @@ impl<I: Image> EroFS<I> {
     }
 
     pub fn get_inode(&self, nid: u64) -> Result<Inode> {
-        let offset = self.core.get_inode_offset(nid) as usize;
+        let offset = self.core.get_inode_offset(nid)?;
         let data = self
             .image
             .get(offset..)

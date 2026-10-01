@@ -107,19 +107,11 @@ bitflags::bitflags! {
 
 impl FileMode {
     pub fn is_dir(&self) -> bool {
-        self.contains(Self::DIR)
+        FileType::from_raw_mode(self.bits() as _).is_dir()
     }
 
     pub fn is_file(&self) -> bool {
-        !self.intersects(
-            Self::DIR
-                | Self::CHAR_DEVICE
-                | Self::BLOCK_DEVICE
-                | Self::NAMED_PIPE
-                | Self::SOCKET
-                | Self::SYMLINK
-                | Self::IRREGULAR,
-        )
+        FileType::from_raw_mode(self.bits() as _).is_file()
     }
 }
 
@@ -164,6 +156,14 @@ impl Inode {
             Self::Compact((_, n)) => n.size as usize,
             Self::Extended((_, n)) => n.size as usize,
         }
+    }
+
+    pub(crate) fn try_data_size(&self) -> Result<usize, Error> {
+        let size = match self {
+            Self::Compact((_, n)) => u64::from(n.size),
+            Self::Extended((_, n)) => n.size,
+        };
+        usize::try_from(size).map_err(|_| Error::Overflow("file size"))
     }
 
     pub fn raw_block_addr(&self) -> u32 {
@@ -227,31 +227,22 @@ impl Inode {
         }
     }
 
+    /// Returns the extended inode's timestamp, or `None` if absent or invalid.
     #[cfg(feature = "std")]
     pub fn modified(&self) -> Option<SystemTime> {
         match self {
-            Self::Compact((_, _)) => None,
-            Self::Extended((_, n)) => {
-                let secs = n.mtime;
-                let nanos = n.mtime_ns;
-                Some(
-                    SystemTime::UNIX_EPOCH
-                        + Duration::from_secs(secs)
-                        + Duration::from_nanos(nanos as u64),
-                )
+            Self::Extended((_, n)) if n.mtime_ns < 1_000_000_000 => {
+                SystemTime::UNIX_EPOCH.checked_add(Duration::new(n.mtime, n.mtime_ns))
             }
+            _ => None,
         }
     }
 
     #[cfg(not(feature = "std"))]
     pub fn modified(&self) -> Option<(u64, u32)> {
         match self {
-            Self::Compact((_, _)) => None,
-            Self::Extended((_, n)) => {
-                let secs = n.mtime;
-                let nanos = n.mtime_ns;
-                Some((secs, nanos))
-            }
+            Self::Extended((_, n)) if n.mtime_ns < 1_000_000_000 => Some((n.mtime, n.mtime_ns)),
+            _ => None,
         }
     }
 

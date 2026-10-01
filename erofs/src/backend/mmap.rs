@@ -41,12 +41,12 @@ impl Image for MmapImage {
     fn get<R: RangeBounds<usize>>(&self, range: R) -> Option<&[u8]> {
         let start = match range.start_bound() {
             Bound::Included(&s) => s,
-            Bound::Excluded(&s) => s + 1,
+            Bound::Excluded(&s) => s.checked_add(1)?,
             Bound::Unbounded => 0,
         };
 
         let end = match range.end_bound() {
-            Bound::Included(&e) => e + 1,
+            Bound::Included(&e) => e.checked_add(1)?,
             Bound::Excluded(&e) => e,
             Bound::Unbounded => self.0.len(),
         };
@@ -84,7 +84,8 @@ impl MmapImage {
     /// # Safety
     ///
     /// This function creates a memory-mapped view of the file. The caller must
-    /// ensure that the file is not modified while the mapping is active.
+    /// ensure that the file is not modified or truncated, by any process,
+    /// for the entire lifetime of the returned mapping.
     ///
     /// # Examples
     ///
@@ -94,11 +95,13 @@ impl MmapImage {
     ///
     /// # fn main() -> std::io::Result<()> {
     /// let file = File::open("image.erofs")?;
-    /// let image = MmapImage::new_from_file(&file)?;
+    /// // SAFETY: assume the file remains immutable until the image is dropped.
+    /// let image = unsafe { MmapImage::new_from_file(&file)? };
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_from_file(file: &fs::File) -> io::Result<Self> {
+    pub unsafe fn new_from_file(file: &fs::File) -> io::Result<Self> {
+        // SAFETY: the caller guarantees that the backing file remains immutable.
         let mmap = unsafe { Mmap::map(file)? };
         Ok(Self(mmap))
     }
@@ -110,7 +113,8 @@ impl MmapImage {
     /// # Safety
     ///
     /// This function creates a memory-mapped view of the file. The caller must
-    /// ensure that the file is not modified while the mapping is active.
+    /// ensure that the file is not modified or truncated, by any process,
+    /// for the entire lifetime of the returned mapping.
     ///
     /// # Examples
     ///
@@ -118,12 +122,14 @@ impl MmapImage {
     /// use erofs_rs::backend::MmapImage;
     ///
     /// # fn main() -> std::io::Result<()> {
-    /// let image = MmapImage::new_from_path("image.erofs")?;
+    /// // SAFETY: assume the file remains immutable until the image is dropped.
+    /// let image = unsafe { MmapImage::new_from_path("image.erofs")? };
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_from_path<P: AsRef<path::Path>>(path: P) -> io::Result<Self> {
+    pub unsafe fn new_from_path<P: AsRef<path::Path>>(path: P) -> io::Result<Self> {
         let file = fs::File::open(path)?;
-        Self::new_from_file(&file)
+        // SAFETY: the caller guarantees immutability for the mapping's lifetime.
+        unsafe { Self::new_from_file(&file) }
     }
 }

@@ -15,16 +15,20 @@
 //! ## Standard usage (with std)
 //!
 //! ```no_run
+//! # #[cfg(feature = "std")]
+//! # {
 //! use std::io::Read;
 //! use erofs_rs::{EroFS, backend::MmapImage};
 //!
-//! let image = MmapImage::new_from_path("image.erofs").unwrap();
+//! // SAFETY: assume the file remains immutable until the filesystem is dropped.
+//! let image = unsafe { MmapImage::new_from_path("image.erofs").unwrap() };
 //! let fs = EroFS::new(image).unwrap();
 //!
 //! // Read a file
 //! let mut file = fs.open("/etc/passwd").unwrap();
 //! let mut content = String::new();
 //! file.read_to_string(&mut content).unwrap();
+//! # }
 //! ```
 //!
 //! ## no_std usage (with alloc)

@@ -9,7 +9,7 @@ repository = "https://github.com/Dreamacro/erofs-rs"
 keywords = ["erofs", "filesystem", "readonly", "linux"]
 categories = ["filesystem"]
 readme = "../README.md"
-rust-version = "1.89"
+rust-version = "1.91"
 
 [lints]
 workspace = true
@@ -24,7 +24,7 @@ std = [
   "rustix/std",
   "typed-path/std",
 ]
-opendal = ["dep:opendal"]
+opendal = ["std", "dep:opendal"]
 
 [dependencies]
 binrw = { workspace = true }

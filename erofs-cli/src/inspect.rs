@@ -1,4 +1,4 @@
-use std::os::unix::fs::PermissionsExt;
+use std::{os::unix::fs::PermissionsExt, time::UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local};
@@ -37,7 +37,7 @@ pub async fn inspect(args: InspectArgs) -> Result<()> {
         // Async path for remote files
         let u = Url::parse(&args.image)?;
         let builder = services::Http::default().endpoint(&u[..Position::BeforePath]);
-        let op = Operator::new(builder)?.finish();
+        let op = Operator::new(builder)?;
         let image = OpendalImage::new(op, u.path().to_string());
         let fs = AsyncEroFS::new(image).await?;
 
@@ -47,7 +47,8 @@ pub async fn inspect(args: InspectArgs) -> Result<()> {
         }
     } else {
         // Sync path for local files
-        let image = MmapImage::new_from_path(args.image)?;
+        // SAFETY: the CLI requires local images to remain unmodified while mapped.
+        let image = unsafe { MmapImage::new_from_path(args.image)? };
         let fs = EroFS::new(image)?;
 
         match args.operation {
@@ -101,12 +102,20 @@ fn format_size(inode: &Inode) -> String {
 }
 
 fn format_time(inode: &Inode) -> String {
-    let t = match inode.modified() {
-        Some(t) => t,
-        None => return String::from(""),
+    let Some(time) = inode
+        .modified()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+    else {
+        return String::new();
     };
-
-    let dt: DateTime<Local> = t.into();
+    let dt = i64::try_from(time.as_secs())
+        .ok()
+        .and_then(|secs| DateTime::from_timestamp(secs, time.subsec_nanos()))
+        .map(|dt| dt.with_timezone(&Local))
+        .and_then(|dt| dt.naive_utc().checked_add_offset(*dt.offset()));
+    let Some(dt) = dt else {
+        return "<invalid timestamp>".to_string();
+    };
     let now = Local::now();
     if dt.year() == now.year() {
         dt.format("%b %e %H:%M").to_string()
@@ -128,7 +137,7 @@ fn ls<I: Image>(fs: &EroFS<I>, path: &str) -> Result<()> {
             format_mode(&inode),
             format_size(&inode),
             format_time(&inode),
-            entry.dir_entry.file_name()
+            String::from_utf8_lossy(entry.dir_entry.file_name())
         );
     }
 
@@ -162,7 +171,7 @@ async fn ls_async<I: AsyncImage>(fs: &AsyncEroFS<I>, path: &str) -> Result<()> {
             format_mode(&inode),
             format_size(&inode),
             format_time(&inode),
-            entry.dir_entry.file_name()
+            String::from_utf8_lossy(entry.dir_entry.file_name())
         );
     }
 

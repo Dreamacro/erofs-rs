@@ -1,13 +1,10 @@
+use core::cmp;
+
 #[cfg(feature = "std")]
-use std::{
-    cmp, format,
-    io::{Read, Result},
-};
+use std::io::{Read, Result};
 
 #[cfg(not(feature = "std"))]
 use crate::Result;
-
-use bytes::Bytes;
 
 use super::EroFS;
 use crate::backend::Image;
@@ -27,23 +24,27 @@ pub trait Read {
 /// # Example
 ///
 /// ```no_run
+/// # #[cfg(feature = "std")]
+/// # {
 /// use std::io::Read;
 /// use erofs_rs::EroFS;
 /// use erofs_rs::backend::MmapImage;
 ///
-/// let image = MmapImage::new_from_path("image.erofs").unwrap();
+/// // SAFETY: assume the file remains immutable until the filesystem is dropped.
+/// let image = unsafe { MmapImage::new_from_path("image.erofs").unwrap() };
 /// let fs = EroFS::new(image).unwrap();
 ///
 /// let mut file = fs.open("/etc/passwd").unwrap();
 /// let mut content = Vec::new();
 /// file.read_to_end(&mut content).unwrap();
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct File<'a, I: Image> {
     inode: Inode,
     erofs: &'a EroFS<I>,
     offset: usize,
-    buf: Option<Bytes>,
+    buf: Option<&'a [u8]>,
 }
 
 impl<'a, I: Image> File<'a, I> {
@@ -68,7 +69,7 @@ impl<'a, I: Image> Read for File<'a, I> {
             return Ok(0);
         }
 
-        if let Some(ref data) = self.buf {
+        if let Some(data) = self.buf {
             let offset = self.offset % self.erofs.block_size();
             let data_remaining = data.len().saturating_sub(offset);
             let n = cmp::min(buf.len(), data_remaining);
@@ -85,10 +86,9 @@ impl<'a, I: Image> Read for File<'a, I> {
         let block = self.erofs.get_inode_block(&self.inode, cur_offset);
 
         #[cfg(feature = "std")]
-        let block =
-            block.map_err(|e| std::io::Error::other(format!("read block failed: {}", e)))?;
+        let block = block.map_err(std::io::Error::other)?;
         #[cfg(not(feature = "std"))]
-        let block = block.map_err(|e| e)?;
+        let block = block?;
 
         if buf.len() >= block.len() {
             let n = block.len();
@@ -99,7 +99,7 @@ impl<'a, I: Image> Read for File<'a, I> {
             let offset = cur_offset % block_size;
             let n = cmp::min(buf.len(), block.len().saturating_sub(offset));
             buf[..n].copy_from_slice(&block[offset..offset + n]);
-            self.buf = Some(Bytes::copy_from_slice(block));
+            self.buf = Some(block);
             self.offset += n;
             Ok(n)
         }

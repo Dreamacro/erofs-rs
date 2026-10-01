@@ -14,12 +14,16 @@
 //! ## Using mmap backend (std)
 //!
 //! ```no_run
+//! # #[cfg(feature = "std")]
+//! # {
 //! use erofs_rs::{EroFS, backend::MmapImage};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let image = MmapImage::new_from_path("image.erofs")?;
+//! // SAFETY: assume the file remains immutable until the filesystem is dropped.
+//! let image = unsafe { MmapImage::new_from_path("image.erofs")? };
 //! let fs = EroFS::new(image)?;
 //! # Ok(())
+//! # }
 //! # }
 //! ```
 //!
@@ -98,20 +102,22 @@ pub trait Image {
 ///
 /// ```no_run
 /// use erofs_rs::backend::AsyncImage;
-/// use erofs_rs::Result;
-/// use std::future::Future;
+/// use erofs_rs::{Error, Result};
 ///
-/// struct MyAsyncImage;
+/// struct MyAsyncImage(Vec<u8>);
 ///
 /// impl AsyncImage for MyAsyncImage {
-///     async fn read_exact_at(&self, buf: &mut [u8], offset: usize) -> Result<usize> {
-///         // Implementation here
-///         Ok(0)
+///     async fn read_exact_at(&self, buf: &mut [u8], offset: usize) -> Result<()> {
+///         let data = self.0.get(offset..)
+///             .and_then(|data| data.get(..buf.len()))
+///             .ok_or_else(|| Error::OutOfBounds("read exceeds image".into()))?;
+///         buf.copy_from_slice(data);
+///         Ok(())
 ///     }
 /// }
 /// ```
 pub trait AsyncImage: Send + Sync {
-    /// Asynchronously reads data from the image at a specific offset.
+    /// Asynchronously fills `buf` from the image at a specific offset.
     ///
     /// # Arguments
     ///
@@ -120,14 +126,16 @@ pub trait AsyncImage: Send + Sync {
     ///
     /// # Returns
     ///
-    /// The number of bytes read on success.
+    /// Returns `Ok(())` only after all `buf.len()` bytes have been read.
+    /// Implementations must not report a short read as success.
     ///
     /// # Errors
     ///
-    /// Returns an error if the read operation fails.
+    /// Returns an error if the read operation fails or the image ends before
+    /// `buf` is filled. On error, `buf` may have been partially modified.
     fn read_exact_at(
         &self,
         buf: &mut [u8],
         offset: usize,
-    ) -> impl Future<Output = Result<usize>> + Send;
+    ) -> impl Future<Output = Result<()>> + Send;
 }

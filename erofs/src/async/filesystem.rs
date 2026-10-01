@@ -71,6 +71,7 @@ impl<I: AsyncImage> EroFS<I> {
             )));
         }
 
+        inode.try_data_size()?;
         Ok(File::new(inode, self))
     }
 
@@ -84,7 +85,10 @@ impl<I: AsyncImage> EroFS<I> {
     }
 
     pub async fn get_inode(&self, nid: u64) -> Result<Inode> {
-        let offset = self.core.get_inode_offset(nid) as usize;
+        let offset = self.core.get_inode_offset(nid)?;
+        offset
+            .checked_add(InodeExtended::size())
+            .ok_or(Error::Overflow("inode read range"))?;
         let mut buf = vec![0u8; InodeExtended::size()];
         self.image.read_exact_at(&mut buf, offset).await?;
         self.core.parse_inode(&buf, nid)

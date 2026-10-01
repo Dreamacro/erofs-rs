@@ -20,7 +20,8 @@ use std::io::Read;
 use erofs_rs::{EroFS, backend::MmapImage};
 
 fn main() -> erofs_rs::Result<()> {
-    let image = MmapImage::new_from_path("system.erofs")?;
+    // SAFETY: ensure no process modifies or truncates the image while it is mapped.
+    let image = unsafe { MmapImage::new_from_path("system.erofs")? };
     let fs = EroFS::new(image)?;
 
     // Read file
@@ -30,7 +31,7 @@ fn main() -> erofs_rs::Result<()> {
 
     // List directory
     for entry in fs.read_dir("/usr/bin")? {
-        println!("{}", entry?.dir_entry.file_name());
+        println!("{}", String::from_utf8_lossy(entry?.dir_entry.file_name()));
     }
 
     Ok(())
@@ -87,6 +88,8 @@ erofs-rs = { version = "0.1", default-features = false }
 ```
 
 ## CLI
+
+Local images are memory-mapped. Do not modify or truncate them while a command is running.
 
 ```bash
 # Dump superblock info

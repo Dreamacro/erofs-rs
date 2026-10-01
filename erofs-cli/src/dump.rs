@@ -4,8 +4,7 @@ use clap::Args;
 use erofs_rs::{
     EroFS,
     r#async::EroFS as AsyncEroFS,
-    backend::MmapImage,
-    backend::OpendalImage,
+    backend::{MmapImage, OpendalImage},
     types::{SB_EXTSLOT_SIZE, SuperBlock},
 };
 use opendal::{Operator, services};
@@ -34,12 +33,13 @@ pub async fn dump(args: DumpArgs) -> Result<()> {
     let block = if args.path.starts_with("http") {
         let u = Url::parse(&args.path)?;
         let builder = services::Http::default().endpoint(&u[..Position::BeforePath]);
-        let op = Operator::new(builder)?.finish();
+        let op = Operator::new(builder)?;
         let image = OpendalImage::new(op, u.path().to_string());
         let fs = AsyncEroFS::new(image).await?;
         fs.super_block().to_owned()
     } else {
-        let image = MmapImage::new_from_path(args.path)?;
+        // SAFETY: the CLI requires local images to remain unmodified while mapped.
+        let image = unsafe { MmapImage::new_from_path(args.path)? };
         let fs = EroFS::new(image)?;
         fs.super_block().to_owned()
     };
@@ -80,13 +80,20 @@ pub async fn dump(args: DumpArgs) -> Result<()> {
         "Filesystem inode count:                       {}",
         block.inos
     );
-    let created = DateTime::from_timestamp(block.build_time as i64, block.build_time_ns)
-        .map(|dt| dt.with_timezone(&Local).format("%a %b %e %H:%M:%S %Y").to_string())
-        .unwrap_or_else(|| format!("<invalid timestamp: {}.{}>", block.build_time, block.build_time_ns));
-    println!(
-        "Filesystem created:                           {}",
-        created
-    );
+    let created = i64::try_from(block.build_time)
+        .ok()
+        .filter(|_| block.build_time_ns < 1_000_000_000)
+        .and_then(|secs| DateTime::from_timestamp(secs, block.build_time_ns))
+        .map(|dt| dt.with_timezone(&Local))
+        .and_then(|dt| dt.naive_utc().checked_add_offset(*dt.offset()))
+        .map(|dt| dt.format("%a %b %e %H:%M:%S %Y").to_string())
+        .unwrap_or_else(|| {
+            format!(
+                "<invalid timestamp: {}.{}>",
+                block.build_time, block.build_time_ns
+            )
+        });
+    println!("Filesystem created:                           {}", created);
     println!(
         "Filesystem features:                          {}",
         block.feature_compat

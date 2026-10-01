@@ -2,7 +2,7 @@ use std::io::Read;
 
 use alloc::string::String;
 
-use opendal::{Operator, options::ReadOptions, raw::BytesRange};
+use opendal::{BytesRange, Operator, options::ReadOptions};
 
 use super::AsyncImage;
 use crate::Result;
@@ -16,7 +16,7 @@ impl OpendalImage {
 }
 
 impl AsyncImage for OpendalImage {
-    async fn read_exact_at(&self, buf: &mut [u8], offset: usize) -> Result<usize> {
+    async fn read_exact_at(&self, buf: &mut [u8], offset: usize) -> Result<()> {
         self.0
             .read_options(
                 &self.1,
@@ -27,6 +27,6 @@ impl AsyncImage for OpendalImage {
             )
             .await?
             .read_exact(buf)?;
-        Ok(buf.len())
+        Ok(())
     }
 }

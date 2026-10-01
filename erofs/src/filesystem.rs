@@ -36,6 +36,15 @@ pub enum BlockPlan {
     },
 }
 
+impl BlockPlan {
+    fn direct(offset: usize, size: usize) -> Result<Self> {
+        offset
+            .checked_add(size)
+            .ok_or(Error::Overflow("block read range"))?;
+        Ok(Self::Direct { offset, size })
+    }
+}
+
 impl EroFSCore {
     /// Parse and validate a superblock from raw bytes.
     ///
@@ -73,13 +82,13 @@ impl EroFSCore {
         let mut inode_buf = Cursor::new(data);
         let layout: u16 = inode_buf.read_le()?;
         inode_buf.set_position(0);
-        if Inode::is_compact_format(layout) {
-            let inode = InodeCompact::read(&mut inode_buf)?;
-            Ok(Inode::Compact((nid, inode)))
+        let inode = if Inode::is_compact_format(layout) {
+            Inode::Compact((nid, InodeCompact::read(&mut inode_buf)?))
         } else {
-            let inode = InodeExtended::read(&mut inode_buf)?;
-            Ok(Inode::Extended((nid, inode)))
-        }
+            Inode::Extended((nid, InodeExtended::read(&mut inode_buf)?))
+        };
+        inode.try_data_size()?;
+        Ok(inode)
     }
 
     /// Plan a block read operation for the given inode and offset.
@@ -88,41 +97,43 @@ impl EroFSCore {
     /// For `BlockPlan::Chunked`, the caller must perform an additional
     /// read and call `resolve_chunk_read()`.
     pub(crate) fn plan_inode_block_read(&self, inode: &Inode, offset: usize) -> Result<BlockPlan> {
+        let data_size = inode.try_data_size()?;
         match inode.layout()? {
             Layout::FlatPlain => {
-                let block_count = inode.data_size().div_ceil(self.block_size);
+                let block_count = data_size.div_ceil(self.block_size);
                 let block_index = offset / self.block_size;
                 if block_index >= block_count {
                     return Err(Error::OutOfRange(block_index, block_count));
                 }
 
-                let size = inode.data_size();
-                let offset = self.block_offset(inode.raw_block_addr()) as usize
-                    + (block_index * self.block_size);
-                Ok(BlockPlan::Direct { offset, size })
+                let block_start = block_index * self.block_size;
+                let size = (data_size - block_start).min(self.block_size);
+                let offset = self
+                    .block_offset(inode.raw_block_addr())?
+                    .checked_add(block_start)
+                    .ok_or(Error::Overflow("file block offset"))?;
+                BlockPlan::direct(offset, size)
             }
             Layout::FlatInline => {
-                let block_count = inode.data_size().div_ceil(self.block_size);
+                let block_count = data_size.div_ceil(self.block_size);
                 let block_index = offset / self.block_size;
                 if block_index >= block_count {
                     return Err(Error::OutOfRange(block_index, block_count));
                 }
 
-                if block_count != 0 && block_index == block_count - 1 {
-                    // tail block
-                    let inode_offset = self.get_inode_offset(inode.id());
-                    let buf_size = inode.data_size() % self.block_size;
-                    let offset = inode_offset as usize + inode.size() + inode.xattr_size();
-                    return Ok(BlockPlan::Direct {
-                        offset,
-                        size: buf_size,
-                    });
+                if block_index == block_count - 1 {
+                    let size = data_size % self.block_size;
+                    if size == 0 {
+                        return Err(Error::CorruptedData("empty inline tail".to_string()));
+                    }
+                    return BlockPlan::direct(self.inode_tail_offset(inode)?, size);
                 }
 
-                let offset = self.block_offset(inode.raw_block_addr()) as usize
-                    + (block_index * self.block_size);
-                let len = self.block_size.min(inode.data_size());
-                Ok(BlockPlan::Direct { offset, size: len })
+                let offset = self
+                    .block_offset(inode.raw_block_addr())?
+                    .checked_add(block_index * self.block_size)
+                    .ok_or(Error::Overflow("file block offset"))?;
+                BlockPlan::direct(offset, self.block_size)
             }
             Layout::CompressedFull | Layout::CompressedCompact => {
                 Err(Error::NotSupported("compressed compact layout".to_string()))
@@ -141,23 +152,29 @@ impl EroFSCore {
                 }
 
                 let chunk_bits = chunk_format.chunk_size_bits() + self.super_block.blk_size_bits;
-                let chunk_size = 1usize << chunk_bits;
-                let chunk_count = inode.data_size().div_ceil(chunk_size);
-                let chunk_index = offset >> chunk_bits;
+                let chunk_size = 1usize
+                    .checked_shl(u32::from(chunk_bits))
+                    .ok_or(Error::Overflow("chunk size"))?;
+                let chunk_count = data_size.div_ceil(chunk_size);
+                let chunk_index = offset / chunk_size;
                 let chunk_fixed = offset % chunk_size / self.block_size;
                 if chunk_index >= chunk_count {
                     return Err(Error::OutOfRange(chunk_index, chunk_count));
                 }
 
-                let inode_offset = self.get_inode_offset(inode.id());
-                let addr_offset =
-                    inode_offset as usize + inode.size() + inode.xattr_size() + (chunk_index * 4);
+                let addr_offset = self
+                    .inode_tail_offset(inode)?
+                    .checked_add(chunk_index * 4)
+                    .ok_or(Error::Overflow("chunk address offset"))?;
+                addr_offset
+                    .checked_add(4)
+                    .ok_or(Error::Overflow("chunk address range"))?;
 
                 Ok(BlockPlan::Chunked {
                     addr_offset,
                     chunk_fixed,
                     chunk_size,
-                    data_size: inode.data_size(),
+                    data_size,
                     chunk_index,
                 })
             }
@@ -182,7 +199,13 @@ impl EroFSCore {
             ));
         }
 
-        let file_byte_offset = chunk_index * chunk_size + chunk_fixed * self.block_size;
+        let chunk_offset = chunk_fixed
+            .checked_mul(self.block_size)
+            .ok_or(Error::Overflow("chunk offset"))?;
+        let file_byte_offset = chunk_index
+            .checked_mul(chunk_size)
+            .and_then(|offset| offset.checked_add(chunk_offset))
+            .ok_or(Error::Overflow("file chunk offset"))?;
         let remaining = data_size.saturating_sub(file_byte_offset);
         let read_size = remaining.min(self.block_size);
 
@@ -190,16 +213,36 @@ impl EroFSCore {
             return Err(Error::OutOfRange(file_byte_offset, data_size));
         }
 
-        let offset = self.block_offset(chunk_addr as u32 + chunk_fixed as u32) as usize;
+        let chunk_fixed =
+            u32::try_from(chunk_fixed).map_err(|_| Error::Overflow("chunk block index"))?;
+        let block = (chunk_addr as u32)
+            .checked_add(chunk_fixed)
+            .ok_or(Error::Overflow("chunk block address"))?;
+        let offset = self.block_offset(block)?;
+        offset
+            .checked_add(read_size)
+            .ok_or(Error::Overflow("chunk read range"))?;
         Ok((offset, read_size))
     }
 
-    pub(crate) fn get_inode_offset(&self, nid: u64) -> u64 {
-        self.block_offset(self.super_block.meta_blk_addr) + (nid * InodeCompact::size() as u64)
+    pub(crate) fn get_inode_offset(&self, nid: u64) -> Result<usize> {
+        let base = self.block_offset(self.super_block.meta_blk_addr)?;
+        usize::try_from(nid)
+            .ok()
+            .and_then(|nid| nid.checked_mul(InodeCompact::size()))
+            .and_then(|offset| base.checked_add(offset))
+            .ok_or(Error::Overflow("inode offset"))
     }
 
-    pub(crate) fn block_offset(&self, block: u32) -> u64 {
-        (block as u64) << self.super_block.blk_size_bits
+    fn inode_tail_offset(&self, inode: &Inode) -> Result<usize> {
+        self.get_inode_offset(inode.id())?
+            .checked_add(inode.size() + inode.xattr_size())
+            .ok_or(Error::Overflow("inode tail offset"))
+    }
+
+    pub(crate) fn block_offset(&self, block: u32) -> Result<usize> {
+        let offset = u64::from(block) << self.super_block.blk_size_bits;
+        usize::try_from(offset).map_err(|_| Error::Overflow("block offset"))
     }
 }
 
@@ -242,7 +285,12 @@ mod tests {
         }
     }
 
-    fn make_compact_inode(layout: Layout, data_size: u32, xattr_count: u16, inode_data: u32) -> Inode {
+    fn make_compact_inode(
+        layout: Layout,
+        data_size: u32,
+        xattr_count: u16,
+        inode_data: u32,
+    ) -> Inode {
         let format = (layout as u16) << 1;
         let inode = InodeCompact {
             format,
@@ -269,7 +317,10 @@ mod tests {
         assert_eq!(inode.xattr_size(), size_of::<XattrHeader>());
 
         let inode = make_compact_inode(Layout::FlatInline, 0, 2, 0);
-        assert_eq!(inode.xattr_size(), size_of::<XattrHeader>() + size_of::<XattrEntry>());
+        assert_eq!(
+            inode.xattr_size(),
+            size_of::<XattrHeader>() + size_of::<XattrEntry>()
+        );
     }
 
     #[test]
@@ -280,7 +331,7 @@ mod tests {
 
         match plan {
             BlockPlan::Chunked { addr_offset, .. } => {
-                let inode_offset = core.get_inode_offset(inode.id()) as usize;
+                let inode_offset = core.get_inode_offset(inode.id()).expect("inode offset");
                 let expected = inode_offset + inode.size() + inode.xattr_size();
                 assert_eq!(addr_offset, expected);
             }
