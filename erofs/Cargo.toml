@@ -1,6 +1,6 @@
 [package]
 name = "erofs-rs"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 authors = ["Dreamacro"]
 description = "A pure Rust library for reading EROFS (Enhanced Read-Only File System) images"
