@@ -7,9 +7,11 @@
 //! EROFS compressed-extent mapping. I/O stays in the sync/async executors.
 
 use alloc::{format, string::ToString, vec::Vec};
-use binrw::{BinRead, BinReaderExt, io::Cursor};
+use binrw::{BinRead, io::Cursor};
+use bytes::Buf;
 use core::ops::Range;
 
+use crate::metadata::ReadSource;
 use crate::{
     Error, Result,
     filesystem::{BlockPlan, EroFSCore},
@@ -206,10 +208,10 @@ impl Index {
             return Ok(None);
         };
         let (kind, cluster_offset, block, partial) = if !self.compact {
-            let mut cursor = Cursor::new(data);
-            let advice: u16 = cursor.read_le()?;
-            let cluster_offset: u16 = cursor.read_le()?;
-            let block: u32 = cursor.read_le()?;
+            let mut fields = data;
+            let advice = fields.get_u16_le();
+            let cluster_offset = fields.get_u16_le();
+            let block = fields.get_u32_le();
             if advice & !0x8003 != 0 {
                 return Err(Error::NotSupported("compression index advice".to_string()));
             }
@@ -222,22 +224,21 @@ impl Index {
             let slots = if size == 32 { 16 } else { 2 };
             let low_bits = self.block_bits.max(12);
             let entry_bits = (size - 4) * 8 / slots;
-            let field = |slot: usize| -> Result<(u16, u8)> {
+            let field = |slot: usize| {
                 let bit = slot * entry_bits;
-                let word: u32 = Cursor::new(&data[bit / 8..]).read_le()?;
-                let word = word >> (bit % 8);
-                Ok((
+                let word = (&data[bit / 8..]).get_u32_le() >> (bit % 8);
+                (
                     (word & ((1 << low_bits) - 1)) as u16,
                     ((word >> low_bits) & 3) as u8,
-                ))
+                )
             };
-            let (low, kind) = field(slot)?;
+            let (low, kind) = field(slot);
             if kind == 2 {
                 if low & CBLKCNT != 0 || slot + 1 != slots {
                     return self.nonhead(low).map(|n| Some(Entry::NonHead(n)));
                 }
                 // The final NONHEAD stores a forward distance, not a back distance.
-                let (previous, kind) = field(slot - 1)?;
+                let (previous, kind) = field(slot - 1);
                 let back = if kind == 2 {
                     self.nonhead(previous)?.back + 1
                 } else {
@@ -249,7 +250,7 @@ impl Index {
             let mut previous = slot;
             while previous != 0 {
                 previous -= 1;
-                let (distance, kind) = field(previous)?;
+                let (distance, kind) = field(previous);
                 if kind == 2 {
                     let nonhead = self.nonhead(distance)?;
                     if self.big1 {
@@ -272,7 +273,7 @@ impl Index {
                 }
                 blocks += 1;
             }
-            let base: u32 = Cursor::new(&data[size - 4..]).read_le()?;
+            let base = (&data[size - 4..]).get_u32_le();
             // Compact predictors wrap at u32; legacy -1 encodes block zero.
             (kind, low, base.wrapping_add(blocks), false)
         };
@@ -353,7 +354,7 @@ struct PhysicalExtent {
     offset: u64,
     size: u64,
     format: ExtentFormat,
-    /// Inline payload stays in primary metadata, outside device address translation.
+    /// Inline payload follows its inode's metadata source, not device address translation.
     inline: bool,
 }
 
@@ -392,6 +393,7 @@ enum Stage {
 /// A bounded, resumable metadata walk shared by both I/O implementations.
 pub struct CompressedRead {
     inode: Inode,
+    metadata_source: ReadSource,
     offset: u64,
     header_offset: u64,
     lzma_dict_size: u32,
@@ -417,6 +419,7 @@ impl CompressedRead {
             & !7;
         let mut reader = Self {
             inode: *inode,
+            metadata_source: core.metadata_source(inode.id())?,
             offset,
             header_offset,
             lzma_dict_size: 0,
@@ -444,7 +447,16 @@ impl CompressedRead {
         offset
             .checked_add(size as u64)
             .ok_or(Error::Overflow("compression metadata range"))?;
+        let source = if matches!(
+            self.stage,
+            Stage::ConfigLength { .. } | Stage::Config { .. }
+        ) {
+            ReadSource::Device(0)
+        } else {
+            self.metadata_source
+        };
         Ok(BlockPlan::CompressionMetadata {
+            source,
             offset,
             size,
             reader: self,
@@ -459,7 +471,10 @@ impl CompressedRead {
     ) -> Result<BlockPlan> {
         match self.stage {
             Stage::ConfigLength { remaining } => {
-                let size: u16 = Cursor::new(data).read_le()?;
+                let mut fields = data;
+                let size = fields.try_get_u16_le().map_err(|_| {
+                    Error::CorruptedData("truncated compression configuration length".into())
+                })?;
                 let minimum = if remaining.trailing_zeros() <= 1 {
                     14
                 } else {
@@ -474,11 +489,13 @@ impl CompressedRead {
                 return self.request(page_offset + 2, usize::from(size));
             }
             Stage::Config { remaining } => {
+                let mut fields = data.get(..6).ok_or_else(|| {
+                    Error::CorruptedData("truncated compression configuration".into())
+                })?;
                 match remaining.trailing_zeros() {
                     1 => {
-                        let mut cursor = Cursor::new(data);
-                        self.lzma_dict_size = cursor.read_le()?;
-                        let format: u16 = cursor.read_le()?;
+                        self.lzma_dict_size = fields.get_u32_le();
+                        let format = fields.get_u16_le();
                         if !(4096..=MAX_LZMA_DICT_SIZE).contains(&self.lzma_dict_size) {
                             return Err(Error::CorruptedData(
                                 "invalid MicroLZMA dictionary size".to_string(),
@@ -522,7 +539,7 @@ impl CompressedRead {
             }
             Stage::Header => {
                 if data[7] & 0x80 != 0 {
-                    let offset = u64::from_le_bytes(data[..8].try_into().unwrap()) & !(1 << 63);
+                    let offset = (&data[..8]).get_u64_le() & !(1 << 63);
                     return self.fragment(core, offset, 0, self.inode.data_size());
                 }
                 if matches!(self.inode.data, InodeData::CompressedFull) && data[4] & 1 != 0 {
@@ -535,7 +552,10 @@ impl CompressedRead {
                 };
             }
             Stage::ExtentBase { layout } => {
-                let physical = Cursor::new(data).read_le()?;
+                let mut fields = data;
+                let physical = fields
+                    .try_get_u64_le()
+                    .map_err(|_| Error::CorruptedData("truncated extent base address".into()))?;
                 self.stage = Stage::Extents {
                     layout,
                     left: 0,
@@ -749,8 +769,7 @@ impl CompressedRead {
             }
             self.inode.data_size().div_ceil(1 << cluster_bits)
         } else {
-            u64::from(u32::from_le_bytes(data[..4].try_into().unwrap()))
-                | (u64::from(u16::from_le_bytes(data[6..8].try_into().unwrap())) << 32)
+            u64::from((&data[..4]).get_u32_le()) | (u64::from((&data[6..8]).get_u16_le()) << 32)
         };
         let start = self
             .header_offset
@@ -847,21 +866,21 @@ impl CompressedRead {
                     .min(layout.start + layout.count * layout.record_size);
                 return self.request(offset, (end - offset) as usize);
             };
-            let mut cursor = Cursor::new(entry);
-            let plen: u32 = cursor.read_le()?;
+            let mut fields = entry;
+            let plen = fields.get_u32_le();
             let mut offset = if layout.record_size == 4 {
                 physical
             } else {
-                u64::from(cursor.read_le::<u32>()?)
+                u64::from(fields.get_u32_le())
             };
             let start = if layout.record_size <= 8 {
                 index << layout.cluster_bits
             } else {
-                offset |= u64::from(cursor.read_le::<u32>()?) << 32;
-                let low: u32 = cursor.read_le()?;
+                offset |= u64::from(fields.get_u32_le()) << 32;
+                let low = fields.get_u32_le();
                 u64::from(low)
                     | if layout.record_size == 32 {
-                        u64::from(cursor.read_le::<u32>()?) << 32
+                        u64::from(fields.get_u32_le()) << 32
                     } else {
                         0
                     }
@@ -1004,10 +1023,11 @@ impl CompressedRead {
         offset
             .checked_add(size)
             .ok_or(Error::Overflow("compressed data range"))?;
-        let (device_id, offset) = if inline {
-            (0, offset)
+        let (source, offset) = if inline {
+            (self.metadata_source, offset)
         } else {
-            core.resolve_device(0, offset, size)?
+            let (device, offset) = core.resolve_device(0, offset, size)?;
+            (ReadSource::Device(device), offset)
         };
         let (encoding, partial, zero_padding) = match format {
             ExtentFormat::Plain { interlaced } => {
@@ -1017,7 +1037,7 @@ impl CompressedRead {
                     ));
                 }
                 if !interlaced {
-                    return BlockPlan::direct(device_id, offset + skip as u64, decoded_size - skip);
+                    return BlockPlan::direct(source, offset + skip as u64, decoded_size - skip);
                 }
                 let start = logical.start % core.block_size;
                 if size > core.block_size
@@ -1060,7 +1080,7 @@ impl CompressedRead {
             }
         };
         Ok(BlockPlan::Encoded(EncodedExtent {
-            device_id,
+            source,
             offset,
             size: size as usize,
             decoded_size,
@@ -1109,7 +1129,7 @@ impl Encoding {
 }
 
 pub struct EncodedExtent {
-    pub(crate) device_id: u16,
+    pub(crate) source: ReadSource,
     pub(crate) offset: u64,
     pub(crate) size: usize,
     decoded_size: usize,
@@ -1229,8 +1249,7 @@ fn decode_lz4_prefix(mut input: &[u8], output: &mut [u8]) -> Result<()> {
         let mut length = initial;
         if initial == 15 {
             loop {
-                let (&byte, rest) = input.split_first().ok_or_else(invalid)?;
-                *input = rest;
+                let byte = input.try_get_u8().map_err(|_| invalid())?;
                 length = length.checked_add(usize::from(byte)).ok_or_else(invalid)?;
                 if byte != 255 {
                     break;
@@ -1241,19 +1260,16 @@ fn decode_lz4_prefix(mut input: &[u8], output: &mut [u8]) -> Result<()> {
     }
     let mut written = 0;
     while written < output.len() {
-        let (&token, rest) = input.split_first().ok_or_else(invalid)?;
-        input = rest;
+        let token = input.try_get_u8().map_err(|_| invalid())?;
         let literals = length(&mut input, usize::from(token >> 4))?.min(output.len() - written);
         let bytes = input.get(..literals).ok_or_else(invalid)?;
         output[written..written + literals].copy_from_slice(bytes);
-        input = &input[literals..];
+        input.advance(literals);
         written += literals;
         if written == output.len() {
             break;
         }
-        let bytes = input.get(..2).ok_or_else(invalid)?;
-        let distance = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
-        input = &input[2..];
+        let distance = usize::from(input.try_get_u16_le().map_err(|_| invalid())?);
         if distance == 0 || distance > written {
             return Err(invalid());
         }
@@ -1317,6 +1333,7 @@ fn decode_zstd(input: &[u8], output: &mut [u8], window_size: u32, partial: bool)
 
 #[cfg(feature = "lzma")]
 fn decode_microlzma(input: &[u8], output: &mut [u8], dict_size: u32, partial: bool) -> Result<()> {
+    use bytes::BufMut;
     use lzma_rs::decompress::raw::{LzmaDecoder, LzmaParams, LzmaProperties};
     use std::io::Read;
 
@@ -1346,15 +1363,13 @@ fn decode_microlzma(input: &[u8], output: &mut [u8], dict_size: u32, partial: bo
     let mut decoder = LzmaDecoder::new(params, Some(dict_size as usize))
         .map_err(|err| Error::CorruptedData(format!("invalid MicroLZMA parameters: {err}")))?;
     let prefix = [0u8];
-    let mut input = prefix.as_slice().chain(&input[1..]);
+    let mut input = Read::chain(prefix.as_slice(), &input[1..]);
     if partial {
         struct Prefix<'a>(&'a mut [u8]);
         impl std::io::Write for Prefix<'_> {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 let n = bytes.len().min(self.0.len());
-                let remaining = core::mem::take(&mut self.0);
-                remaining[..n].copy_from_slice(&bytes[..n]);
-                self.0 = &mut remaining[n..];
+                self.0.put_slice(&bytes[..n]);
                 if self.0.is_empty() {
                     return Err(std::io::ErrorKind::WriteZero.into());
                 }

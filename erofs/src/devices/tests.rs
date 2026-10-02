@@ -5,6 +5,7 @@ use crate::{
     filesystem::{BlockPlan, EroFSCore},
     tests::{Read, Source, directory, image, ready},
 };
+use bytes::BufMut;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
 fn fixture() -> [Vec<u8>; 3] {
@@ -19,15 +20,15 @@ fn fixture() -> [Vec<u8>; 3] {
         data[slot + 68] = start;
     }
     // Device 1's unified range deliberately overlaps primary metadata.
-    data[2088..2092].copy_from_slice(&512u32.to_le_bytes());
+    (&mut data[2088..]).put_u32_le(512);
     directory(
         &mut data[4096..4608],
         &[(1, b".", 2), (1, b"..", 2), (2, b"a", 1)],
     );
     data[2112] = 8; // Indexed chunks, 1024 bytes per chunk.
     data[2114] = 3; // 20-byte xattr body makes the index require 8-byte alignment.
-    data[2120..2124].copy_from_slice(&3089u32.to_le_bytes());
-    data[2128..2132].copy_from_slice(&0x21u32.to_le_bytes());
+    (&mut data[2120..]).put_u32_le(3089);
+    (&mut data[2128..]).put_u32_le(0x21);
     data[2144..2164].fill(0); // Empty internal xattrs.
     data[2164..2168].fill(0xaa); // Not part of the first index.
     for (index, id, block) in [
@@ -37,9 +38,10 @@ fn fixture() -> [Vec<u8>; 3] {
         (3, 0, 21),
     ] {
         let at = 2168 + index * 8;
-        data[at..at + 2].copy_from_slice(&0xbeefu16.to_le_bytes()); // Ignored without 48-bit chunks.
-        data[at + 2..at + 4].copy_from_slice(&id.to_le_bytes());
-        data[at + 4..at + 8].copy_from_slice(&block.to_le_bytes());
+        let mut fields = &mut data[at..];
+        fields.put_u16_le(0xbeef); // Ignored without 48-bit chunks.
+        fields.put_u16_le(id);
+        fields.put_u32_le(block);
     }
     let a = [vec![b'A'; 512], vec![b'B'; 1536]].concat();
     let b = [vec![b'C'; 512], vec![b'D'; 1536]].concat();
@@ -153,8 +155,8 @@ fn unified_flat_data_and_primary_inline_metadata_are_distinct() {
         let [mut data, a, b] = fixture();
         data[2112] = if inline { 4 } else { 0 };
         data[2114] = 0;
-        data[2120..2124].copy_from_slice(&700u32.to_le_bytes());
-        data[2128..2132].copy_from_slice(&20u32.to_le_bytes());
+        (&mut data[2120..]).put_u32_le(700);
+        (&mut data[2128..]).put_u32_le(20);
         data[2144..2332].fill(b'!');
         let sources = [&data, &a, &b].map(|data| Source {
             data: SliceImage::new(data),
@@ -208,18 +210,18 @@ fn invalid_tables_devices_and_truncated_payloads_fail() {
         let mut data = data.clone();
         match kind {
             0 => data.truncate(1535),
-            1 => data[1476] = 6, // Device ranges overlap.
-            2 => data[2170..2172].copy_from_slice(&3u16.to_le_bytes()), // Masked ID is absent.
-            3 => data[2172..2176].copy_from_slice(&4u32.to_le_bytes()), // Past device capacity.
-            4 => data[2170..2176].fill(0), // Primary address zero is valid.
-            5 => data[2172..2176].copy_from_slice(&3u32.to_le_bytes()), // Valid descriptor, short backing file.
+            1 => data[1476] = 6,                    // Device ranges overlap.
+            2 => (&mut data[2170..]).put_u16_le(3), // Masked ID is absent.
+            3 => (&mut data[2172..]).put_u32_le(4), // Past device capacity.
+            4 => data[2170..2176].fill(0),          // Primary address zero is valid.
+            5 => (&mut data[2172..]).put_u32_le(3), // Valid descriptor, short backing file.
             6 => {
                 data[2170..2172].fill(0);
-                data[2172..2176].copy_from_slice(&15u32.to_le_bytes());
+                (&mut data[2172..]).put_u32_le(15);
             } // Beyond primary.
             7 => {
                 data[2170..2172].fill(0);
-                data[2172..2176].copy_from_slice(&7u32.to_le_bytes());
+                (&mut data[2172..]).put_u32_le(7);
             } // The second block must not escape the chunk's selected device.
             _ => unreachable!(),
         }
@@ -263,14 +265,14 @@ fn full_device_id_width_and_zero_unified_addresses() {
     .clone();
     assert_eq!(fs.devices().len(), 2); // SliceImage does not implement Clone.
     for count in [1u16, 3, u16::MAX] {
-        data[1110..1112].copy_from_slice(&count.to_le_bytes());
+        (&mut data[1110..]).put_u16_le(count);
         let mut table = vec![0; usize::from(count) * SLOT_SIZE];
         table[(usize::from(count) - 1) * SLOT_SIZE + 64] = 1;
         let mut core = EroFSCore::new(&data[1024..1152]).unwrap();
         core.set_device_table(&table).unwrap();
         assert!(
             matches!(core.resolve_chunk_read(&[0, 0, 255, 255, 0, 0, 0, 0], 0x20, 0, 0, 1).unwrap(),
-            BlockPlan::Direct { device_id, offset: 0, size: 1 } if device_id == count)
+            BlockPlan::Direct { source: crate::metadata::ReadSource::Device(device_id), offset: 0, size: 1 } if device_id == count)
         );
         // A zero unified start never redirects primary address zero.
         assert_eq!(core.resolve_device(0, 0, 1).unwrap(), (0, 0));
@@ -283,8 +285,8 @@ fn wide_chunks_holes_and_device_ranges_use_u64() {
     data[1104] |= 0x80;
     let high = (1u64 << 40) + 7;
     for (at, high_at, value) in [(1344, 1352, high + 10), (1348, 1354, high + 100)] {
-        data[at..at + 4].copy_from_slice(&(value as u32).to_le_bytes());
-        data[high_at..high_at + 2].copy_from_slice(&((value >> 32) as u16).to_le_bytes());
+        (&mut data[at..]).put_u32_le(value as u32);
+        (&mut data[high_at..]).put_u16_le((value >> 32) as u16);
     }
     assert_eq!(
         DeviceTable::parse(&data[1280..1536], 512, 13, false)
@@ -297,16 +299,17 @@ fn wide_chunks_holes_and_device_ranges_use_u64() {
     core.set_device_table(&data[1280..1536]).unwrap();
     assert_eq!(core.devices()[0].blocks, high + 10);
     let mut record = [0; 8];
-    record[..2].copy_from_slice(&((high >> 32) as u16).to_le_bytes());
-    record[2..4].copy_from_slice(&1u16.to_le_bytes());
-    record[4..].copy_from_slice(&(high as u32).to_le_bytes());
+    let mut fields = &mut record[..];
+    fields.put_u16_le((high >> 32) as u16);
+    fields.put_u16_le(1);
+    fields.put_u32_le(high as u32);
     assert!(
         matches!(core.resolve_chunk_read(&record, 0x60, 2, 17, 31).unwrap(),
-        BlockPlan::Direct { device_id: 1, offset, size: 31 } if offset == (high + 2) * 512 + 17)
+        BlockPlan::Direct { source: crate::metadata::ReadSource::Device(1), offset, size: 31 } if offset == (high + 2) * 512 + 17)
     );
     assert!(
         matches!(core.resolve_chunk_read(&record, 0x20, 0, 0, 1).unwrap(),
-        BlockPlan::Direct { device_id: 1, offset, .. } if offset == (high & 0xffff_ffff) * 512)
+        BlockPlan::Direct { source: crate::metadata::ReadSource::Device(1), offset, .. } if offset == (high & 0xffff_ffff) * 512)
     );
     record[4..].fill(0xff);
     record[..2].fill(0);
@@ -324,8 +327,7 @@ fn wide_chunks_holes_and_device_ranges_use_u64() {
         BlockPlan::Hole { size: 1 }
     ));
     assert!(matches!(
-        core.resolve_chunk_read(&u32::MAX.to_le_bytes(), 0x40, 0, 0, 1)
-            .unwrap(),
+        core.resolve_chunk_read(&[0xff; 4], 0x40, 0, 0, 1).unwrap(),
         BlockPlan::Hole { .. }
     ));
     assert!(
@@ -347,9 +349,9 @@ fn wide_chunks_holes_and_device_ranges_use_u64() {
     data[1104] = 4;
     let core = EroFSCore::new(&data[1024..1152]).unwrap();
     record.fill(0xff);
-    record[4..].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+    (&mut record[4..]).put_u32_le(0x8000_0000);
     assert!(
         matches!(core.resolve_chunk_read(&record, 0x20, 0, 0, 1).unwrap(),
-        BlockPlan::Direct { device_id: 0, offset, .. } if offset == 0x8000_0000u64 * 512)
+        BlockPlan::Direct { source: crate::metadata::ReadSource::Device(0), offset, .. } if offset == 0x8000_0000u64 * 512)
     );
 }

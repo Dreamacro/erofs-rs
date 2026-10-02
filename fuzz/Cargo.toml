@@ -19,6 +19,7 @@ deflate = ["erofs-rs/deflate"]
 zstd = ["erofs-rs/zstd"]
 
 [dependencies]
+bytes = { version = "1", default-features = false }
 libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
 erofs-rs = { path = "../erofs", default-features = false }
 

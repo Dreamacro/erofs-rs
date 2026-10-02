@@ -4,6 +4,7 @@ use crate::{
     tests::{Source, ready},
     types::MAGIC_NUMBER,
 };
+use bytes::BufMut;
 use core::{
     ops::{Bound, RangeBounds},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
@@ -11,9 +12,9 @@ use core::{
 
 fn entry(index: u8, name: &[u8], value: &[u8]) -> Vec<u8> {
     let mut data = vec![name.len() as u8, index];
-    data.extend_from_slice(&(value.len() as u16).to_le_bytes());
-    data.extend_from_slice(name);
-    data.extend_from_slice(value);
+    data.put_u16_le(value.len() as u16);
+    data.put_slice(name);
+    data.put_slice(value);
     data.resize(data.len().next_multiple_of(4), 0);
     data
 }
@@ -43,11 +44,11 @@ fn image(
     body[..4].fill(255); // Enumeration must not mistake the lookup filter for data.
     body[4] = shared.len() as u8;
     for record in shared {
-        body.extend_from_slice(&((shared_data.len() / 4) as u32).to_le_bytes());
-        shared_data.extend_from_slice(record);
+        body.put_u32_le((shared_data.len() / 4) as u32);
+        shared_data.put_slice(record);
     }
     for record in inline {
-        body.extend_from_slice(record);
+        body.put_slice(record);
     }
     if inline.is_empty() && shared.is_empty() {
         body.clear();
@@ -60,43 +61,41 @@ fn image(
     let prefix_offset = if packed { 508 } else { prefix_at + 508 };
     let mut prefix_data = vec![0; 508];
     for prefix in prefixes {
-        prefix_data.extend_from_slice(&(prefix.len() as u16).to_le_bytes());
-        prefix_data.extend_from_slice(prefix);
+        prefix_data.put_u16_le(prefix.len() as u16);
+        prefix_data.put_slice(prefix);
         prefix_data.resize(prefix_data.len().next_multiple_of(4), 0);
     }
     let mut data = vec![0; prefix_at + prefix_data.len()];
-    data[1024..1028].copy_from_slice(&MAGIC_NUMBER.to_le_bytes());
+    (&mut data[1024..]).put_u32_le(MAGIC_NUMBER);
     data[1032] = 4; // Name-filter feature enabled.
     data[1036] = 9;
     data[1064] = 4;
-    data[1068..1072].copy_from_slice(&((shared_at / 512) as u32).to_le_bytes());
+    (&mut data[1068..]).put_u32_le((shared_at / 512) as u32);
     if !prefixes.is_empty() {
         data[1104] = 0x40;
         data[1032] |= if packed { 0 } else { 0x10 };
         data[1115] = prefixes.len() as u8;
-        data[1116..1120].copy_from_slice(&((prefix_offset / 4) as u32).to_le_bytes());
+        (&mut data[1116..]).put_u32_le((prefix_offset / 4) as u32);
     }
     let packed_nid = ((packed_at - 2048) / 32) as u64;
     if packed {
-        data[1120..1128].copy_from_slice(&packed_nid.to_le_bytes());
-        data[packed_at + 4..packed_at + 6].copy_from_slice(&0o100644u16.to_le_bytes());
-        data[packed_at + 8..packed_at + 12]
-            .copy_from_slice(&(prefix_data.len() as u32).to_le_bytes());
-        data[packed_at + 16..packed_at + 20]
-            .copy_from_slice(&((prefix_at / 512) as u32).to_le_bytes());
+        (&mut data[1120..]).put_u64_le(packed_nid);
+        (&mut data[packed_at + 4..]).put_u16_le(0o100644);
+        (&mut data[packed_at + 8..]).put_u32_le(prefix_data.len() as u32);
+        (&mut data[packed_at + 16..]).put_u32_le((prefix_at / 512) as u32);
     }
     data[2048] = 0x10; // Omit dot; retain the parent entry.
-    data[2052..2054].copy_from_slice(&0o40755u16.to_le_bytes());
-    data[2056..2060].copy_from_slice(&27u32.to_le_bytes());
-    data[2064..2068].copy_from_slice(&((root_data / 512) as u32).to_le_bytes());
-    data[root_data + 8..root_data + 10].copy_from_slice(&24u16.to_le_bytes());
+    (&mut data[2052..]).put_u16_le(0o40755);
+    (&mut data[2056..]).put_u32_le(27);
+    (&mut data[2064..]).put_u32_le((root_data / 512) as u32);
+    (&mut data[root_data + 8..]).put_u16_le(24);
     data[root_data + 12] = 1;
-    data[root_data + 20..root_data + 22].copy_from_slice(&26u16.to_le_bytes());
+    (&mut data[root_data + 20..]).put_u16_le(26);
     data[root_data + 24..root_data + 27].copy_from_slice(b"..f");
     data[2080] = u8::from(extended);
-    data[2084..2086].copy_from_slice(&0o100644u16.to_le_bytes());
+    (&mut data[2084..]).put_u16_le(0o100644);
     if !body.is_empty() {
-        data[2082..2084].copy_from_slice(&(((body.len() - 12) / 4 + 1) as u16).to_le_bytes());
+        (&mut data[2082..]).put_u16_le(((body.len() - 12) / 4 + 1) as u16);
     }
     data[body_at..body_at + body.len()].copy_from_slice(&body);
     data[shared_at..shared_at + shared_data.len()].copy_from_slice(&shared_data);
@@ -203,9 +202,8 @@ fn long_prefixes_in_image_and_packed_inode() {
         if packed {
             // PLAIN_XATTR_PFX overrides the packed inode even when it is present.
             fixture.data[1032] |= 0x10;
-            fixture.data[1116..1120]
-                .copy_from_slice(&((fixture.prefixes / 4) as u32).to_le_bytes());
-            fixture.data[1120..1128].copy_from_slice(&u64::MAX.to_le_bytes());
+            (&mut fixture.data[1116..]).put_u32_le((fixture.prefixes / 4) as u32);
+            (&mut fixture.data[1120..]).put_u64_le(u64::MAX);
         } else {
             // Older images without a packed inode also store prefixes directly.
             fixture.data[1032] &= !0x10;
@@ -247,7 +245,7 @@ fn compressed_prefixes_reuse_extent_mapping() {
     fixture.data[inode] = 2; // Compact inode with Full compression indexes.
     fixture.data[inode + 32..inode + 64].fill(0);
     fixture.data[inode + 48] = 1;
-    fixture.data[inode + 52..inode + 56].copy_from_slice(&((physical / 512) as u32).to_le_bytes());
+    (&mut fixture.data[inode + 52..]).put_u32_le((physical / 512) as u32);
     fixture.data[inode + 56] = 2;
     fixture.data[inode + 60] = 1;
     fixture.data[physical..physical + 512].fill(0);
@@ -313,7 +311,7 @@ fn no_attributes_do_not_read_and_failures_can_be_retried() {
 
     let mut fixture = image(&[entry(1, b"test", b"ok")], &[], &[], false, false);
     for mode in [0o100644u16, 0o40755, 0o120777, 0o20600, 0o10600, 0o140600] {
-        fixture.data[2084..2086].copy_from_slice(&mode.to_le_bytes());
+        (&mut fixture.data[2084..]).put_u16_le(mode);
         let source = Source {
             data: SliceImage::new(&fixture.data),
             reads: AtomicUsize::new(0),
@@ -348,8 +346,8 @@ fn no_attributes_do_not_read_and_failures_can_be_retried() {
     }
     // Attribute access does not try to decode the subject inode's file data.
     fixture.data[2080] = 2;
-    fixture.data[2084..2086].copy_from_slice(&0o100644u16.to_le_bytes());
-    fixture.data[2088..2092].copy_from_slice(&100_000u32.to_le_bytes());
+    (&mut fixture.data[2084..]).put_u16_le(0o100644);
+    (&mut fixture.data[2088..]).put_u32_le(100_000);
     check(&fixture.data, &[(b"user.test", b"ok")]);
 }
 
@@ -385,7 +383,7 @@ fn invalid_headers_entries_prefixes_and_duplicates_are_rejected() {
         rejected(&data);
     }
     let mut data = base.data.clone();
-    data[2082..2084].copy_from_slice(&1u16.to_le_bytes());
+    (&mut data[2082..]).put_u16_le(1);
     rejected(&data); // Header-only body has no defined format.
     rejected(&base.data[..base.body + 15]);
     for record in [
@@ -467,10 +465,10 @@ fn invalid_headers_entries_prefixes_and_duplicates_are_rejected() {
     );
     let packed = 2048 + base.packed as usize * 32;
     let mut data = base.data.clone();
-    data[packed + 4..packed + 6].copy_from_slice(&0o40755u16.to_le_bytes());
+    (&mut data[packed + 4..]).put_u16_le(0o40755);
     rejected(&data);
     let mut data = base.data;
-    data[packed + 8..packed + 12].copy_from_slice(&510u32.to_le_bytes());
+    (&mut data[packed + 8..]).put_u32_le(510);
     rejected(&data);
 }
 
@@ -511,9 +509,9 @@ fn metadata_addresses_remain_u64() {
         false,
         false,
     );
-    fixture.data[1064..1068].copy_from_slice(&0x80000000u32.to_le_bytes());
-    fixture.data[1068..1072].copy_from_slice(&0x90000000u32.to_le_bytes());
-    fixture.data[1116..1120].copy_from_slice(&0xa0000000u32.to_le_bytes());
+    (&mut fixture.data[1064..]).put_u32_le(0x80000000);
+    (&mut fixture.data[1068..]).put_u32_le(0x90000000);
+    (&mut fixture.data[1116..]).put_u32_le(0xa0000000);
     let image = Sparse(vec![
         (1024, &fixture.data[1024..1152]),
         (0x80000000u64 * 512, &fixture.data[2048..fixture.body + 40]),

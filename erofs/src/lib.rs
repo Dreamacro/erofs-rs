@@ -69,6 +69,7 @@ pub(crate) mod compression;
 mod devices;
 pub(crate) mod dirent;
 pub(crate) mod filesystem;
+pub(crate) mod metadata;
 #[cfg(test)]
 mod tests;
 mod xattr;

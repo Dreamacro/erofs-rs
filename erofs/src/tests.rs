@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use bytes::BufMut;
 use core::{
     future::Future,
     ops::{Bound::*, RangeBounds},
@@ -63,9 +64,10 @@ pub fn directory(data: &mut [u8], entries: &[(u64, &[u8], u8)]) {
     let mut name_offset = entries.len() * 12;
     for (index, &(nid, name, kind)) in entries.iter().enumerate() {
         let at = index * 12;
-        data[at..at + 8].copy_from_slice(&nid.to_le_bytes());
-        data[at + 8..at + 10].copy_from_slice(&(name_offset as u16).to_le_bytes());
-        data[at + 10] = kind;
+        let mut fields = &mut data[at..];
+        fields.put_u64_le(nid);
+        fields.put_u16_le(name_offset as u16);
+        fields.put_u8(kind);
         data[name_offset..name_offset + name.len()].copy_from_slice(name);
         name_offset += name.len();
     }
@@ -73,7 +75,7 @@ pub fn directory(data: &mut [u8], entries: &[(u64, &[u8], u8)]) {
 
 pub fn image() -> Vec<u8> {
     let mut data = vec![0; 6656];
-    data[1024..1028].copy_from_slice(&MAGIC_NUMBER.to_le_bytes());
+    (&mut data[1024..]).put_u32_le(MAGIC_NUMBER);
     data[1036] = 9;
     data[1038] = 1;
     data[1064] = 4;
@@ -83,9 +85,9 @@ pub fn image() -> Vec<u8> {
         (3, 0o100644, 1, 12),
     ] {
         let at = 2048 + nid * 32;
-        data[at + 4..at + 6].copy_from_slice(&mode.to_le_bytes());
-        data[at + 8..at + 12].copy_from_slice(&size.to_le_bytes());
-        data[at + 16..at + 20].copy_from_slice(&block.to_le_bytes());
+        (&mut data[at + 4..]).put_u16_le(mode);
+        (&mut data[at + 8..]).put_u32_le(size);
+        (&mut data[at + 16..]).put_u32_le(block);
     }
     // Dot inodes must not be loaded. Advisory dtype deliberately disagrees with inode type.
     directory(
@@ -187,8 +189,8 @@ fn walking_uses_inode_types_and_rejects_ancestor_cycles() {
     let mut data = image();
     data[4130] = 1; // A directory advertised as a regular file.
     data[2112] = 0x10; // Directory with omitted dot entry.
-    data[2116..2118].copy_from_slice(&0o40755u16.to_le_bytes());
-    data[2120..2124].copy_from_slice(&512u32.to_le_bytes());
+    (&mut data[2116..]).put_u16_le(0o40755);
+    (&mut data[2120..]).put_u32_le(512);
     directory(&mut data[5120..5632], &[(1, b"back", 1), (3, b"\xff", 0)]);
     let source = Source {
         data: SliceImage::new(&data),

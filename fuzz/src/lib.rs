@@ -1,4 +1,5 @@
 mod source;
+use bytes::BufMut;
 #[cfg(not(feature = "std"))]
 use erofs_rs::sync::file::Read;
 use erofs_rs::{EroFS, r#async::EroFS as AsyncEroFS, types::Inode};
@@ -14,8 +15,9 @@ type Fs<'a> = EroFS<Source<'a>>;
 type AsyncFs<'a> = AsyncEroFS<Source<'a>>;
 
 fn number(data: &[u8], at: usize) -> u64 {
-    data.get(at..at + 8)
-        .map_or(0, |bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+    data.get(at..)
+        .and_then(|data| data.first_chunk())
+        .map_or(0, |bytes| u64::from_le_bytes(*bytes))
 }
 
 fn pair<A, B, E, F>(a: Result<A, E>, b: Result<B, F>, states: &[State; 2]) -> Option<(A, B)> {
@@ -88,7 +90,7 @@ fn stream(fs: &Fs<'_>, afs: &AsyncFs<'_>, a: Inode, b: Inode, states: &[State; 2
             }
             Ok(n) => {
                 assert!(n <= size);
-                left.extend_from_slice(&buf[..n]);
+                left.put_slice(&buf[..n]);
             }
             Err(_) => break,
         }
@@ -103,7 +105,7 @@ fn stream(fs: &Fs<'_>, afs: &AsyncFs<'_>, a: Inode, b: Inode, states: &[State; 2
             }
             Ok(n) => {
                 assert!(n <= size);
-                right.extend_from_slice(&buf[..n]);
+                right.put_slice(&buf[..n]);
             }
             Err(_) => break,
         }
@@ -190,25 +192,22 @@ fn envelope(data: &[u8], compression: bool) -> Cow<'_, [u8]> {
     }
     let mut image = data.to_vec();
     image.resize(image.len().max(2176), 0);
-    image[1024..1028].copy_from_slice(&erofs_rs::types::MAGIC_NUMBER.to_le_bytes());
+    (&mut image[1024..]).put_u32_le(erofs_rs::types::MAGIC_NUMBER);
     image[1036] = 9;
     image[1056..1060].fill(0); // Valid inherited nanoseconds.
-    image[1064..1068].copy_from_slice(&4u32.to_le_bytes());
+    (&mut image[1064..]).put_u32_le(4);
     image[1105..1108].fill(0); // Known incompatibility bits.
     image[1110..1112].fill(0);
-    image[2080..2082].copy_from_slice(
-        &(if compression {
-            if data.get(10).is_some_and(|b| b & 1 != 0) {
-                6u16
-            } else {
-                2
-            }
+    (&mut image[2080..]).put_u16_le(if compression {
+        if data.get(10).is_some_and(|b| b & 1 != 0) {
+            6
         } else {
-            0
-        })
-        .to_le_bytes(),
-    );
-    image[2084..2086].copy_from_slice(&0o100644u16.to_le_bytes());
+            2
+        }
+    } else {
+        0
+    });
+    (&mut image[2084..]).put_u16_le(0o100644);
     if compression {
         image[2082..2084].fill(0);
     }
@@ -354,6 +353,22 @@ pub fn read_contract(data: &[u8]) {
             include_bytes!("../seeds/compression/full-zstd"),
             cfg!(feature = "zstd"),
         ),
+        (
+            include_bytes!("../seeds/compression/metabox-lz4"),
+            cfg!(feature = "lz4"),
+        ),
+        (
+            include_bytes!("../seeds/compression/metabox-lzma"),
+            cfg!(feature = "lzma"),
+        ),
+        (
+            include_bytes!("../seeds/compression/metabox-deflate"),
+            cfg!(feature = "deflate"),
+        ),
+        (
+            include_bytes!("../seeds/compression/metabox-zstd"),
+            cfg!(feature = "zstd"),
+        ),
     ];
     let index = data.first().copied().unwrap_or(0) as usize % images.len();
     let (image, enabled) = images[index];
@@ -362,9 +377,10 @@ pub fn read_contract(data: &[u8]) {
     }
     let states = [State::default(), State::default()];
     let (fs, afs) = systems(image, &[], &states).unwrap();
-    let mut file = fs.open_inode_file(fs.get_inode(1).unwrap()).unwrap();
+    let nid = number(image, 16);
+    let mut file = fs.open_inode_file(fs.get_inode(nid).unwrap()).unwrap();
     let mut afile = afs
-        .open_inode_file(ready(afs.get_inode(1)).unwrap())
+        .open_inode_file(ready(afs.get_inode(nid)).unwrap())
         .unwrap();
     let expected = [vec![b'A'; 700], vec![b'B'; 325], vec![b'C'; 475]].concat();
     let mut positions = [0, 0];

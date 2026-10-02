@@ -1,4 +1,5 @@
 use alloc::{format, vec::Vec};
+use bytes::Buf;
 use core::ops::Range;
 
 use crate::{Error, Result};
@@ -42,19 +43,13 @@ impl DeviceTable {
             .try_reserve_exact(slots.len())
             .map_err(|_| Error::OutOfBounds("cannot allocate device ranges".into()))?;
         for (index, slot) in slots.iter().enumerate() {
-            let blocks = u64::from(u32::from_le_bytes(slot[64..68].try_into().unwrap()))
-                | if wide {
-                    u64::from(u16::from_le_bytes([slot[72], slot[73]])) << 32
-                } else {
-                    0
-                };
-            let unified_start_block =
-                u64::from(u32::from_le_bytes(slot[68..72].try_into().unwrap()))
-                    | if wide {
-                        u64::from(u16::from_le_bytes([slot[74], slot[75]])) << 32
-                    } else {
-                        0
-                    };
+            let mut fields = &slot[64..];
+            let mut blocks = u64::from(fields.get_u32_le());
+            let mut unified_start_block = u64::from(fields.get_u32_le());
+            if wide {
+                blocks |= u64::from(fields.get_u16_le()) << 32;
+                unified_start_block |= u64::from(fields.get_u16_le()) << 32;
+            }
             let size = blocks
                 .checked_mul(block_size)
                 .ok_or(Error::Overflow("device size"))?;

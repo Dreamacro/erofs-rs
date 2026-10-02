@@ -1,4 +1,5 @@
 use alloc::{borrow::Cow, format, string::ToString, sync::Arc, vec::Vec};
+use bytes::BufMut;
 use typed_path::{UnixPath, UnixPathBuf};
 
 use super::file::File;
@@ -6,6 +7,7 @@ use super::walkdir::WalkDir;
 use crate::backend::Image;
 use crate::dirent;
 use crate::filesystem::{BlockPlan, EroFSCore};
+use crate::metadata::{self, ReadSource};
 use crate::types::*;
 use crate::xattr::XattrRead;
 use crate::{DeviceInfo, Error, Result, Xattrs};
@@ -113,6 +115,13 @@ impl<I: Image> EroFS<I> {
             .get(SUPER_BLOCK_OFFSET..SUPER_BLOCK_OFFSET + SuperBlock::size() as u64)
             .ok_or_else(|| Error::InvalidSuperblock("failed to read super block".to_string()))?;
         let mut core = EroFSCore::new(sb_data)?;
+        let extensions = core.extension_range()?;
+        if !extensions.is_empty() {
+            let data = image
+                .get(extensions)
+                .ok_or_else(|| Error::OutOfBounds("truncated superblock extensions".into()))?;
+            core.set_extensions(data)?;
+        }
         let range = core.device_table_range(devices.len())?;
         if !range.is_empty() {
             let data = image
@@ -203,7 +212,7 @@ impl<I: Image> EroFS<I> {
             target
                 .try_reserve(block.len())
                 .map_err(|_| Error::OutOfBounds("symbolic link target is too large".to_string()))?;
-            target.extend_from_slice(&block);
+            target.put_slice(&block);
         }
         if target.is_empty() {
             return Err(Error::CorruptedData(
@@ -223,28 +232,22 @@ impl<I: Image> EroFS<I> {
     }
 
     /// Reads extended attributes of an inode obtained from this filesystem.
-    /// Attribute values are copied; file contents are not read unless long name
-    /// prefixes reside in the special packed inode.
+    /// Attribute values are copied without reading the subject's file data.
+    /// Metadata may require decoding the metabox or special packed inode.
     pub fn xattrs_inode(&self, inode: Inode) -> Result<Xattrs> {
         let mut reader = XattrRead::new(&self.core, &inode)?;
-        let packed = reader
-            .packed_nid
-            .map(|nid| self.get_inode(nid))
-            .transpose()?;
         let mut cached: Cow<'_, [u8]> = Cow::Borrowed(&[]);
         let mut cached_offset = 0;
+        let mut cached_source = ReadSource::Device(0);
         while let Some(request) = reader.request() {
-            let data = if request.packed {
-                let inode = packed
-                    .as_ref()
-                    .ok_or_else(|| Error::CorruptedData("missing xattr prefix inode".into()))?;
-                request.validate_inode(inode)?;
-                if request.in_buffer(cached_offset, &cached).is_none() {
+            let data = if let ReadSource::Inode(nid) = request.source {
+                if cached_source != request.source
+                    || request.in_buffer(cached_offset, &cached).is_none()
+                {
+                    let inode = self.source_inode(nid)?;
+                    cached = self.get_inode_range(&inode, request.offset, request.size)?;
                     cached_offset = request.offset;
-                    cached = self.get_inode_data(inode, request.offset)?;
-                    if cached.len() < request.size {
-                        cached = self.get_inode_block(inode, request.offset)?;
-                    }
+                    cached_source = request.source;
                 }
                 request.in_buffer(cached_offset, &cached)
             } else {
@@ -264,26 +267,73 @@ impl<I: Image> EroFS<I> {
 
     pub fn get_inode(&self, nid: u64) -> Result<Inode> {
         let offset = self.core.get_inode_offset(nid)?;
+        let source = self.core.metadata_source(nid)?;
         let compact_size = InodeCompact::size();
-        let end = offset
-            .checked_add(compact_size as u64)
-            .ok_or(Error::Overflow("inode read range"))?;
-        let data = self
-            .image
-            .get(offset..end)
-            .ok_or_else(|| Error::OutOfBounds("failed to read inode format".to_string()))?;
-        let (_, size) = EroFSCore::inode_header(data)?;
+        let data = self.read_source(source, offset, compact_size)?;
+        let (_, size) = EroFSCore::inode_header(&data)?;
         let data = if size > compact_size {
-            let end = offset
-                .checked_add(size as u64)
-                .ok_or(Error::Overflow("inode read range"))?;
-            self.image
-                .get(offset..end)
-                .ok_or_else(|| Error::OutOfBounds("failed to read inode".to_string()))?
+            self.read_source(source, offset, size)?
         } else {
             data
         };
-        self.core.parse_inode(data, nid)
+        self.core.parse_inode(&data, nid)
+    }
+
+    fn source_inode(&self, nid: u64) -> Result<Inode> {
+        metadata::primary_inode(nid)?;
+        let inode = self.get_inode(nid)?;
+        if !inode.is_file() {
+            return Err(Error::CorruptedData(
+                "metadata source is not a regular inode".into(),
+            ));
+        }
+        Ok(inode)
+    }
+
+    fn read_source(&self, source: ReadSource, offset: u64, size: usize) -> Result<Cow<'_, [u8]>> {
+        let end = offset
+            .checked_add(size as u64)
+            .ok_or(Error::Overflow("source read range"))?;
+        match source {
+            ReadSource::Device(device) => self
+                .image_for_device(device)?
+                .get(offset..end)
+                .filter(|data| data.len() == size)
+                .map(Cow::Borrowed)
+                .ok_or_else(|| Error::OutOfBounds("failed to read source".into())),
+            ReadSource::Inode(nid) => {
+                let inode = self.source_inode(nid)?;
+                let mut data = self.get_inode_range(&inode, offset, size)?;
+                match &mut data {
+                    Cow::Borrowed(bytes) => *bytes = &bytes[..size],
+                    Cow::Owned(bytes) => bytes.truncate(size),
+                }
+                Ok(data)
+            }
+        }
+    }
+
+    // Retain coverage beyond the requested end for iterator-local metadata caches.
+    fn get_inode_range(&self, inode: &Inode, offset: u64, size: usize) -> Result<Cow<'_, [u8]>> {
+        metadata::validate_range(inode, offset, size)?;
+        if size == 0 {
+            return Ok(Cow::Borrowed(&[]));
+        }
+        let mut data = self.get_inode_data(inode, offset)?;
+        if data.len() < size {
+            let buf = data.to_mut();
+            buf.try_reserve_exact(size - buf.len())
+                .map_err(|_| Error::OutOfBounds("cannot allocate inode range".into()))?;
+            while buf.len() < size {
+                let next = self.get_inode_data(inode, offset + buf.len() as u64)?;
+                if next.is_empty() {
+                    return Err(Error::CorruptedData("inode read made no progress".into()));
+                }
+                let n = next.len().min(size - buf.len());
+                buf.put_slice(&next[..n]);
+            }
+        }
+        Ok(data)
     }
 
     /// Assemble exactly one logical block, even when it crosses compressed extents.
@@ -291,21 +341,10 @@ impl<I: Image> EroFS<I> {
     // caching if compressed directory traversal becomes a bottleneck.
     pub(crate) fn get_inode_block(&self, inode: &Inode, offset: u64) -> Result<Cow<'_, [u8]>> {
         let size = self.core.block_read_size(inode, offset)?;
-        let mut data = self.get_inode_data(inode, offset)?;
-        if data.len() >= size {
-            match &mut data {
-                Cow::Borrowed(bytes) => *bytes = &bytes[..size],
-                Cow::Owned(bytes) => bytes.truncate(size),
-            }
-        } else {
-            let buf = data.to_mut();
-            buf.try_reserve_exact(size - buf.len())
-                .map_err(|_| Error::OutOfBounds("cannot allocate inode block".to_string()))?;
-            while buf.len() < size {
-                let next = self.get_inode_data(inode, offset + buf.len() as u64)?;
-                let n = next.len().min(size - buf.len());
-                buf.extend_from_slice(&next[..n]);
-            }
+        let mut data = self.get_inode_range(inode, offset, size)?;
+        match &mut data {
+            Cow::Borrowed(bytes) => *bytes = &bytes[..size],
+            Cow::Owned(bytes) => bytes.truncate(size),
         }
         Ok(data)
     }
@@ -316,16 +355,11 @@ impl<I: Image> EroFS<I> {
         loop {
             match plan {
                 BlockPlan::Direct {
-                    device_id,
+                    source,
                     offset,
                     size,
                 } => {
-                    let size = size.min(limit);
-                    return self
-                        .image_for_device(device_id)?
-                        .get(offset..offset + size as u64)
-                        .map(Cow::Borrowed)
-                        .ok_or_else(|| Error::OutOfBounds("failed to get inode data".to_string()));
+                    return self.read_source(source, offset, size.min(limit));
                 }
                 BlockPlan::Hole { size } => return Ok(Cow::Owned(vec![0; size.min(limit)])),
                 BlockPlan::Fragment { offset, size } => {
@@ -334,6 +368,7 @@ impl<I: Image> EroFS<I> {
                     limit = usize::try_from(size).unwrap_or(usize::MAX);
                 }
                 BlockPlan::Chunked {
+                    source,
                     addr_offset,
                     format,
                     block_index,
@@ -341,12 +376,9 @@ impl<I: Image> EroFS<I> {
                     size,
                 } => {
                     let entry_size = EroFSCore::chunk_entry_size(format);
-                    let data = self
-                        .image
-                        .get(addr_offset..addr_offset + entry_size as u64)
-                        .ok_or_else(|| Error::OutOfBounds("failed to get chunk index".into()))?;
+                    let data = self.read_source(source, addr_offset, entry_size)?;
                     plan = self.core.resolve_chunk_read(
-                        data,
+                        &data,
                         format,
                         block_index,
                         offset_in_block,
@@ -354,26 +386,17 @@ impl<I: Image> EroFS<I> {
                     )?;
                 }
                 BlockPlan::CompressionMetadata {
+                    source,
                     offset,
                     size,
                     reader,
                 } => {
-                    let data = self
-                        .image
-                        .get(offset..offset + size as u64)
-                        .ok_or_else(|| {
-                            Error::OutOfBounds("failed to read compression metadata".to_string())
-                        })?;
-                    plan = reader.resume(&self.core, offset, data)?;
+                    let data = self.read_source(source, offset, size)?;
+                    plan = reader.resume(&self.core, offset, &data)?;
                 }
                 BlockPlan::Encoded(extent) => {
-                    let data = self
-                        .image_for_device(extent.device_id)?
-                        .get(extent.offset..extent.offset + extent.size as u64)
-                        .ok_or_else(|| {
-                            Error::OutOfBounds("failed to read compressed data".to_string())
-                        })?;
-                    return extent.decode(data, limit).map(Cow::Owned);
+                    let data = self.read_source(extent.source, extent.offset, extent.size)?;
+                    return extent.decode(&data, limit).map(Cow::Owned);
                 }
             }
         }

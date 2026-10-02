@@ -33,7 +33,7 @@ and `target` are ignored by Git. The small `seeds` directory is checked in.
 | `compression` | Image with Full/Compact indexes, inline payloads, fragments or modern extents. Compare bounded sequential streams with different read sizes, including partial decoding and sparse high physical addresses. |
 | `xattrs` | Image; inline/shared entries, namespaces, opaque names/values and plain/packed/compressed prefixes. Compare complete byte maps. |
 | `devices` | Up to 8192 bytes of primary image, then up to 2048 bytes of device 1, then device 2. Boot byte 10 modulo 3 selects the number of supplied devices. Exercise indexed chunks, flat/inline/compressed data, masks, holes, device ranges and high addresses. |
-| `read_contract` | Byte 0 selects a fixed valid plain/four-codec image. Remaining bytes generate up to 32 `(u16 buffer_size, u8 failure_point)` operations via `Arbitrary`. Check against known file bytes, not just the other executor. Also retry failed directory block loads. |
+| `read_contract` | Byte 0 selects a fixed valid plain/four-codec/metabox image. Remaining bytes generate up to 32 `(u16 buffer_size, u8 failure_point)` operations via `Arbitrary`. Check against known file bytes, not just the other executor. Also retry failed directory block loads. |
 
 For image targets, unused boot bytes 16..24 supply an inode ID (little-endian).
 For filesystem path lookup, byte 31 modulo 65 supplies a length and bytes starting
@@ -50,6 +50,10 @@ The backend exposes the input bytes at offsets 0, `1 << 40` and `1 << 48`;
 unrepresented gaps fail reads. This tests wide byte/block addresses without
 allocating huge images. Async exact-read failures may modify the destination.
 No network, mmap, native encoder or `mkfs.erofs` is used in the hot loop.
+The `metabox-*` seeds cover all four codecs and were checked with `fsck.erofs`;
+boot bytes select the full high-bit file NID. Replay also verifies file bytes
+and xattrs against known source values. The operation target includes these
+images to inject failures while loading metabox-backed metadata.
 
 ## Oracles and budgets
 

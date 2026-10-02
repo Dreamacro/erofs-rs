@@ -1,5 +1,6 @@
-use alloc::format;
 use alloc::vec::Vec;
+use alloc::{boxed::Box, format};
+use bytes::BufMut;
 
 use typed_path::UnixPath;
 
@@ -8,6 +9,7 @@ use super::walkdir::WalkDir;
 use crate::backend::AsyncImage;
 use crate::dirent;
 use crate::filesystem::{BlockPlan, EroFSCore};
+use crate::metadata::{self, ReadSource};
 use crate::types::*;
 use crate::xattr::XattrRead;
 use crate::{DeviceInfo, Error, Result, Xattrs};
@@ -42,6 +44,12 @@ impl<I: AsyncImage> EroFS<I> {
             .read_exact_at(&mut super_block, SUPER_BLOCK_OFFSET)
             .await?;
         let mut core = EroFSCore::new(&super_block)?;
+        let extensions = core.extension_range()?;
+        if !extensions.is_empty() {
+            let mut data = vec![0; (extensions.end - extensions.start) as usize]; // At most 255 slots.
+            image.read_exact_at(&mut data, extensions.start).await?;
+            core.set_extensions(&data)?;
+        }
         let range = core.device_table_range(devices.len())?;
         if !range.is_empty() {
             let size = (range.end - range.start) as usize; // At most 65535 device slots.
@@ -124,28 +132,24 @@ impl<I: AsyncImage> EroFS<I> {
     }
 
     /// Reads extended attributes of an inode obtained from this filesystem.
-    /// Attribute values are copied; file contents are not read unless long name
-    /// prefixes reside in the special packed inode.
+    /// Attribute values are copied without reading the subject's file data.
+    /// Metadata may require decoding the metabox or special packed inode.
     pub async fn xattrs_inode(&self, inode: Inode) -> Result<Xattrs> {
         let mut reader = XattrRead::new(&self.core, &inode)?;
-        let packed = match reader.packed_nid {
-            Some(nid) => Some(self.get_inode(nid).await?),
-            None => None,
-        };
         let mut cached = Vec::new();
         let mut cached_offset = 0;
+        let mut cached_source = ReadSource::Device(0);
         while let Some(request) = reader.request() {
-            if request.packed {
-                let inode = packed
-                    .as_ref()
-                    .ok_or_else(|| Error::CorruptedData("missing xattr prefix inode".into()))?;
-                request.validate_inode(inode)?;
-                if request.in_buffer(cached_offset, &cached).is_none() {
+            if let ReadSource::Inode(nid) = request.source {
+                if cached_source != request.source
+                    || request.in_buffer(cached_offset, &cached).is_none()
+                {
+                    let inode = self.source_inode(nid).await?;
+                    cached = self
+                        .read_inode_range(&inode, request.offset, request.size)
+                        .await?;
                     cached_offset = request.offset;
-                    cached = self.read_inode_data(inode, request.offset).await?;
-                    if cached.len() < request.size {
-                        cached = self.read_inode_block(inode, request.offset).await?;
-                    }
+                    cached_source = request.source;
                 }
                 let data = request
                     .in_buffer(cached_offset, &cached)
@@ -167,39 +171,82 @@ impl<I: AsyncImage> EroFS<I> {
 
     pub async fn get_inode(&self, nid: u64) -> Result<Inode> {
         let offset = self.core.get_inode_offset(nid)?;
+        let source = self.core.metadata_source(nid)?;
         let compact_size = InodeCompact::size();
         let extended_offset = offset
             .checked_add(compact_size as u64)
             .ok_or(Error::Overflow("inode read range"))?;
         let mut buf = [0u8; InodeExtended::size()];
-        self.image
-            .read_exact_at(&mut buf[..compact_size], offset)
+        self.read_source(source, &mut buf[..compact_size], offset)
             .await?;
         let (_, size) = EroFSCore::inode_header(&buf[..compact_size])?;
         if size > compact_size {
             offset
                 .checked_add(size as u64)
                 .ok_or(Error::Overflow("inode read range"))?;
-            self.image
-                .read_exact_at(&mut buf[compact_size..size], extended_offset)
+            self.read_source(source, &mut buf[compact_size..size], extended_offset)
                 .await?;
         }
         self.core.parse_inode(&buf[..size], nid)
     }
 
+    async fn source_inode(&self, nid: u64) -> Result<Inode> {
+        metadata::primary_inode(nid)?;
+        // Boxing breaks the async type cycle, not the on-disk cycle: special
+        // inode headers are required to reside in primary metadata.
+        let inode = Box::pin(self.get_inode(nid)).await?;
+        if !inode.is_file() {
+            return Err(Error::CorruptedData(
+                "metadata source is not a regular inode".into(),
+            ));
+        }
+        Ok(inode)
+    }
+
+    async fn read_source(&self, source: ReadSource, buf: &mut [u8], offset: u64) -> Result<()> {
+        match source {
+            ReadSource::Device(device) => {
+                self.image_for_device(device)?
+                    .read_exact_at(buf, offset)
+                    .await
+            }
+            ReadSource::Inode(nid) => {
+                let inode = self.source_inode(nid).await?;
+                let data = Box::pin(self.read_inode_range(&inode, offset, buf.len())).await?;
+                buf.copy_from_slice(&data[..buf.len()]);
+                Ok(())
+            }
+        }
+    }
+
+    // Retain coverage beyond the requested end for iterator-local metadata caches.
+    async fn read_inode_range(&self, inode: &Inode, offset: u64, size: usize) -> Result<Vec<u8>> {
+        metadata::validate_range(inode, offset, size)?;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut data = self.read_inode_data(inode, offset).await?;
+        if data.len() < size {
+            data.try_reserve_exact(size - data.len())
+                .map_err(|_| Error::OutOfBounds("cannot allocate inode range".into()))?;
+            while data.len() < size {
+                let next = self
+                    .read_inode_data(inode, offset + data.len() as u64)
+                    .await?;
+                if next.is_empty() {
+                    return Err(Error::CorruptedData("inode read made no progress".into()));
+                }
+                let n = next.len().min(size - data.len());
+                data.put_slice(&next[..n]);
+            }
+        }
+        Ok(data)
+    }
+
     pub(crate) async fn read_inode_block(&self, inode: &Inode, offset: u64) -> Result<Vec<u8>> {
         let size = self.core.block_read_size(inode, offset)?;
-        let mut data = self.read_inode_data(inode, offset).await?;
+        let mut data = self.read_inode_range(inode, offset, size).await?;
         data.truncate(size);
-        data.try_reserve_exact(size - data.len())
-            .map_err(|_| Error::OutOfBounds("cannot allocate inode block".into()))?;
-        while data.len() < size {
-            let next = self
-                .read_inode_data(inode, offset + data.len() as u64)
-                .await?;
-            let n = next.len().min(size - data.len());
-            data.extend_from_slice(&next[..n]);
-        }
         Ok(data)
     }
 
@@ -209,14 +256,12 @@ impl<I: AsyncImage> EroFS<I> {
         loop {
             match plan {
                 BlockPlan::Direct {
-                    device_id,
+                    source,
                     offset,
                     size,
                 } => {
                     let mut buf = vec![0u8; size.min(limit)];
-                    self.image_for_device(device_id)?
-                        .read_exact_at(&mut buf, offset)
-                        .await?;
+                    self.read_source(source, &mut buf, offset).await?;
                     return Ok(buf);
                 }
                 BlockPlan::Hole { size } => return Ok(vec![0; size.min(limit)]),
@@ -226,6 +271,7 @@ impl<I: AsyncImage> EroFS<I> {
                     limit = usize::try_from(size).unwrap_or(usize::MAX);
                 }
                 BlockPlan::Chunked {
+                    source,
                     addr_offset,
                     format,
                     block_index,
@@ -234,7 +280,7 @@ impl<I: AsyncImage> EroFS<I> {
                 } => {
                     let mut data = [0u8; 8];
                     let data = &mut data[..EroFSCore::chunk_entry_size(format)];
-                    self.image.read_exact_at(data, addr_offset).await?;
+                    self.read_source(source, data, addr_offset).await?;
                     plan = self.core.resolve_chunk_read(
                         data,
                         format,
@@ -244,18 +290,18 @@ impl<I: AsyncImage> EroFS<I> {
                     )?;
                 }
                 BlockPlan::CompressionMetadata {
+                    source,
                     offset,
                     size,
                     reader,
                 } => {
                     let mut data = vec![0; size];
-                    self.image.read_exact_at(&mut data, offset).await?;
+                    self.read_source(source, &mut data, offset).await?;
                     plan = reader.resume(&self.core, offset, &data)?;
                 }
                 BlockPlan::Encoded(extent) => {
                     let mut data = vec![0; extent.size];
-                    self.image_for_device(extent.device_id)?
-                        .read_exact_at(&mut data, extent.offset)
+                    self.read_source(extent.source, &mut data, extent.offset)
                         .await?;
                     return extent.decode(&data, limit);
                 }

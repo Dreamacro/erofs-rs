@@ -4,6 +4,7 @@ use crate::{
     tests::{Source, ready},
     types::MAGIC_NUMBER,
 };
+use bytes::BufMut;
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 #[cfg(any(
     feature = "lz4",
@@ -67,26 +68,27 @@ fn padded(payload: &[u8]) -> Vec<u8> {
 // [1025, 1500) is shifted PLAIN. The last logical block crosses both extents.
 fn image(algorithm: u8, payload: &[u8]) -> Vec<u8> {
     let mut data = vec![0; 5120];
-    data[1024..1028].copy_from_slice(&MAGIC_NUMBER.to_le_bytes());
+    (&mut data[1024..]).put_u32_le(MAGIC_NUMBER);
     data[1036] = 9;
-    data[1064..1068].copy_from_slice(&4u32.to_le_bytes());
+    (&mut data[1064..]).put_u32_le(4);
     data[1104] = 3; // Compression configuration and leading zero padding.
-    data[1108..1110].copy_from_slice(&(1u16 << algorithm).to_le_bytes());
+    (&mut data[1108..]).put_u16_le(1 << algorithm);
     data[1152] = if algorithm < 2 { 14 } else { 6 };
     match algorithm {
-        1 => data[1154..1158].copy_from_slice(&32768u32.to_le_bytes()),
+        1 => (&mut data[1154..]).put_u32_le(32768),
         2 => data[1154] = 15,
         3 => data[1155] = 10,
         _ => {}
     }
     data[2080] = 2; // CompressedFull, compact inode, nid 1.
-    data[2084..2086].copy_from_slice(&0o100644u16.to_le_bytes());
-    data[2088..2092].copy_from_slice(&1500u32.to_le_bytes());
+    (&mut data[2084..]).put_u16_le(0o100644);
+    (&mut data[2088..]).put_u32_le(1500);
     data[2118] = algorithm;
     for (at, kind, within, block) in [(2128, 1u16, 0u16, 8u32), (2136, 2, 0, 1), (2144, 0, 1, 9)] {
-        data[at..at + 2].copy_from_slice(&kind.to_le_bytes());
-        data[at + 2..at + 4].copy_from_slice(&within.to_le_bytes());
-        data[at + 4..at + 8].copy_from_slice(&block.to_le_bytes());
+        let mut fields = &mut data[at..];
+        fields.put_u16_le(kind);
+        fields.put_u16_le(within);
+        fields.put_u32_le(block);
     }
     data[4096..4608].copy_from_slice(&padded(payload));
     data[4608..5083].fill(b'C');
@@ -103,6 +105,7 @@ fn plan(data: &[u8], offset: u64) -> Result<BlockPlan> {
     let (core, inode) = metadata(data);
     let mut plan = core.plan_inode_read(&inode, offset)?;
     while let BlockPlan::CompressionMetadata {
+        source: ReadSource::Device(0),
         offset,
         size,
         reader,
@@ -122,7 +125,7 @@ fn plain_holes_and_fragments_do_not_require_codecs() {
     for compact in [false, true] {
         let mut data = image(0, &[]);
         data[2080] = if compact { 6 } else { 2 };
-        data[2088..2092].copy_from_slice(&512u32.to_le_bytes());
+        (&mut data[2088..]).put_u32_le(512);
         data[2120..2152].fill(0);
         data[if compact { 2124 } else { 2132 }] = if compact { 7 } else { 8 };
         data[4096..4608].copy_from_slice(&wanted);
@@ -133,34 +136,34 @@ fn plain_holes_and_fragments_do_not_require_codecs() {
     for bits in 0..4 {
         let mut data = image(0, &[]);
         let record_size = 4usize << bits;
-        data[2088..2092].copy_from_slice(&512u32.to_le_bytes());
+        (&mut data[2088..]).put_u32_le(512);
         data[2112..2240].fill(0);
         data[2112] = 1;
         data[2116] = 1 | (bits << 1);
         let mut at = 2120usize.next_multiple_of(record_size);
         if bits == 0 {
-            data[at..at + 8].copy_from_slice(&4096u64.to_le_bytes());
+            (&mut data[at..]).put_u64_le(4096);
             at += 8;
         } else {
-            data[at + 4..at + 8].copy_from_slice(&4096u32.to_le_bytes());
+            (&mut data[at + 4..]).put_u32_le(4096);
         }
         check_image(&data, &[0; 512]);
-        data[at..at + 4].copy_from_slice(&512u32.to_le_bytes());
+        (&mut data[at..]).put_u32_le(512);
         data[4096..4608].copy_from_slice(&wanted);
         check_image(&data, &wanted);
     }
     let mut data = image(0, &[]);
     data[1104] |= 0x20;
-    data[1120..1128].copy_from_slice(&16u64.to_le_bytes());
-    data[2088..2092].copy_from_slice(&17u32.to_le_bytes());
-    data[2112..2120].copy_from_slice(&((1u64 << 63) | 7).to_le_bytes());
-    data[2564..2566].copy_from_slice(&0o100644u16.to_le_bytes());
-    data[2568..2572].copy_from_slice(&512u32.to_le_bytes());
+    (&mut data[1120..]).put_u64_le(16);
+    (&mut data[2088..]).put_u32_le(17);
+    (&mut data[2112..]).put_u64_le((1 << 63) | 7);
+    (&mut data[2564..]).put_u16_le(0o100644);
+    (&mut data[2568..]).put_u32_le(512);
     data[2576] = 8; // Flat packed inode.
     data[4096..4608].copy_from_slice(&wanted);
     check_image(&data, &wanted[7..24]);
     for size in [6u32, 23] {
-        data[2568..2572].copy_from_slice(&size.to_le_bytes());
+        (&mut data[2568..]).put_u32_le(size);
         let source = Source {
             data: SliceImage::new(&data),
             reads: AtomicUsize::new(0),
@@ -194,8 +197,8 @@ fn external_compressed_data_and_primary_inline_tails() {
             data[1348] = if inline { 4 } else { 8 };
             let wanted = if inline {
                 data[1104] |= 0x10;
-                data[2088..2092].copy_from_slice(&1025u32.to_le_bytes());
-                data[2114..2116].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+                (&mut data[2088..]).put_u32_le(1025);
+                (&mut data[2114..]).put_u16_le(payload.len() as u16);
                 data[2116] = 8;
                 data[2144..2152].copy_from_slice(&[2, 0, 0, 0, 2, 0, 0, 0]);
                 data[2152..2152 + payload.len()].copy_from_slice(payload);
@@ -253,11 +256,11 @@ fn external_compressed_data_and_primary_inline_tails() {
     data[1112] = 10;
     data[1344] = 1;
     data[1348] = 8;
-    data[1120..1128].copy_from_slice(&16u64.to_le_bytes());
-    data[2088..2092].copy_from_slice(&17u32.to_le_bytes());
-    data[2112..2120].copy_from_slice(&((1u64 << 63) | 7).to_le_bytes());
-    data[2564..2566].copy_from_slice(&0o100644u16.to_le_bytes());
-    data[2568..2572].copy_from_slice(&512u32.to_le_bytes());
+    (&mut data[1120..]).put_u64_le(16);
+    (&mut data[2088..]).put_u32_le(17);
+    (&mut data[2112..]).put_u64_le((1 << 63) | 7);
+    (&mut data[2564..]).put_u16_le(0o100644);
+    (&mut data[2568..]).put_u32_le(512);
     data[2576] = 8;
     let blob: Vec<u8> = (0..512).map(|n| n as u8).collect();
     let sources = [&data, &blob].map(|data| Source {
@@ -391,6 +394,7 @@ fn block_count_markers_are_not_lookback_distances() {
 
 fn feed(plan: BlockPlan, core: &EroFSCore, at: u64, data: &[u8]) -> Result<BlockPlan> {
     let BlockPlan::CompressionMetadata {
+        source: ReadSource::Device(0),
         offset,
         size,
         reader,
@@ -409,7 +413,7 @@ fn configuration_records_follow_ext_slots_and_four_byte_alignment() {
     core.super_block.compr_algs = 15;
     let mut plan = core.plan_inode_read(&inode, 0).unwrap();
     let mut lzma = [0; 14];
-    lzma[..4].copy_from_slice(&32768u32.to_le_bytes());
+    (&mut lzma[..]).put_u32_le(32768);
     // An extended 15-byte LZ4 config forces alignment padding before LZMA.
     for (at, config) in [
         (1200, &[0; 15][..]),
@@ -421,6 +425,7 @@ fn configuration_records_follow_ext_slots_and_four_byte_alignment() {
         plan = feed(plan, &core, at + 2, config).unwrap();
     }
     let BlockPlan::CompressionMetadata {
+        source: ReadSource::Device(0),
         offset,
         size,
         reader,
@@ -446,7 +451,7 @@ fn invalid_configuration_and_unsupported_formats_are_rejected() {
     }
     for dictionary in [0u32, 4095, MAX_LZMA_DICT_SIZE + 1] {
         let mut data = image(1, &[]);
-        data[1154..1158].copy_from_slice(&dictionary.to_le_bytes());
+        (&mut data[1154..]).put_u32_le(dictionary);
         assert!(matches!(plan(&data, 0), Err(Error::CorruptedData(_))));
     }
     for (algorithm, at, value) in [(1, 1158, 1), (3, 1154, 1)] {
@@ -499,9 +504,9 @@ fn full_index_walk_checks_lookback_and_block_counts() {
     let mut data = image(algorithm, &[]);
     data[2116] = 2;
     assert!(matches!(plan(&data, 0), Err(Error::CorruptedData(_))));
-    data[2140..2142].copy_from_slice(&(CBLKCNT | 1).to_le_bytes());
+    (&mut data[2140..]).put_u16_le(CBLKCNT | 1);
     assert!(matches!(plan(&data, 0), Ok(BlockPlan::Encoded(_))));
-    data[2140..2142].copy_from_slice(&(CBLKCNT | 2).to_le_bytes());
+    (&mut data[2140..]).put_u16_le(CBLKCNT | 2);
     assert!(matches!(
         plan(&data, 0),
         Ok(BlockPlan::Encoded(EncodedExtent { size: 1024, .. }))
@@ -515,12 +520,12 @@ fn decoded_extent_limit_is_checked_before_decoding() {
         let count = length.div_ceil(512) as usize;
         let mut data = image(algorithm, &[]);
         data.resize(2128 + count * 8, 0);
-        data[2088..2092].copy_from_slice(&(length as u32).to_le_bytes());
+        (&mut data[2088..]).put_u32_le(length as u32);
         for index in 1..count {
             let at = 2128 + index * 8;
             data[at..at + 8].fill(0);
             data[at] = 2;
-            data[at + 4..at + 6].copy_from_slice(&(index.min(2047) as u16).to_le_bytes());
+            (&mut data[at + 4..]).put_u16_le(index.min(2047) as u16);
         }
         let result = plan(&data, 0);
         if length == MAX_DECODED_SIZE {
@@ -544,7 +549,7 @@ fn codec_samples_require_complete_input_and_exact_output() {
     let wanted = expected();
     for (algorithm, encoding, payload) in enabled_samples() {
         let mut extent = EncodedExtent {
-            device_id: 0,
+            source: ReadSource::Device(0),
             offset: 0,
             size: 512,
             decoded_size: 1025,
@@ -620,13 +625,13 @@ fn plain_extent_mapping_and_interlaced_crop() {
     assert!(matches!(
         plan(&data, 1030).unwrap(),
         BlockPlan::Direct {
-            device_id: 0,
+            source: ReadSource::Device(0),
             offset: 4613,
             size: 470
         }
     ));
     let extent = EncodedExtent {
-        device_id: 0,
+        source: ReadSource::Device(0),
         offset: 0,
         size: 8,
         decoded_size: 6,
@@ -639,14 +644,14 @@ fn plain_extent_mapping_and_interlaced_crop() {
     assert_eq!(extent.decode(b"abcdefgh", 2).unwrap(), b"ab");
     for (algorithm, _, payload) in enabled_samples() {
         let mut data = image(algorithm, payload);
-        data[2088..2092].copy_from_slice(&1325u32.to_le_bytes());
+        (&mut data[2088..]).put_u32_le(1325);
         data[1104] |= 0x10;
         data[2116] = 0x18; // Interlaced PLAIN inline tail, with one leading byte.
-        data[2114..2116].copy_from_slice(&301u16.to_le_bytes());
+        (&mut data[2114..]).put_u16_le(301);
         data[2152] = b'!';
         data[2153..2453].fill(b'C');
         check_image(&data, &[expected(), vec![b'C'; 300]].concat());
-        data[2114..2116].copy_from_slice(&300u16.to_le_bytes());
+        (&mut data[2114..]).put_u16_le(300);
         assert!(plan(&data, 1025).is_err());
     }
 }
@@ -661,7 +666,7 @@ fn plain_extent_mapping_and_interlaced_crop() {
 fn partial_references_stop_inside_literals_and_matches() {
     for (algorithm, encoding, payload) in enabled_samples() {
         let mut extent = EncodedExtent {
-            device_id: 0,
+            source: ReadSource::Device(0),
             offset: 0,
             size: 512,
             decoded_size: 1,
@@ -721,19 +726,20 @@ fn multiple_blocks_inline_tails_and_nondefault_clusters() {
             let mut data = image(algorithm, payload);
             data.resize(6144, 0);
             data[2080] = if compact { 6 } else { 2 };
-            data[2088..2092].copy_from_slice(&1025u32.to_le_bytes());
+            (&mut data[2088..]).put_u32_le(1025);
             data[2116] = if compact { 6 } else { 2 };
             data[2120..2152].fill(0);
             if compact {
-                data[2120..2122].copy_from_slice(&0x1000u16.to_le_bytes());
-                data[2122..2124].copy_from_slice(&(0x2000 | CBLKCNT | 2).to_le_bytes());
-                data[2124..2128].copy_from_slice(&8u32.to_le_bytes());
-                data[2128..2130].copy_from_slice(&0x2002u16.to_le_bytes());
+                let mut fields = &mut data[2120..];
+                fields.put_u16_le(0x1000);
+                fields.put_u16_le(0x2000 | CBLKCNT | 2);
+                fields.put_u32_le(8);
+                fields.put_u16_le(0x2002);
             } else {
                 data[2128] = 1;
                 data[2132] = 8;
                 data[2136] = 2;
-                data[2140..2142].copy_from_slice(&(CBLKCNT | 2).to_le_bytes());
+                (&mut data[2140..]).put_u16_le(CBLKCNT | 2);
                 data[2144] = 2;
                 data[2148] = 2;
             }
@@ -743,13 +749,13 @@ fn multiple_blocks_inline_tails_and_nondefault_clusters() {
 
             data[1104] |= 0x10;
             data[2116] |= 8;
-            data[2114..2116].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+            (&mut data[2114..]).put_u16_le(payload.len() as u16);
             let at = if compact { 2136 } else { 2152 };
             data[at..at + payload.len()].copy_from_slice(payload);
             check_image(&data, &expected());
         }
         let mut data = image(algorithm, payload);
-        data[2088..2092].copy_from_slice(&1025u32.to_le_bytes());
+        (&mut data[2088..]).put_u32_le(1025);
         data[2119] = 2; // 2 KiB logical cluster in a 512-byte filesystem.
         data.resize(8192, 0);
         data[4096..6144].fill(0);
@@ -770,7 +776,7 @@ fn extent_record_sizes_holes_and_partial_references() {
         for bits in 0..4 {
             let mut data = image(algorithm, payload);
             let record_size = 4usize << bits;
-            data[2088..2092].copy_from_slice(&1536u32.to_le_bytes());
+            (&mut data[2088..]).put_u32_le(1536);
             data[2112..2240].fill(0);
             data[2116] = 1 | (bits << 1);
             if bits >= 2 {
@@ -778,7 +784,7 @@ fn extent_record_sizes_holes_and_partial_references() {
             }
             let mut at = 2120usize.next_multiple_of(record_size);
             if bits == 0 {
-                data[at..at + 8].copy_from_slice(&4096u64.to_le_bytes());
+                (&mut data[at..]).put_u64_le(4096);
                 at += 8;
             }
             // Two references to prefixes of the same payload, followed by a hole.
@@ -790,12 +796,12 @@ fn extent_record_sizes_holes_and_partial_references() {
                 } else {
                     512 | (1 << 27) | ((u32::from(algorithm) + 1) << 28)
                 };
-                data[pos..pos + 4].copy_from_slice(&plen.to_le_bytes());
+                (&mut data[pos..]).put_u32_le(plen);
                 if bits >= 1 {
-                    data[pos + 4..pos + 8].copy_from_slice(&4096u32.to_le_bytes());
+                    (&mut data[pos + 4..]).put_u32_le(4096);
                 }
                 if bits >= 2 {
-                    data[pos + 12..pos + 16].copy_from_slice(&(index as u32 * 512).to_le_bytes());
+                    (&mut data[pos + 12..]).put_u32_le(index as u32 * 512);
                 }
             }
             data[4608..5120].copy_from_slice(&padded(payload));
@@ -811,7 +817,7 @@ fn legacy_lz4_uses_trailing_padding() {
     let mut input = vec![0; 512];
     input[..payload.len()].copy_from_slice(payload);
     let extent = EncodedExtent {
-        device_id: 0,
+        source: ReadSource::Device(0),
         offset: 0,
         size: 512,
         decoded_size: 1025,
@@ -838,7 +844,7 @@ fn advanced_metadata_limits_and_invalid_ranges() {
     assert!(plan(&data, 0).is_err());
     data[2118] = algorithm;
     data[2116] = 8;
-    data[2114..2116].copy_from_slice(&500u16.to_le_bytes());
+    (&mut data[2114..]).put_u16_le(500);
     assert!(plan(&data, 1025).is_err()); // Missing superblock feature.
     data[1104] |= 0x10;
     assert!(plan(&data, 1025).is_err()); // Crosses the metadata block boundary.
@@ -849,11 +855,10 @@ fn advanced_metadata_limits_and_invalid_ranges() {
     data[2112] = 1;
     data[2116] = 5; // One 16-byte extent record.
     for plen in [0x20_0000, MAX_ENCODED_SIZE as u32 + 1] {
-        data[2128..2132]
-            .copy_from_slice(&(plen | ((u32::from(algorithm) + 1) << 28)).to_le_bytes());
+        (&mut data[2128..]).put_u32_le(plen | ((u32::from(algorithm) + 1) << 28));
         assert!(plan(&data, 0).is_err());
     }
-    data[2128..2132].copy_from_slice(&(512 | ((u32::from(algorithm) + 1) << 28)).to_le_bytes());
+    (&mut data[2128..]).put_u32_le(512 | ((u32::from(algorithm) + 1) << 28));
     data[2132..2140].fill(255);
     assert!(matches!(plan(&data, 0), Err(Error::Overflow(_))));
     data[2112] = 0;
@@ -866,13 +871,14 @@ fn wide_extent_addresses_and_large_holes() {
         let mut data = image(algorithm, payload);
         data[2080..2272].fill(0);
         data[2080] = 3; // Extended inode, Full indexes.
-        data[2084..2086].copy_from_slice(&0o100644u16.to_le_bytes());
-        data[2088..2096].copy_from_slice(&((1u64 << 32) + 1025).to_le_bytes());
+        (&mut data[2084..]).put_u16_le(0o100644);
+        (&mut data[2088..]).put_u64_le((1 << 32) + 1025);
         data[2144] = 2; // Two 32-byte records; the first is a 4 GiB hole.
         data[2148] = 7;
-        data[2208..2212].copy_from_slice(&(512 | ((u32::from(algorithm) + 1) << 28)).to_le_bytes());
-        data[2212..2220].copy_from_slice(&((1u64 << 40) + 4096).to_le_bytes());
-        data[2220..2228].copy_from_slice(&(1u64 << 32).to_le_bytes());
+        let mut fields = &mut data[2208..];
+        fields.put_u32_le(512 | ((u32::from(algorithm) + 1) << 28));
+        fields.put_u64_le((1 << 40) + 4096);
+        fields.put_u64_le(1 << 32);
         assert!(matches!(
             plan(&data, 0).unwrap(),
             BlockPlan::Hole { size: 512 }
@@ -917,39 +923,39 @@ fn packed_fragments_are_bounded_and_cannot_recurse() {
         let mut data = image(algorithm, payload);
         data.resize(6144, 0);
         data[1104] |= 0x20;
-        data[1120..1128].copy_from_slice(&16u64.to_le_bytes());
+        (&mut data[1120..]).put_u64_le(16);
         // The packed inode is itself compressed. Reference an interior range.
         let packed = data[2080..2152].to_vec();
         data[2560..2632].copy_from_slice(&packed);
-        data[2088..2092].copy_from_slice(&325u32.to_le_bytes());
-        data[2112..2120].copy_from_slice(&((1u64 << 63) | 700).to_le_bytes());
+        (&mut data[2088..]).put_u32_le(325);
+        (&mut data[2112..]).put_u64_le((1 << 63) | 700);
         check_image(&data, &vec![b'B'; 325]);
         let mut short_extents = data.clone();
-        short_extents[2088..2092].copy_from_slice(&837u32.to_le_bytes());
+        (&mut short_extents[2088..]).put_u32_le(837);
         short_extents[2112..2144].fill(0);
         short_extents[2116] = 0x21; // Four-byte extents: a hole, then a fragment.
-        short_extents[2120..2128].copy_from_slice(&u64::MAX.to_le_bytes());
-        short_extents[2132..2136].copy_from_slice(&700u32.to_le_bytes());
+        (&mut short_extents[2120..]).put_u64_le(u64::MAX);
+        (&mut short_extents[2132..]).put_u32_le(700);
         check_image(&short_extents, &[vec![0; 512], vec![b'B'; 325]].concat());
 
         // A Full-index fragment can use HEAD2 and a zero block-count marker
         // even without BIG_PCLUSTER_2 (native mkfs uses this for non-LZ4).
-        data[2088..2092].copy_from_slice(&1025u32.to_le_bytes());
+        (&mut data[2088..]).put_u32_le(1025);
         data[2112..2120].fill(0);
         data[2116] = 0x22;
         data[2128] = 3;
         data[2132..2136].fill(0);
-        data[2140..2142].copy_from_slice(&CBLKCNT.to_le_bytes());
+        (&mut data[2140..]).put_u16_le(CBLKCNT);
         data[2144] = 2;
         data[2146] = 0;
-        data[2148..2152].copy_from_slice(&2u32.to_le_bytes());
+        (&mut data[2148..]).put_u32_le(2);
         check_image(&data, &expected());
-        data[2088..2092].copy_from_slice(&325u32.to_le_bytes());
-        data[2112..2120].copy_from_slice(&((1u64 << 63) | 1499).to_le_bytes());
+        (&mut data[2088..]).put_u32_le(325);
+        (&mut data[2112..]).put_u64_le((1 << 63) | 1499);
         let fs = crate::sync::EroFS::new(SliceImage::new(&data)).unwrap();
         assert!(fs.get_inode_data(&fs.get_inode(1).unwrap(), 0).is_err());
-        data[2112..2120].copy_from_slice(&(1u64 << 63).to_le_bytes());
-        data[2592..2600].copy_from_slice(&(1u64 << 63).to_le_bytes());
+        (&mut data[2112..]).put_u64_le(1 << 63);
+        (&mut data[2592..]).put_u64_le(1 << 63);
         let fs = crate::sync::EroFS::new(SliceImage::new(&data)).unwrap();
         assert!(fs.get_inode_data(&fs.get_inode(1).unwrap(), 0).is_err());
     }
@@ -969,10 +975,10 @@ fn sync_async_block_assembly_cache_and_retry_contracts() {
             let mut data = image(algorithm, payload);
             if fragment {
                 data[1104] |= 0x20;
-                data[1120..1128].copy_from_slice(&16u64.to_le_bytes());
+                (&mut data[1120..]).put_u64_le(16);
                 let packed = data[2080..2152].to_vec();
                 data[2560..2632].copy_from_slice(&packed);
-                data[2112..2120].copy_from_slice(&(1u64 << 63).to_le_bytes());
+                (&mut data[2112..]).put_u64_le(1 << 63);
             }
             let source = Source {
                 data: SliceImage::new(&data),

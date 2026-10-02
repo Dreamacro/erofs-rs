@@ -18,6 +18,44 @@ fn seed_corpus_replays_and_reaches_file_data() {
             let data = fs::read(&path).unwrap();
             eprintln!("replaying {}", path.display());
             run(&data);
+            if name != "read_contract"
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("metabox-")
+            {
+                let states = [State::default(), State::default()];
+                let (fs, _) = systems(&data, &[], &states).unwrap();
+                let enabled = match path.file_name().unwrap().to_str().unwrap() {
+                    "metabox-lz4" => cfg!(feature = "lz4"),
+                    "metabox-lzma" => cfg!(feature = "lzma"),
+                    "metabox-deflate" => cfg!(feature = "deflate"),
+                    "metabox-zstd" => cfg!(feature = "zstd"),
+                    _ => unreachable!(),
+                };
+                let inode = fs.get_inode(number(&data, 16));
+                if !enabled {
+                    assert!(matches!(inode, Err(erofs_rs::Error::NotSupported(_))));
+                    continue;
+                }
+                let inode = inode.unwrap();
+                assert_ne!(inode.id() & (1 << 63), 0);
+                let attrs = fs.xattrs_inode(inode).unwrap();
+                assert_eq!(attrs.len(), 2);
+                assert_eq!(attrs[b"user.key".as_slice()], b"one");
+                assert_eq!(attrs[b"user.long.key".as_slice()], b"two");
+                let mut file = fs.open_inode_file(inode).unwrap();
+                let expected = [vec![b'A'; 700], vec![b'B'; 325], vec![b'C'; 475]].concat();
+                let mut position = 0;
+                let mut buf = [0; 257];
+                while position < expected.len() {
+                    let n = file.read(&mut buf).unwrap();
+                    check_read(n, &buf, &mut position, &expected);
+                }
+                continue;
+            }
             if name == "filesystem" {
                 let states = [State::default(), State::default()];
                 let (fs, _) = systems(&data, &[], &states).unwrap();

@@ -1,4 +1,4 @@
-//! Shared extended-attribute parsing; image and packed-inode I/O stays in the executors.
+//! Shared extended-attribute parsing; source I/O stays in the executors.
 
 use alloc::{
     collections::{BTreeMap, btree_map::Entry},
@@ -6,10 +6,12 @@ use alloc::{
     vec::Vec,
 };
 use binrw::{BinRead, io::Cursor};
+use bytes::{Buf, BufMut};
 
 use crate::{
     Error, Result,
     filesystem::EroFSCore,
+    metadata::ReadSource,
     types::{Inode, XattrEntry, XattrHeader},
 };
 
@@ -27,28 +29,19 @@ pub type Xattrs = BTreeMap<Vec<u8>, Vec<u8>>;
 pub struct Request {
     pub offset: u64,
     pub size: usize,
-    pub packed: bool,
+    pub source: ReadSource,
 }
 
 impl Request {
-    fn new(offset: u64, size: usize, packed: bool) -> Result<Self> {
+    fn new(offset: u64, size: usize, source: ReadSource) -> Result<Self> {
         offset
             .checked_add(size as u64)
             .ok_or(Error::Overflow("xattr read range"))?;
         Ok(Self {
             offset,
             size,
-            packed,
+            source,
         })
-    }
-
-    pub fn validate_inode(self, inode: &Inode) -> Result<()> {
-        if !inode.is_file() || self.offset + self.size as u64 > inode.data_size() {
-            return Err(Error::CorruptedData(
-                "xattr prefix outside packed inode".into(),
-            ));
-        }
-        Ok(())
     }
 
     pub fn in_buffer(self, offset: u64, data: &[u8]) -> Option<&[u8]> {
@@ -67,7 +60,6 @@ enum Stage {
 }
 
 pub struct XattrRead {
-    pub packed_nid: Option<u64>,
     request: Option<Request>,
     stage: Stage,
     body: Request,
@@ -75,7 +67,7 @@ pub struct XattrRead {
     prefixes: Vec<Vec<u8>>,
     shared: vec::IntoIter<u32>,
     shared_base: u64,
-    shared_in_metabox: bool,
+    shared_source: Option<ReadSource>,
     attrs: Xattrs,
 }
 
@@ -89,10 +81,9 @@ impl XattrRead {
                 .checked_add(inode.inode_size as u64)
                 .ok_or(Error::Overflow("inode xattr offset"))?
         };
-        let body = Request::new(offset, size, false)?;
+        let body = Request::new(offset, size, core.metadata_source(inode.id())?)?;
         let sb = &core.super_block;
         let mut reader = Self {
-            packed_nid: None,
             request: (size != 0).then_some(body),
             stage: Stage::Body,
             body,
@@ -100,7 +91,11 @@ impl XattrRead {
             prefixes: Vec::new(),
             shared: Vec::new().into_iter(),
             shared_base: core.block_offset(sb.xattr_blk_addr),
-            shared_in_metabox: sb.feature_compat & 8 != 0,
+            shared_source: if sb.feature_compat & 8 != 0 {
+                core.metabox_nid.map(ReadSource::Inode)
+            } else {
+                Some(ReadSource::Device(0))
+            },
             attrs: Xattrs::new(),
         };
         if size == 0 {
@@ -115,13 +110,19 @@ impl XattrRead {
                     "invalid xattr prefix count or feature".into(),
                 ));
             }
-            reader.packed_nid =
-                (sb.feature_compat & 0x10 == 0 && sb.packed_nid != 0).then_some(sb.packed_nid);
+            let source = if sb.feature_compat & 0x10 != 0 {
+                ReadSource::Device(0)
+            } else {
+                core.metabox_nid
+                    .filter(|&nid| nid != 0)
+                    .or_else(|| (sb.packed_nid != 0).then_some(sb.packed_nid))
+                    .map_or(ReadSource::Device(0), ReadSource::Inode)
+            };
             reader.stage = Stage::PrefixLength;
             reader.request = Some(Request::new(
                 u64::from(sb.xattr_prefix_start) * 4,
                 2,
-                reader.packed_nid.is_some(),
+                source,
             )?);
         }
         Ok(reader)
@@ -144,12 +145,12 @@ impl XattrRead {
         }
         match self.stage {
             Stage::PrefixLength => {
-                let length = usize::from(u16::from_le_bytes([data[0], data[1]]));
+                let length = usize::from((&data[..2]).get_u16_le());
                 if !(1..=256).contains(&length) {
                     return Err(Error::CorruptedData("invalid xattr prefix length".into()));
                 }
                 self.stage = Stage::Prefix;
-                self.request = Some(Request::new(request.offset + 2, length, request.packed)?);
+                self.request = Some(Request::new(request.offset + 2, length, request.source)?);
             }
             Stage::Prefix => {
                 // Validate the short namespace now; zero denotes hidden metadata.
@@ -172,7 +173,7 @@ impl XattrRead {
                         .ok_or(Error::Overflow("xattr prefix offset"))?
                         & !3;
                     self.stage = Stage::PrefixLength;
-                    self.request = Some(Request::new(offset, 2, request.packed)?);
+                    self.request = Some(Request::new(offset, 2, request.source)?);
                 }
             }
             Stage::Body => {
@@ -186,8 +187,8 @@ impl XattrRead {
                 let shared = data.get(start..end).ok_or_else(|| {
                     Error::CorruptedData("xattr shared IDs exceed inode body".into())
                 })?;
-                if header.shared_count != 0 && self.shared_in_metabox {
-                    return Err(Error::NotSupported("shared xattrs in metabox".into()));
+                if header.shared_count != 0 && self.shared_source.is_none() {
+                    return Err(Error::CorruptedData("shared xattrs without metabox".into()));
                 }
                 self.shared = shared
                     .as_chunks::<4>()
@@ -208,7 +209,7 @@ impl XattrRead {
                         entry,
                         &record[size_of::<XattrEntry>()..size_of::<XattrEntry>() + length],
                     )?;
-                    entries = &entries[size..];
+                    entries.advance(size);
                 }
                 self.next_shared()?;
             }
@@ -220,7 +221,7 @@ impl XattrRead {
                     self.next_shared()?;
                 } else {
                     self.stage = Stage::SharedValue(entry);
-                    self.request = Some(Request::new(request.offset + 4, size, false)?);
+                    self.request = Some(Request::new(request.offset + 4, size, request.source)?);
                 }
             }
             Stage::SharedValue(entry) => {
@@ -241,7 +242,10 @@ impl XattrRead {
                     .shared_base
                     .checked_add(u64::from(id) * 4)
                     .ok_or(Error::Overflow("shared xattr offset"))?;
-                Request::new(offset, size_of::<XattrEntry>(), false)
+                let source = self
+                    .shared_source
+                    .ok_or_else(|| Error::CorruptedData("shared xattrs without metabox".into()))?;
+                Request::new(offset, size_of::<XattrEntry>(), source)
             })
             .transpose()?;
         Ok(())
@@ -282,7 +286,7 @@ impl XattrRead {
                 bytes
                     .try_reserve_exact(value.len())
                     .map_err(|_| Error::OutOfBounds("cannot allocate xattr value".into()))?;
-                bytes.extend_from_slice(value);
+                bytes.put_slice(value);
                 entry.insert(bytes);
                 Ok(())
             }
