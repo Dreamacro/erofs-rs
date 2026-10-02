@@ -99,6 +99,7 @@ fn indexed_devices_preserve_bytes_borrows_holes_and_retries() {
         .concat();
         let mut file = fs.open("/a").unwrap();
         let mut afile = ready(afs.open("/a")).unwrap();
+        crate::tests::check_read_at(&file, &afile, &expected);
         let mut offset = 0;
         let mut buf = [0; 700];
         while offset < expected.len() {

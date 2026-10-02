@@ -64,6 +64,24 @@ impl<'a, I: Image> File<'a, I> {
     pub fn size(&self) -> u64 {
         self.inode.data_size()
     }
+
+    /// Reads at a logical file offset without changing the sequential position or cache.
+    ///
+    /// Returns `0` at or beyond EOF, or for an empty buffer, without performing I/O.
+    /// Short reads are allowed. Errors leave `buf` unchanged. Positioned reads do not
+    /// populate the sequential cache, so repeated reads may decode an extent again.
+    pub fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if buf.is_empty() || offset >= self.size() {
+            return Ok(0);
+        }
+        let data = self.erofs.get_inode_data(&self.inode, offset);
+        #[cfg(feature = "std")]
+        let data = data.map_err(std::io::Error::other);
+        let data = data?;
+        let n = buf.len().min(data.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok(n)
+    }
 }
 
 impl<'a, I: Image> Read for File<'a, I> {

@@ -31,6 +31,22 @@ impl<'a, I: AsyncImage> File<'a, I> {
         self.inode.data_size()
     }
 
+    /// Reads at a logical file offset without changing the sequential position or cache.
+    ///
+    /// Returns `0` at or beyond EOF, or for an empty buffer, without performing I/O.
+    /// Short reads are allowed. Errors or cancellation leave `buf` unchanged.
+    /// Positioned reads do not populate the sequential cache, so repeated reads
+    /// may decode an extent again.
+    pub async fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if buf.is_empty() || offset >= self.size() {
+            return Ok(0);
+        }
+        let data = self.erofs.read_inode_data(&self.inode, offset).await?;
+        let n = buf.len().min(data.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok(n)
+    }
+
     /// Asynchronously reads file contents into `buf`.
     ///
     /// Returns the number of bytes read, or `0` at EOF or for an empty buffer.

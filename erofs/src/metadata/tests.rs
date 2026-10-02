@@ -177,6 +177,9 @@ fn check(data: &[u8], extras: &[&[u8]], prefix: &[u8]) {
             assert!(ready(afile.read(&mut [0; 1])).is_err());
             continue;
         }
+        crate::tests::check_read_at(&file, &afile, &expected);
+        send(afile.read_at(&mut [0; 1], 0));
+        send(afs.read_link_inode(aentry.inode));
         let mut left = Vec::new();
         let mut right = Vec::new();
         let mut buf = [0; 113];
@@ -237,6 +240,24 @@ fn metadata_sources_cover_layouts_xattrs_and_devices() {
         (&mut data[1060..]).put_u32_le(8);
         let blob = data.split_off(4096);
         check(&data, &[&blob], b"user.meta.key");
+
+        let mut meta = metadata();
+        (&mut meta[260..]).put_u16_le(0o120777);
+        let data = image(&meta, compressed);
+        let source = Source {
+            data: SliceImage::new(&data),
+            reads: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        };
+        let fs = crate::EroFS::new(&source).unwrap();
+        let afs = ready(crate::r#async::EroFS::new(&source)).unwrap();
+        let inode = fs.get_inode(NID_METABOX | 8).unwrap();
+        let ainode = ready(afs.get_inode(NID_METABOX | 8)).unwrap();
+        assert_eq!(fs.read_link_inode(inode).unwrap().as_bytes(), &[b'a'; 17]);
+        assert_eq!(
+            ready(afs.read_link_inode(ainode)).unwrap().as_bytes(),
+            &[b'a'; 17]
+        );
     }
 }
 

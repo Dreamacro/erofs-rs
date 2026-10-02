@@ -294,3 +294,186 @@ fn plain_files_preserve_paths_cache_and_read_positions() {
     assert_eq!(ready(afile.read(&mut buf)).unwrap(), 0);
     assert_eq!(source.reads.load(Relaxed), reads);
 }
+
+pub fn check_read_at<I: Image, A: AsyncImage>(
+    file: &crate::sync::file::File<'_, I>,
+    afile: &crate::r#async::file::File<'_, A>,
+    expected: &[u8],
+) {
+    let size = expected.len() as u64;
+    for offset in [
+        size,
+        size.saturating_sub(1),
+        511,
+        0,
+        size / 2,
+        513,
+        u64::MAX,
+    ] {
+        for asynchronous in [false, true] {
+            let mut buf = [0xa5; 113];
+            let n = if asynchronous {
+                ready(afile.read_at(&mut buf, offset)).unwrap()
+            } else {
+                file.read_at(&mut buf, offset).unwrap()
+            };
+            let at = offset.min(size) as usize;
+            assert!(n <= buf.len().min(expected.len() - at));
+            assert_eq!(n == 0, offset >= size);
+            assert_eq!(&buf[..n], &expected[at..at + n]);
+            assert!(buf[n..].iter().all(|&byte| byte == 0xa5));
+        }
+    }
+}
+
+#[test]
+fn positioned_reads_preserve_sequential_cache_and_retry_state() {
+    let mut data = image();
+    let expected: Vec<u8> = (0..700).map(|n| (n % 251) as u8).collect();
+    data[5120..5820].copy_from_slice(&expected);
+    let source = Source {
+        data: SliceImage::new(&data),
+        reads: AtomicUsize::new(0),
+        fail: AtomicBool::new(false),
+    };
+    let fs = crate::EroFS::new(&source).unwrap();
+    let afs = ready(crate::r#async::EroFS::new(&source)).unwrap();
+    let mut file = fs.open("/a").unwrap();
+    let mut afile = ready(afs.open("/a")).unwrap();
+    let mut buf = [0; 7];
+    assert_eq!(file.read(&mut buf).unwrap(), 7);
+    assert_eq!(buf, expected[..7]);
+    assert_eq!(ready(afile.read(&mut buf)).unwrap(), 7);
+    assert_eq!(buf, expected[..7]);
+    check_read_at(&file, &afile, &expected);
+
+    source.fail.store(true, Relaxed);
+    let reads = source.reads.load(Relaxed);
+    for offset in [0, 700, 1 << 40, u64::MAX] {
+        assert_eq!(file.read_at(&mut [], offset).unwrap(), 0);
+        assert_eq!(ready(afile.read_at(&mut [], offset)).unwrap(), 0);
+        if offset >= 700 {
+            assert_eq!(file.read_at(&mut buf, offset).unwrap(), 0);
+            assert_eq!(ready(afile.read_at(&mut buf, offset)).unwrap(), 0);
+        }
+    }
+    assert_eq!(source.reads.load(Relaxed), reads);
+    buf.fill(0xa5);
+    assert!(file.read_at(&mut buf, 513).is_err());
+    assert_eq!(buf, [0xa5; 7]);
+    assert!(ready(afile.read_at(&mut buf, 513)).is_err());
+    assert_eq!(buf, [0xa5; 7]);
+    let reads = source.reads.load(Relaxed);
+    assert_eq!(file.read(&mut buf).unwrap(), 7);
+    assert_eq!(buf, expected[7..14]);
+    assert_eq!(ready(afile.read(&mut buf)).unwrap(), 7);
+    assert_eq!(buf, expected[7..14]);
+    assert_eq!(source.reads.load(Relaxed), reads);
+    source.fail.store(false, Relaxed);
+    assert_eq!(file.read_at(&mut buf, 513).unwrap(), 7);
+    assert_eq!(buf, expected[513..520]);
+    assert_eq!(ready(afile.read_at(&mut buf, 513)).unwrap(), 7);
+    assert_eq!(buf, expected[513..520]);
+    assert_eq!(file.read(&mut buf).unwrap(), 7);
+    assert_eq!(buf, expected[14..21]);
+    assert_eq!(ready(afile.read(&mut buf)).unwrap(), 7);
+    assert_eq!(buf, expected[14..21]);
+}
+
+#[test]
+fn positioned_reads_keep_u64_offsets() {
+    let mut data = image();
+    data[2112..2176].fill(0);
+    data[2112] = 1; // Extended flat inode, entirely sparse.
+    (&mut data[2116..]).put_u16_le(0o100644);
+    (&mut data[2120..]).put_u64_le(u64::MAX);
+    (&mut data[2128..]).put_u32_le(u32::MAX);
+    let source = Source {
+        data: SliceImage::new(&data),
+        reads: AtomicUsize::new(0),
+        fail: AtomicBool::new(false),
+    };
+    let fs = crate::EroFS::new(&source).unwrap();
+    let afs = ready(crate::r#async::EroFS::new(&source)).unwrap();
+    let file = fs.open_inode_file(fs.get_inode(2).unwrap()).unwrap();
+    let afile = afs
+        .open_inode_file(ready(afs.get_inode(2)).unwrap())
+        .unwrap();
+    source.fail.store(true, Relaxed);
+    let reads = source.reads.load(Relaxed);
+    for (offset, count) in [
+        (1 << 32, 7),
+        ((1 << 48) + 17, 7),
+        (u64::MAX - 1, 1),
+        (u64::MAX, 0),
+    ] {
+        for asynchronous in [false, true] {
+            let mut buf = [0xa5; 7];
+            let n = if asynchronous {
+                ready(afile.read_at(&mut buf, offset)).unwrap()
+            } else {
+                file.read_at(&mut buf, offset).unwrap()
+            };
+            assert_eq!(n, count);
+            assert!(buf[..n].iter().all(|&byte| byte == 0));
+            assert!(buf[n..].iter().all(|&byte| byte == 0xa5));
+        }
+    }
+    assert_eq!(source.reads.load(Relaxed), reads);
+}
+
+#[test]
+fn symlink_reads_preserve_bytes_and_validate_targets() {
+    let mut long = vec![b'x'; 700];
+    long[..10].copy_from_slice(b"missing/\xff/");
+    let mut nul = long.clone();
+    nul[699] = 0;
+    for target in [Vec::new(), b"../missing/\xff".to_vec(), long, nul] {
+        for inline in [false, true] {
+            let mut data = image();
+            data[2112] = if inline { 4 } else { 0 };
+            (&mut data[2116..]).put_u16_le(0o120777);
+            (&mut data[2120..]).put_u32_le(target.len() as u32);
+            if inline {
+                let head = target.len().saturating_sub(1) / 512 * 512;
+                data[5120..5120 + head].copy_from_slice(&target[..head]);
+                data[2144..2144 + target.len() - head].copy_from_slice(&target[head..]);
+            } else {
+                data[5120..5120 + target.len()].copy_from_slice(&target);
+            }
+            let source = Source {
+                data: SliceImage::new(&data),
+                reads: AtomicUsize::new(0),
+                fail: AtomicBool::new(false),
+            };
+            let fs = crate::EroFS::new(&source).unwrap();
+            let afs = ready(crate::r#async::EroFS::new(&source)).unwrap();
+            let inode = fs.get_inode(2).unwrap();
+            let ainode = ready(afs.get_inode(2)).unwrap();
+            let directory = fs.get_inode(1).unwrap();
+            source.fail.store(true, Relaxed);
+            let reads = source.reads.load(Relaxed);
+            assert!(matches!(
+                fs.read_link_inode(directory),
+                Err(Error::NotASymlink(1))
+            ));
+            assert!(matches!(
+                ready(afs.read_link_inode(directory)),
+                Err(Error::NotASymlink(1))
+            ));
+            assert_eq!(source.reads.load(Relaxed), reads);
+            assert!(fs.read_link_inode(inode).is_err());
+            assert!(ready(afs.read_link_inode(ainode)).is_err());
+            source.fail.store(false, Relaxed);
+            let left = fs.read_link_inode(inode);
+            let right = ready(afs.read_link_inode(ainode));
+            if target.is_empty() || target.contains(&0) {
+                assert!(matches!(left, Err(Error::CorruptedData(_))));
+                assert!(matches!(right, Err(Error::CorruptedData(_))));
+            } else {
+                assert_eq!(left.unwrap().as_bytes(), target);
+                assert_eq!(right.unwrap().as_bytes(), target);
+            }
+        }
+    }
+}

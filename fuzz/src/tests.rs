@@ -58,7 +58,7 @@ fn seed_corpus_replays_and_reaches_file_data() {
             }
             if name == "filesystem" {
                 let states = [State::default(), State::default()];
-                let (fs, _) = systems(&data, &[], &states).unwrap();
+                let (fs, afs) = systems(&data, &[], &states).unwrap();
                 match path.file_name().unwrap().to_str().unwrap() {
                     "cycle" => {
                         let mut entries = fs.walk_dir("/").unwrap();
@@ -72,12 +72,20 @@ fn seed_corpus_replays_and_reaches_file_data() {
                         let mut file = fs.open(path).unwrap();
                         assert_eq!(file.read(&mut [0; 1]).unwrap(), 1);
                     }
-                    "symlink" => assert_eq!(
-                        fs.read_link_inode(fs.get_inode(1).unwrap())
-                            .unwrap()
-                            .as_bytes(),
-                        b"../f"
-                    ),
+                    "symlink" => {
+                        assert_eq!(
+                            fs.read_link_inode(fs.get_inode(1).unwrap())
+                                .unwrap()
+                                .as_bytes(),
+                            b"../f"
+                        );
+                        assert_eq!(
+                            ready(afs.read_link_inode(ready(afs.get_inode(1)).unwrap()))
+                                .unwrap()
+                                .as_bytes(),
+                            b"../f"
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -142,7 +150,7 @@ fn seed_corpus_replays_and_reaches_file_data() {
             }
             if name == "compression" {
                 let states = [State::default(), State::default()];
-                let (fs, _) = systems(&data, &[], &states).unwrap();
+                let (fs, afs) = systems(&data, &[], &states).unwrap();
                 let inode = fs.get_inode(1).unwrap();
                 let mut file = fs.open_inode_file(inode).unwrap();
                 let result = file.read(&mut [0; 1]);
@@ -156,6 +164,24 @@ fn seed_corpus_replays_and_reaches_file_data() {
                     assert_eq!(result.unwrap(), 1, "{}", path.display());
                 } else {
                     assert!(result.is_err());
+                }
+                if path.file_name().unwrap() == "wide-extent" {
+                    let afile = afs
+                        .open_inode_file(ready(afs.get_inode(1)).unwrap())
+                        .unwrap();
+                    let mut buf = [0; 257];
+                    let offset = (1 << 32) + 700;
+                    let result = file.read_at(&mut buf, offset);
+                    if enabled {
+                        assert_eq!(result.unwrap(), buf.len());
+                        assert_eq!(buf, [b'B'; 257]);
+                        buf.fill(0);
+                        assert_eq!(ready(afile.read_at(&mut buf, offset)).unwrap(), buf.len());
+                        assert_eq!(buf, [b'B'; 257]);
+                    } else {
+                        assert!(result.is_err());
+                        assert!(ready(afile.read_at(&mut buf, offset)).is_err());
+                    }
                 }
             }
         }

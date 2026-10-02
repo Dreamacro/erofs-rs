@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use alloc::{boxed::Box, format};
 use bytes::BufMut;
 
-use typed_path::UnixPath;
+use typed_path::{UnixPath, UnixPathBuf};
 
 use super::file::File;
 use super::walkdir::WalkDir;
@@ -119,6 +119,33 @@ impl<I: AsyncImage> EroFS<I> {
         }
 
         Ok(File::new(inode, self))
+    }
+
+    /// Reads the target of a symbolic link inode from this filesystem without following it.
+    /// The inode must originate from this filesystem. Target bytes are preserved;
+    /// empty targets and targets containing NUL are rejected.
+    pub async fn read_link_inode(&self, inode: Inode) -> Result<UnixPathBuf> {
+        if !inode.is_symlink() {
+            return Err(Error::NotASymlink(inode.id()));
+        }
+        let size = inode.data_size();
+        let mut target = Vec::new();
+        for block_index in 0..size.div_ceil(self.core.block_size) {
+            let block = self
+                .read_inode_block(&inode, block_index * self.core.block_size)
+                .await?;
+            if block.contains(&0) {
+                return Err(Error::CorruptedData("invalid symbolic link target".into()));
+            }
+            target
+                .try_reserve(block.len())
+                .map_err(|_| Error::OutOfBounds("symbolic link target is too large".into()))?;
+            target.put_slice(&block);
+        }
+        if target.is_empty() {
+            return Err(Error::CorruptedData("invalid symbolic link target".into()));
+        }
+        Ok(UnixPathBuf::from(target))
     }
 
     /// Reads all visible extended attributes without following symbolic links.

@@ -700,6 +700,11 @@ fn check_image(data: &[u8], wanted: &[u8]) {
     let inode = fs.get_inode(1).unwrap();
     let afs = ready(crate::r#async::EroFS::new(&source)).unwrap();
     let ainode = ready(afs.get_inode(1)).unwrap();
+    crate::tests::check_read_at(
+        &fs.open_inode_file(inode).unwrap(),
+        &afs.open_inode_file(ainode).unwrap(),
+        wanted,
+    );
     for offset in (0..wanted.len()).step_by(113) {
         let size = (wanted.len() - offset).min(512);
         assert_eq!(
@@ -897,6 +902,34 @@ fn wide_extent_addresses_and_large_holes() {
                 expected()[700..]
             );
         }
+    }
+}
+
+#[test]
+fn compressed_symlinks_use_the_same_mapping_in_both_executors() {
+    let wanted = [expected(), vec![b'C'; 475]].concat();
+    for (algorithm, _, payload) in enabled_samples() {
+        let mut data = image(algorithm, payload);
+        (&mut data[2084..]).put_u16_le(0o120777);
+        let source = Source {
+            data: SliceImage::new(&data),
+            reads: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        };
+        let fs = crate::EroFS::new(&source).unwrap();
+        let afs = ready(crate::r#async::EroFS::new(&source)).unwrap();
+        assert_eq!(
+            fs.read_link_inode(fs.get_inode(1).unwrap())
+                .unwrap()
+                .as_bytes(),
+            wanted
+        );
+        assert_eq!(
+            ready(afs.read_link_inode(ready(afs.get_inode(1)).unwrap()))
+                .unwrap()
+                .as_bytes(),
+            wanted
+        );
     }
 }
 

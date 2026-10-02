@@ -78,6 +78,29 @@ fn stream(fs: &Fs<'_>, afs: &AsyncFs<'_>, a: Inode, b: Inode, states: &[State; 2
     else {
         return;
     };
+    let mut left_at = [0; 257];
+    let mut right_at = [0; 257];
+    for offset in [
+        a.data_size().saturating_sub(1),
+        1 << 32,
+        (1 << 32) + 700,
+        0,
+        a.data_size() / 2,
+        a.data_size(),
+        u64::MAX,
+    ] {
+        if let Some((left, right)) = pair(
+            file.read_at(&mut left_at, offset),
+            ready(afile.read_at(&mut right_at, offset)),
+            states,
+        ) {
+            assert!(left <= left_at.len() && right <= right_at.len());
+            assert_eq!(left == 0, offset >= a.data_size());
+            assert_eq!(right == 0, offset >= b.data_size());
+            let n = left.min(right);
+            assert_eq!(&left_at[..n], &right_at[..n]);
+        }
+    }
     let mut left = Vec::new();
     let mut right = Vec::new();
     let mut buf = [0; 4096];
@@ -130,8 +153,15 @@ pub fn filesystem(data: &[u8]) {
             if let Some((a, b)) = pair(fs.xattrs_inode(a), ready(afs.xattrs_inode(b)), &states) {
                 assert_eq!(a, b);
             }
-            if a.is_symlink() && a.data_size() <= 4096 {
-                let _ = fs.read_link_inode(a);
+            if a.is_symlink()
+                && a.data_size() <= 4096
+                && let Some((left, right)) = pair(
+                    fs.read_link_inode(a),
+                    ready(afs.read_link_inode(b)),
+                    &states,
+                )
+            {
+                assert_eq!(left, right);
             }
         }
     }
@@ -405,6 +435,17 @@ pub fn read_contract(data: &[u8]) {
             break;
         };
         let size = usize::from(op.size) % 2049;
+        for state in &states {
+            state.arm(None);
+        }
+        let offset = u64::from(op.size % 1601);
+        let mut at = (offset as usize).min(expected.len());
+        let n = file.read_at(&mut buf[..size], offset).unwrap();
+        check_read(n, &buf[..size], &mut at, &expected);
+        let mut at = (offset as usize).min(expected.len());
+        let n = ready(afile.read_at(&mut buf[..size], offset)).unwrap();
+        check_read(n, &buf[..size], &mut at, &expected);
+        // Positioned reads above must not disturb the sequential positions below.
         for state in &states {
             state.arm((op.failure != 0).then_some(usize::from(op.failure) % 8));
         }

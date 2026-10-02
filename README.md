@@ -8,7 +8,7 @@ A pure Rust library for reading and building [EROFS](https://docs.kernel.org/fil
 
 - **no_std support** with `alloc` on supported targets
 - Zero-copy parsing via mmap (std) or byte slices (no_std)
-- Directory traversal and file reading
+- Directory traversal, sequential/positioned file reads, and lossless symlink targets (sync and async)
 - Inline/shared extended attributes and long name prefixes, with lossless byte names and values
 - Multiple data layouts: flat plain, flat inline, chunk-based (including indexed and 48-bit chunks)
 - Additional devices, with explicit chunk device IDs and unified-address routing for file data
