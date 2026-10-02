@@ -146,6 +146,12 @@ erofs-cli inspect -i http://example.com/images/system.erofs cat /etc/os-release
 - [ ] Metabox metadata
 - [ ] Image building (`mkfs.erofs` equivalent)
 
+## Fuzz testing
+
+The independent [`fuzz/` workspace](fuzz/README.md) covers filesystem parsing,
+compression, xattrs, devices, and sync/async read contracts with cargo-fuzz.
+It includes seed inputs, bounded in-memory backends, and replay/minimization instructions.
+
 ## License
 
 MIT OR Apache-2.0

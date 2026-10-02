@@ -1,0 +1,63 @@
+[package]
+name = "erofs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[features]
+default = ["std", "lz4", "lzma", "deflate", "zstd"]
+std = ["erofs-rs/std"]
+lz4 = ["erofs-rs/lz4"]
+lzma = ["std", "erofs-rs/lzma"]
+deflate = ["erofs-rs/deflate"]
+zstd = ["erofs-rs/zstd"]
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+erofs-rs = { path = "../erofs", default-features = false }
+
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "filesystem"
+path = "fuzz_targets/filesystem.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compression"
+path = "fuzz_targets/compression.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xattrs"
+path = "fuzz_targets/xattrs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "devices"
+path = "fuzz_targets/devices.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_contract"
+path = "fuzz_targets/read_contract.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,57 @@
+name: Fuzz
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [filesystem, compression, xattrs, devices, read_contract]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: nightly
+          components: rustfmt
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo +nightly fmt --manifest-path fuzz/Cargo.toml --all -- --check
+      - name: Replay checked-in seeds and check harness contracts
+        run: |
+          cargo +nightly test --manifest-path fuzz/Cargo.toml --lib --locked
+          cargo +nightly test --manifest-path fuzz/Cargo.toml --lib --no-default-features --locked
+      - uses: actions/cache@v6
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-${{ runner.os }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-${{ runner.os }}-${{ matrix.target }}-
+      - name: Fuzz with AddressSanitizer
+        env:
+          TARGET: ${{ matrix.target }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          seconds=30
+          if [ "$EVENT" = workflow_dispatch ]; then seconds=600; fi
+          mkdir -p "fuzz/corpus/$TARGET"
+          cargo +nightly fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- \
+            -max_total_time="$seconds" -timeout=10 -rss_limit_mb=1024 -max_len=262144 \
+            -print_final_stats=1
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+            fuzz/corpus/${{ matrix.target }}/
+          if-no-files-found: ignore
