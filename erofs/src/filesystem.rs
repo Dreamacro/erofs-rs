@@ -188,12 +188,12 @@ impl EroFSCore {
         let (mut inode, raw_data, xattr_count, high, wide) = if inode_size == InodeCompact::size() {
             let raw = InodeCompact::read(&mut cursor)?;
             let nlink_one =
-                raw.format & 0x10 != 0 && !FileType::from_raw_mode(raw.mode.into()).is_dir();
+                raw.format & 0x10 != 0 && !FileType::from_raw_mode(raw.mode as _).is_dir();
             (
                 Inode {
                     nid,
                     data_size: u64::from(raw.size),
-                    file_type: FileType::from_raw_mode(raw.mode.into()),
+                    file_type: FileType::from_raw_mode(raw.mode as _),
                     mode: raw.mode & 0o7777,
                     uid: u32::from(raw.uid),
                     gid: u32::from(raw.gid),
@@ -220,7 +220,7 @@ impl EroFSCore {
                 Inode {
                     nid,
                     data_size: raw.size,
-                    file_type: FileType::from_raw_mode(raw.mode.into()),
+                    file_type: FileType::from_raw_mode(raw.mode as _),
                     mode: raw.mode & 0o7777,
                     uid: raw.uid,
                     gid: raw.gid,

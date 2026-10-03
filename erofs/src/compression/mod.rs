@@ -1245,6 +1245,7 @@ fn decode_lz4_prefix(mut input: &[u8], output: &mut [u8]) -> Result<()> {
     fn invalid() -> Error {
         Error::CorruptedData("invalid LZ4 prefix".to_string())
     }
+
     fn length(input: &mut &[u8], initial: usize) -> Result<usize> {
         let mut length = initial;
         if initial == 15 {
@@ -1366,6 +1367,7 @@ fn decode_microlzma(input: &[u8], output: &mut [u8], dict_size: u32, partial: bo
     let mut input = Read::chain(prefix.as_slice(), &input[1..]);
     if partial {
         struct Prefix<'a>(&'a mut [u8]);
+
         impl std::io::Write for Prefix<'_> {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 let n = bytes.len().min(self.0.len());
@@ -1375,6 +1377,7 @@ fn decode_microlzma(input: &[u8], output: &mut [u8], dict_size: u32, partial: bo
                 }
                 Ok(n)
             }
+
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }

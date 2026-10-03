@@ -1,4 +1,4 @@
-//! Backend abstraction layer for EROFS image sources.
+//! Backend abstractions for reading and building EROFS images.
 //!
 //! This module provides a unified interface for accessing EROFS image data
 //! from different sources:
@@ -6,8 +6,10 @@
 //! - [`MmapImage`]: Memory-mapped files (requires `std` feature)
 //! - [`SliceImage`]: Raw byte slices (available in `no_std` mode)
 //!
-//! The [`Image`] trait defines the common interface that all backend implementations
-//! must implement.
+//! [`Image`] and [`AsyncImage`] provide positioned image access. [`AsyncRead`]
+//! provides runtime-independent streaming input; with `std`, `AsyncWrite` and
+//! `AsyncSeek` provide image output. The optional `tokio` feature adds `TokioIo`
+//! adapters without changing these traits.
 //!
 //! # Examples
 //!
@@ -40,6 +42,15 @@ use binrw::io::Cursor;
 use core::{future::Future, ops};
 
 use super::Result;
+
+mod io;
+pub use io::AsyncRead;
+#[cfg(feature = "std")]
+pub use io::{AsyncSeek, AsyncWrite};
+#[cfg(feature = "tokio")]
+mod tokio;
+#[cfg(feature = "tokio")]
+pub use tokio::TokioIo;
 
 #[cfg(feature = "std")]
 mod mmap;

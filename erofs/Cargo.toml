@@ -3,7 +3,7 @@ name = "erofs-rs"
 version = "0.3.0"
 edition = "2024"
 authors = ["Dreamacro"]
-description = "A pure Rust library for reading EROFS (Enhanced Read-Only File System) images"
+description = "A pure Rust library for reading and building EROFS (Enhanced Read-Only File System) images"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Dreamacro/erofs-rs"
 keywords = ["erofs", "filesystem", "readonly", "linux"]
@@ -25,6 +25,7 @@ std = [
   "typed-path/std",
 ]
 opendal = ["std", "dep:opendal"]
+tokio = ["std", "dep:tokio"]
 lz4 = ["dep:lz4_flex"]
 lzma = ["std", "dep:lzma-rs"]
 deflate = ["dep:miniz_oxide"]
@@ -42,4 +43,5 @@ opendal = { workspace = true, optional = true }
 rustix = { workspace = true, features = ["fs"] }
 ruzstd = { workspace = true, optional = true, features = ["hash"] }
 thiserror = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["io-util"] }
 typed-path = { workspace = true }

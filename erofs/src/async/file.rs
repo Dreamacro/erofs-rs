@@ -2,7 +2,7 @@ use bytes::{Buf, Bytes};
 
 use super::EroFS;
 use crate::Result;
-use crate::backend::AsyncImage;
+use crate::backend::{AsyncImage, AsyncRead};
 use crate::types::Inode;
 
 /// An async handle to a file within an EROFS filesystem.
@@ -14,6 +14,12 @@ pub struct File<'a, I: AsyncImage> {
     erofs: &'a EroFS<I>,
     offset: u64,
     buf: Bytes,
+}
+
+impl<I: AsyncImage> AsyncRead for File<'_, I> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        File::read(self, buf).await
+    }
 }
 
 impl<'a, I: AsyncImage> File<'a, I> {

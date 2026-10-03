@@ -473,10 +473,12 @@ fn invalid_headers_entries_prefixes_and_duplicates_are_rejected() {
 }
 
 struct Sparse<'a>(Vec<(u64, &'a [u8])>);
+
 impl Image for &Sparse<'_> {
     fn len(&self) -> u64 {
         u64::MAX
     }
+
     fn get<R: RangeBounds<u64>>(&self, range: R) -> Option<&[u8]> {
         let (Bound::Included(&start), Bound::Excluded(&end)) =
             (range.start_bound(), range.end_bound())
@@ -490,6 +492,7 @@ impl Image for &Sparse<'_> {
         })
     }
 }
+
 impl AsyncImage for &Sparse<'_> {
     async fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         let data = self

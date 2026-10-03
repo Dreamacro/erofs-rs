@@ -1,4 +1,4 @@
-//! A pure Rust library for reading EROFS (Enhanced Read-Only File System) images.
+//! A pure Rust library for reading and building EROFS (Enhanced Read-Only File System) images.
 //!
 //! EROFS is a read-only filesystem designed for performance and space efficiency,
 //! commonly used in Android and other embedded systems.
@@ -8,6 +8,11 @@
 //! - **no_std support**: Uses `alloc` on supported targets
 //! - **Zero-copy parsing**: Via mmap (std) or byte slices (no_std)
 //! - **Multiple backends**: Memory-mapped files (std) or raw byte slices (no_std)
+//! - **Image building**: With `std`, `build::Builder` accepts explicit metadata and
+//!   `Read` sources. `build::AsyncBuilder` uses runtime-independent backend traits
+//!   with shared layout/encoding; the optional `tokio` feature adds `backend::TokioIo`.
+//!   `build::from_directory` is a Unix convenience wrapper.
+//!   All write uncompressed images with files, directories and symbolic/hard links.
 //! - **Multiple layouts**: Flat plain, flat inline, and chunk-based data layouts
 //! - **Extended attributes**: Inline/shared entries and long name prefixes,
 //!   exposed through `xattrs` / `xattrs_inode` as lossless byte maps ([`Xattrs`]).
@@ -76,6 +81,8 @@ mod xattr;
 
 pub mod r#async;
 pub mod backend;
+#[cfg(feature = "std")]
+pub mod build;
 mod error;
 pub mod sync;
 pub mod types;

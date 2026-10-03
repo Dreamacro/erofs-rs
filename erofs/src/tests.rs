@@ -27,6 +27,7 @@ impl Image for &Source<'_> {
     fn len(&self) -> u64 {
         self.data.len()
     }
+
     fn get<R: RangeBounds<u64>>(&self, range: R) -> Option<&[u8]> {
         self.reads.fetch_add(1, Relaxed);
         if self.fail.load(Relaxed) {
