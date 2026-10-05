@@ -12,11 +12,12 @@
 //!   `Read` sources. `build::AsyncBuilder` uses runtime-independent backend traits
 //!   with shared layout/encoding; the optional `tokio` feature adds `backend::TokioIo`.
 //!   `build::from_directory` is a Unix convenience wrapper.
-//!   All write uncompressed images with files, directories and symbolic/hard links.
+//!   Images preserve metadata, inline xattrs and links, with optional Full-index
+//!   LZ4/MicroLZMA/DEFLATE/Zstd compression for regular files (`std` + the codec feature).
 //! - **Multiple layouts**: Flat plain, flat inline, and chunk-based data layouts
 //! - **Extended attributes**: Inline/shared entries and long name prefixes,
 //!   exposed through `xattrs` / `xattrs_inode` as lossless byte maps ([`Xattrs`]).
-//! - **Optional compression**: `lz4`, `lzma` (MicroLZMA), `deflate`, and `zstd` support
+//! - **Compressed reading**: `lz4`, `lzma` (MicroLZMA), `deflate`, and `zstd` support
 //!   Full/Compact indexes, multi-block pclusters, inline tails, packed fragments,
 //!   partial references, and 4/8/16/32-byte extent records. Non-default logical
 //!   clusters and legacy LZ4 trailing padding are supported. Physical clusters are

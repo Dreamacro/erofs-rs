@@ -294,7 +294,7 @@ impl XattrRead {
     }
 }
 
-fn namespace(index: u8) -> Result<&'static [u8]> {
+pub fn namespace(index: u8) -> Result<&'static [u8]> {
     match index {
         0 => Ok(b""),
         1 => Ok(b"user."),

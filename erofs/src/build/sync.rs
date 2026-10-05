@@ -1,8 +1,11 @@
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::{
+    borrow::Borrow,
+    io::{self, Read, Seek, SeekFrom, Write},
+};
 use typed_path::UnixPath;
 
 use super::{
-    Metadata, State, check_output_length,
+    Compression, Metadata, Options, SpecialFile, State, check_output_length,
     encode::{self, BLOCK_SIZE, Content, MetadataBlock, ZERO_BLOCK},
     symlink_target,
 };
@@ -25,9 +28,20 @@ use crate::{Result, types::SUPER_BLOCK_OFFSET};
 /// Append validation errors leave the builder usable. A file read or output I/O error
 /// poisons it: discard that output and start again. Dropping a builder does **not**
 /// finish it. Do not access or modify the output through other handles while building.
-/// Uses 4 KiB blocks and extended inodes with flat or inline-tail data. UUID and
-/// filesystem creation time are zero; xattrs, special files, compression,
-/// checksums and additional devices are not generated.
+/// Uses 4 KiB blocks, compact/extended inodes, flat or inline-tail data and a CRC32C
+/// superblock checksum. UUID and filesystem creation time default to zero;
+/// [`Options`] can set them without changing inode modification times.
+/// [`Metadata::xattrs`] are stored inline; pass `&metadata` to reuse metadata
+/// without cloning attributes. Compact inodes require 16-bit UID/GID/link counts,
+/// a 32-bit size and a modification time equal to the configured build time.
+/// [`Options::inode_format`] defaults to automatic selection. Once a streamed
+/// entry is Compact, adding its 65,536th link fails without changing the builder;
+/// select [`super::InodeFormat::Extended`] up front if more links may be needed.
+/// Directory formats are chosen at finish when sizes and counts are known.
+/// Directory attributes remain in memory until finish;
+/// other attributes are streamed during append. [`Options::compression`] enables
+/// bounded Full-index writing for regular files of at least 8 KiB. Sockets,
+/// shared attributes and additional devices are not generated.
 ///
 /// ```
 /// use std::io::Cursor;
@@ -48,9 +62,13 @@ pub struct Builder<W: Write + Seek> {
     state: State,
 }
 
-impl<W: Write + Seek> Builder<W> {
-    /// Starts an image at offset zero. Nonempty outputs are rejected, not truncated.
-    pub fn new(mut output: W) -> Result<Self> {
+impl Options {
+    /// Creates a synchronous builder with these settings and an empty output.
+    ///
+    /// Invalid options are rejected before seeking or writing. Nonempty outputs
+    /// are rejected, not truncated. Call [`Builder::finish`] to complete the image.
+    pub fn build<W: Write + Seek>(self, mut output: W) -> Result<Builder<W>> {
+        let state = State::new(self)?;
         if output.seek(SeekFrom::End(0))? != 0 {
             return Err(
                 io::Error::new(io::ErrorKind::InvalidInput, "image output must be empty").into(),
@@ -59,15 +77,27 @@ impl<W: Write + Seek> Builder<W> {
         output.seek(SeekFrom::Start(0))?;
         // A valid superblock is only written by finish().
         output.write_all(&ZERO_BLOCK)?;
-        Ok(Self {
-            output,
-            state: State::new(),
-        })
+        Ok(Builder { output, state })
+    }
+}
+
+impl<W: Write + Seek> Builder<W> {
+    /// Starts an image at offset zero with default [`Options`].
+    /// Nonempty outputs are rejected, not truncated.
+    pub fn new(output: W) -> Result<Self> {
+        Options::default().build(output)
     }
 
     /// Adds a directory. An empty path or `/` sets the root metadata once.
-    pub fn append_dir(&mut self, path: impl AsRef<UnixPath>, metadata: Metadata) -> Result<()> {
-        self.state.append_dir(path.as_ref(), metadata)
+    ///
+    /// Supply large root attributes before payloads to keep the root NID small.
+    /// A late root beyond the legacy NID range requires EROFS's 48-bit feature.
+    pub fn append_dir(
+        &mut self,
+        path: impl AsRef<UnixPath>,
+        metadata: impl Borrow<Metadata>,
+    ) -> Result<()> {
+        self.state.append_dir(path.as_ref(), metadata.borrow())
     }
 
     /// Appends exactly `size` bytes from `data`, using bounded memory.
@@ -78,11 +108,18 @@ impl<W: Write + Seek> Builder<W> {
     pub fn append_file(
         &mut self,
         path: impl AsRef<UnixPath>,
-        metadata: Metadata,
+        metadata: impl Borrow<Metadata>,
         size: u64,
         data: impl Read,
     ) -> Result<()> {
-        self.append_payload(path.as_ref(), metadata, Content::File, size, data)
+        self.append_payload(
+            path.as_ref(),
+            metadata.borrow(),
+            Content::File,
+            size,
+            1,
+            data,
+        )
     }
 
     /// Adds a symbolic link without resolving its target. Target bytes are retained
@@ -90,23 +127,47 @@ impl<W: Write + Seek> Builder<W> {
     pub fn append_symlink(
         &mut self,
         path: impl AsRef<UnixPath>,
-        metadata: Metadata,
+        metadata: impl Borrow<Metadata>,
         target: impl AsRef<UnixPath>,
     ) -> Result<()> {
         self.state.check_ready()?;
         let target = symlink_target(target.as_ref())?;
         self.append_payload(
             path.as_ref(),
-            metadata,
+            metadata.borrow(),
             Content::Symlink,
             target.len() as u64,
+            1,
             target,
         )
     }
 
-    /// Adds another name for an existing file or symlink, sharing its inode and
+    /// Adds a FIFO, character device or block device, with no payload.
+    ///
+    /// Device numbers must fit EROFS's 12-bit major and 20-bit minor fields.
+    /// No host device or FIFO is created or opened, and no special privileges are
+    /// needed. This can flush a pending metadata block, so output errors poison
+    /// the builder just like other appends.
+    pub fn append_special(
+        &mut self,
+        path: impl AsRef<UnixPath>,
+        metadata: impl Borrow<Metadata>,
+        kind: SpecialFile,
+    ) -> Result<()> {
+        self.append_payload(
+            path.as_ref(),
+            metadata.borrow(),
+            Content::Special(kind),
+            0,
+            1,
+            &[][..],
+        )
+    }
+
+    /// Adds another name for an existing file, symlink or special inode, sharing its
     /// metadata. The target must already have been appended; directory hard links
-    /// are rejected, and symlink targets are not followed.
+    /// are rejected, and symlink targets are not followed. A Compact inode cannot
+    /// exceed 65,535 links; that error leaves both the count and path unchanged.
     pub fn append_hard_link(
         &mut self,
         path: impl AsRef<UnixPath>,
@@ -122,7 +183,16 @@ impl<W: Write + Seek> Builder<W> {
     pub fn finish(mut self) -> Result<W> {
         let blocks = self.state.layout()?;
         self.flush_metadata()?;
+        let mut superblock = encode::superblock(
+            self.state.nodes.len(),
+            blocks,
+            self.state.nodes[0].nid,
+            &self.state.options,
+        );
         for (offset, block) in encode::metadata_blocks(&self.state.nodes) {
+            if offset == 0 {
+                encode::set_superblock_checksum(&mut superblock, &block);
+            }
             self.output.seek(SeekFrom::Start(offset))?;
             self.output.write_all(&block)?;
         }
@@ -131,12 +201,12 @@ impl<W: Write + Seek> Builder<W> {
         for (node_index, node) in self.state.nodes.iter().enumerate() {
             if node.nlink > 1 && !matches!(node.content, Content::Directory { .. }) {
                 self.output.seek(SeekFrom::Start(node.inode_offset()))?;
-                self.output.write_all(&encode::inode(node, node_index))?;
+                self.output
+                    .write_all(&encode::inode(node, node_index)[..node.inode_size()])?;
             }
         }
         self.output.seek(SeekFrom::Start(SUPER_BLOCK_OFFSET))?;
-        self.output
-            .write_all(&encode::superblock(self.state.nodes.len(), blocks))?;
+        self.output.write_all(&superblock)?;
         check_output_length(
             self.output.seek(SeekFrom::End(0))?,
             u64::from(blocks) * BLOCK_SIZE as u64,
@@ -145,24 +215,49 @@ impl<W: Write + Seek> Builder<W> {
         Ok(self.output)
     }
 
-    fn append_payload(
+    // Directory import supplies its known in-tree count for header selection.
+    // Public streaming appends start with one link; actual counts are tracked by State.
+    pub(super) fn append_payload(
         &mut self,
         path: &UnixPath,
-        metadata: Metadata,
+        metadata: &Metadata,
         content: Content,
         size: u64,
+        nlink: u32,
         mut data: impl Read,
     ) -> Result<()> {
-        let entry = self.state.prepare_payload(path, metadata, content, size)?;
-        let block = entry.node.metadata_block();
-        if self
+        let entry = self
             .state
-            .pending_metadata
-            .as_ref()
-            .is_none_or(|page| page.block != block)
-        {
-            self.flush_metadata()?;
-            self.state.pending_metadata = Some(MetadataBlock::new(block));
+            .prepare_payload(path, metadata, content, size, nlink)?;
+        let last_block = if entry.node.compression != Compression::None {
+            entry.node.first_index_block()
+        } else {
+            entry.node.last_metadata_block()
+        };
+        for block in entry.node.metadata_block()..=last_block {
+            if self
+                .state
+                .pending_metadata
+                .as_ref()
+                .is_none_or(|page| page.block != block)
+            {
+                self.flush_metadata()?;
+                self.state.pending_metadata = Some(MetadataBlock::new(block));
+            }
+            self.state
+                .pending_metadata
+                .as_mut()
+                .unwrap()
+                .write_inode(&entry.node, self.state.nodes.len());
+        }
+        #[cfg(any(
+            feature = "lz4",
+            feature = "lzma",
+            feature = "deflate",
+            feature = "zstd"
+        ))]
+        if entry.node.compression != Compression::None {
+            return self.append_compressed(entry, &mut data);
         }
         let external_size = entry.node.external_size();
         if external_size != 0 {
@@ -191,6 +286,76 @@ impl<W: Write + Seek> Builder<W> {
         if entry.node.inline_size != 0 {
             let page = self.state.pending_metadata.as_mut().unwrap();
             data.read_exact(page.inline_data_mut(&entry.node))?;
+        }
+        self.state.commit_payload(entry);
+        Ok(())
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    fn append_compressed(
+        &mut self,
+        mut entry: super::PendingEntry,
+        data: &mut impl Read,
+    ) -> Result<()> {
+        use super::compress::{Compressor, INPUT_SIZE};
+
+        let mut input = vec![0; INPUT_SIZE];
+        let mut compressor = Compressor::new(entry.node.compression);
+        let mut remaining = entry.node.size;
+        let mut index_offset = entry.node.index_offset();
+        self.output.seek(SeekFrom::Start(
+            u64::from(entry.next_block) * BLOCK_SIZE as u64,
+        ))?;
+        while remaining != 0 {
+            let len = remaining.min(INPUT_SIZE as u64) as usize;
+            data.read_exact(&mut input[..len])?;
+            remaining -= len as u64;
+            let mut input = &input[..len];
+            while !input.is_empty() {
+                let consumed = compressor.encode(input, entry.next_block)?;
+                self.output.write_all(&compressor.data)?;
+                entry.next_block += 1; // Worst-case bounds were checked before I/O.
+                entry.node.data_block += 1; // i_u is the physical block count for compressed inodes.
+                let mut indexes = &compressor.indexes[..consumed.div_ceil(BLOCK_SIZE) * 8];
+                while !indexes.is_empty() {
+                    let block = (index_offset / BLOCK_SIZE as u64) as u32;
+                    if self.state.pending_metadata.as_ref().unwrap().block != block {
+                        self.flush_metadata()?;
+                        let mut page = MetadataBlock::new(block);
+                        page.write_inode(&entry.node, self.state.nodes.len());
+                        self.state.pending_metadata = Some(page);
+                        self.output.seek(SeekFrom::Start(
+                            u64::from(entry.next_block) * BLOCK_SIZE as u64,
+                        ))?;
+                    }
+                    let len = indexes
+                        .len()
+                        .min(BLOCK_SIZE - (index_offset % BLOCK_SIZE as u64) as usize);
+                    self.state
+                        .pending_metadata
+                        .as_mut()
+                        .unwrap()
+                        .write_at(index_offset, &indexes[..len]);
+                    index_offset += len as u64;
+                    indexes = &indexes[len..];
+                }
+                input = &input[consumed..];
+            }
+        }
+        let header = encode::inode(&entry.node, self.state.nodes.len());
+        let header = &header[..entry.node.inode_size()];
+        let page = self.state.pending_metadata.as_mut().unwrap();
+        if page.block == entry.node.metadata_block() {
+            page.write_at(entry.node.inode_offset(), header);
+        } else {
+            self.output
+                .seek(SeekFrom::Start(entry.node.inode_offset()))?;
+            self.output.write_all(header)?;
         }
         self.state.commit_payload(entry);
         Ok(())

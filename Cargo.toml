@@ -13,8 +13,9 @@ bitflags = "2"
 bytes = { version = "1", default-features = false }
 chrono = { version = "0.4", default-features = false }
 clap = { version = "4", default-features = false }
+crc32c = { version = "0.6", default-features = false }
 lz4_flex = { version = "0.14", default-features = false }
-lzma-rs = { version = "0.3", default-features = false }
+lzma-rust2 = { version = "0.21", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
 miniz_oxide = { version = "0.9", default-features = false }
 opendal = { version = "0.59", default-features = false }

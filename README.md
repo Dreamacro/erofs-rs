@@ -14,7 +14,7 @@ A pure Rust library for reading and building [EROFS](https://docs.kernel.org/fil
 - Additional devices, with explicit chunk device IDs and unified-address routing for file data
 - Metabox metadata, decoded on demand through the existing codecs without buffering the entire metadata file
 - Optional LZ4, MicroLZMA, DEFLATE, and Zstd decoding with shared sync/async mapping and per-file decoded-extent caching
-- Full/Compact compression indexes, multi-block pclusters, inline tails, packed fragments, partial references, and 4/8/16/32-byte extent records
+- Compressed reading with Full/Compact indexes, multi-block pclusters, inline tails, packed fragments, partial references, and 4/8/16/32-byte extent records
 - Non-default logical cluster sizes and legacy LZ4 trailing padding
 - Incremental image building: shared sync/async layout and encoding, explicit metadata and streaming inputs, plus Unix directory import including Linux and macOS
 
@@ -80,32 +80,24 @@ The low-level API accepts application data without consulting the host filesyste
 
 ```rust
 use std::io::Cursor;
-use erofs_rs::build::{Builder, Metadata};
+use erofs_rs::build::{Metadata, Options, SpecialFile};
 
-let mut builder = Builder::new(Cursor::new(Vec::new()))?;
+let mut builder = Options::default()
+    .uuid([0x11; 16])
+    .build_time((1_700_000_000, 123_456_789))
+    .build(Cursor::new(Vec::new()))?;
 builder.append_dir("etc", Metadata { mode: 0o755, ..Metadata::default() })?;
-builder.append_file("etc/config", Metadata::default(), 4, &b"data"[..])?;
+let metadata = Metadata {
+    modified: (1_700_000_000, 123_456_789),
+    xattrs: [(b"user.comment".to_vec(), b"generated".to_vec())].into(),
+    ..Metadata::default()
+};
+builder.append_file("etc/config", &metadata, 4, &b"data"[..])?;
 builder.append_symlink("config", Metadata { mode: 0o777, ..Metadata::default() }, "etc/config")?;
 builder.append_hard_link("config-copy", "etc/config")?;
+builder.append_special("events", Metadata::default(), SpecialFile::Fifo)?;
 let image = builder.finish()?.into_inner();
 ```
-
-- `Builder<W>` requires an empty `Write + Seek` output; a file or `Cursor<Vec<u8>>` works.
-- `Metadata` contains permission bits, UID/GID and signed Unix modification time with nanoseconds.
-- `append_file(path, metadata, size, reader)` consumes exactly `size` bytes immediately;
-  extra bytes remain unread. Full blocks are streamed, while inline tails share one
-  pending 4 KiB metadata block. No per-file payload buffer or retained input handle is needed.
-- Paths are raw Unix bytes, with an optional leading `/`. Empty components, `.`, `..`,
-  NUL, duplicate paths and components above 255 bytes are rejected. Only directories
-  allow a trailing `/`. Parents can be added later but must exist by `finish()`.
-- The root defaults to mode `0o755`, UID/GID zero and epoch time;
-  `append_dir("/", metadata)` sets its metadata once.
-- Hard links share an existing file/symlink inode; forward and directory hard links
-  are rejected. Symlink targets are preserved verbatim, not resolved.
-- `finish()` flushes pending metadata, writes directories, patches hard-link counts
-  and writes the final superblock, flushes, and returns
-  the output. Dropping does not finish. Append validation errors leave the builder
-  usable, but any read/write failure poisons it; discard that incomplete image.
 
 `AsyncBuilder` is also available with `std`, without a runtime dependency:
 
@@ -129,8 +121,10 @@ async file handles. Borrowed backends (`&mut T`) are supported too. Arbitrary
 blocking `std::io` types are deliberately not adapted automatically.
 
 Only I/O operations need `.await`; directory and hard-link additions only update
-shared metadata. Both builders use the same validation, layout and block encoder,
-and emit identical bytes for identical ordered entries.
+shared metadata. `AsyncBuilder::append_special` needs `.await` because it can flush
+an earlier metadata block, even though special files have no payload. Both builders
+use the same validation, layout and block encoder, and emit identical bytes for
+identical ordered entries.
 An append canceled in its I/O phase poisons the builder just like an I/O error;
 its output must be discarded. Dropping an unpolled append future has no effect.
 Canceling `new` or `finish` also requires discarding the incomplete output.
@@ -156,6 +150,10 @@ thread when calling from an async application):
 erofs_rs::build::from_directory("rootfs", "image.erofs")?;
 ```
 
+Use `Options::default().uuid(...).build_time(...).build_from_directory(source, destination)`
+to set the same UUID and creation time. Identical ordered entries (or an unchanged source directory) and
+options produce identical image bytes; inode metadata is preserved, not normalized.
+
 Directory import uses
 Unix metadata and `rustix` xattr enumeration (Linux, Android, Apple platforms and Hurd).
 Other Unix targets currently return `NotSupported` rather than silently omitting
@@ -165,18 +163,22 @@ metadata mappings.
 For `from_directory`, the output must be a new file outside the source tree. Keep the input tree unchanged
 throughout the build; this is not a filesystem snapshot. Files are copied with bounded
 buffers, while directory entries and metadata are kept in memory. Permissions, UID/GID,
-modification times and raw names/link targets are preserved. Hard-link counts include
-only links inside the image.
+modification times and raw names/link targets are preserved. FIFOs and character/block
+devices are imported as metadata only, preserving device numbers without opening them.
+Reported xattrs are read without following symlinks and stored inline. Unsupported
+namespaces, format limits and attribute read errors fail the build rather than
+silently losing metadata. Sockets remain explicitly rejected. Hard-link counts include only links
+inside the image.
 
 ## Feature Flags
 
 - `std` (default): Enables standard library support, including mmap and basic image building
 - `opendal`: Enables async I/O via [Apache OpenDAL](https://opendal.apache.org/), supporting remote backends (HTTP, S3, etc.)
 - `tokio`: Adds the `backend::TokioIo` adapter; implies `std`, but does not enable a runtime or filesystem features. `AsyncBuilder` itself only needs `std`
-- `lz4`: Enables LZ4 decoding via `lz4_flex`, without requiring `std`
-- `lzma`: Enables EROFS MicroLZMA decoding via `lzma-rs`; implies `std`
-- `deflate`: Enables raw DEFLATE decoding via `miniz_oxide`, without requiring `std`
-- `zstd`: Enables Zstd decoding via `ruzstd`, without requiring `std`
+- `lz4`: Enables LZ4 decoding via `lz4_flex` without requiring `std`; with `std`, also enables LZ4 image writing
+- `lzma`: Enables EROFS MicroLZMA reading and writing via `lzma-rust2`; implies `std`
+- `deflate`: Enables raw DEFLATE decoding via `miniz_oxide`, without requiring `std`; with `std`, also enables writing
+- `zstd`: Enables Zstd decoding via `ruzstd`, without requiring `std`; with `std`, also enables writing
 - All four codec features are enabled in the CLI
 - Without `std`: Operates in `no_std` mode with `alloc`
 
@@ -207,6 +209,14 @@ Repeat `--device` in device-table order; `dump` and `inspect` accept all-local p
 # Build an uncompressed image (e.g. Linux/macOS; output must be new and outside rootfs)
 erofs-cli build rootfs -o image.erofs
 
+# Compress regular files with Full indexes (none|lz4|lzma|deflate|zstd; default: none)
+erofs-cli build rootfs -o compressed.erofs --compression zstd
+
+# Set a fixed UUID and creation time, without changing inode modification times
+erofs-cli build rootfs -o configured.erofs \
+  --uuid 00112233-4455-6677-8899-aabbccddeeff \
+  --build-time 1700000000 --build-time-nsec 123456789
+
 # Dump superblock info
 erofs-cli dump image.erofs
 
@@ -236,20 +246,20 @@ erofs-cli inspect -i http://example.com/images/system.erofs cat /etc/os-release
 ### Implemented
 
 - [x] Superblock / inode / dirent parsing
-- [x] Extended attribute reading (inline, shared, and long prefixes)
-- [x] Flat plain layout
-- [x] Flat inline layout
-- [x] Chunk-based layout, including indexed and 48-bit chunks
-- [x] Additional devices (chunk IDs and unified data addresses)
-- [x] Metabox metadata, including inode records, indexes, inline data, and xattrs
-- [x] LZ4, MicroLZMA, DEFLATE, and Zstd compressed data (layouts and limits above)
-- [x] Directory walk (`walk_dir`)
-- [x] Convert to tar archive
-- [x] Sync/async incremental image building (`Builder` / `AsyncBuilder`, shared encoding) and Unix directory import
+- [x] Flat plain / inline reading
+- [x] Chunk-based reading (including indexed/48-bit chunks) and additional devices (chunk IDs/unified addresses)
+- [x] Metabox metadata reading (inodes, indexes, inline data and xattrs)
+- [x] Compressed reading: LZ4, MicroLZMA, DEFLATE and Zstd (layouts and limits above)
+- [x] Xattrs: inline/shared/long-prefix reading; inline writing/import, including cross-block bodies
+- [x] Directory traversal (`walk_dir`) and tar export
+- [x] Sync/async incremental builders (`Builder` / `AsyncBuilder`) and Unix directory import,
+  with compact/extended inodes, optional LZ4/MicroLZMA/DEFLATE/Zstd Full-index compression, hard links,
+  FIFOs and character/block devices
+- [x] Image UUID/creation-time configuration and superblock CRC32C generation (reader verification pending)
 
 ### TODO
 
-- [ ] Writer support for xattrs, special files, compact inodes, compression and advanced formats
+- [ ] Writer support for advanced formats
 
 ## Fuzz testing
 

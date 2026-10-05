@@ -602,6 +602,58 @@ fn microlzma_properties_are_validated_before_decoder_construction() {
     }
 }
 
+#[cfg(feature = "lzma")]
+#[test]
+fn microlzma_prefixes_wrap_history_without_accepting_incomplete_streams() {
+    // Native liblzma MicroLZMA: 65536 'A' bytes and 513 'B' bytes, 4 KiB dictionary.
+    let payload = [
+        162, 32, 239, 251, 191, 254, 163, 177, 94, 229, 248, 63, 178, 170, 38, 85, 248, 104, 112,
+        65, 112, 21, 15, 141, 253, 30, 76, 27, 138, 66, 183, 25, 244, 105, 24, 113, 174, 102, 35,
+        138, 138, 77, 47, 163, 13, 217, 127, 166, 227, 140, 35, 17, 83, 224, 89, 24, 197, 117, 138,
+        226, 119, 248, 182, 148, 127, 12, 106, 192, 222, 116, 73, 100, 92, 159, 171, 146, 5, 73,
+        161, 0, 0,
+    ];
+    let wanted = [vec![b'A'; 65536], vec![b'B'; 513]].concat();
+    for dictionary in [4096, MAX_LZMA_DICT_SIZE] {
+        for size in [
+            1,
+            273,
+            4095,
+            4096,
+            4097,
+            32768,
+            65535,
+            65536,
+            65537,
+            wanted.len(),
+        ] {
+            let mut output = vec![0; size];
+            decode_microlzma(&payload, &mut output, dictionary, true).unwrap();
+            assert_eq!(output, wanted[..size]);
+        }
+        let mut output = vec![0; wanted.len()];
+        decode_microlzma(&payload, &mut output, dictionary, false).unwrap();
+        assert_eq!(output, wanted);
+        for size in [wanted.len() - 1, wanted.len() + 1] {
+            assert!(decode_microlzma(&payload, &mut vec![0; size], dictionary, false).is_err());
+        }
+        for cut in 0..payload.len() {
+            assert!(decode_microlzma(&payload[..cut], &mut output, dictionary, false).is_err());
+        }
+        // An unreferenced suffix need not be complete or valid.
+        let mut prefix = [0; 4097];
+        decode_microlzma(&payload[..payload.len() - 5], &mut prefix, dictionary, true).unwrap();
+        assert_eq!(prefix, [b'A'; 4097]);
+        for extra in [1, 4096, 65536] {
+            let mut trailing = payload.to_vec();
+            trailing.resize(trailing.len() + extra, 0);
+            assert!(decode_microlzma(&trailing, &mut output, dictionary, false).is_err());
+            decode_microlzma(&trailing, &mut prefix, dictionary, true).unwrap();
+            assert_eq!(prefix, [b'A'; 4097]);
+        }
+    }
+}
+
 #[cfg(feature = "zstd")]
 #[test]
 fn zstd_checks_checksum_window_descriptor_and_content_size() {

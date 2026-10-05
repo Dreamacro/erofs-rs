@@ -17,7 +17,9 @@ workspace = true
 [features]
 default = ["std"]
 std = [
+  "dep:crc32c",
   "dep:memmap2",
+  "miniz_oxide?/with-alloc",
   "thiserror/std",
   "bytes/std",
   "binrw/std",
@@ -27,7 +29,7 @@ std = [
 opendal = ["std", "dep:opendal"]
 tokio = ["std", "dep:tokio"]
 lz4 = ["dep:lz4_flex"]
-lzma = ["std", "dep:lzma-rs"]
+lzma = ["std", "dep:lzma-rust2"]
 deflate = ["dep:miniz_oxide"]
 zstd = ["dep:ruzstd"]
 
@@ -35,8 +37,9 @@ zstd = ["dep:ruzstd"]
 binrw = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
-lz4_flex = { workspace = true, optional = true, features = ["safe-decode", "checked-decode"] }
-lzma-rs = { workspace = true, optional = true, features = ["raw_decoder"] }
+crc32c = { workspace = true, optional = true }
+lz4_flex = { workspace = true, optional = true, features = ["safe-encode", "safe-decode", "checked-decode"] }
+lzma-rust2 = { workspace = true, optional = true, features = ["std", "encoder"] }
 memmap2 = { workspace = true, default-features = true, optional = true }
 miniz_oxide = { workspace = true, optional = true }
 opendal = { workspace = true, optional = true }

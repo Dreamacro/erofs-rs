@@ -1334,72 +1334,44 @@ fn decode_zstd(input: &[u8], output: &mut [u8], window_size: u32, partial: bool)
 
 #[cfg(feature = "lzma")]
 fn decode_microlzma(input: &[u8], output: &mut [u8], dict_size: u32, partial: bool) -> Result<()> {
-    use bytes::BufMut;
-    use lzma_rs::decompress::raw::{LzmaDecoder, LzmaParams, LzmaProperties};
+    use lzma_rust2::LzmaReader;
     use std::io::Read;
 
     // MicroLZMA replaces the raw range coder's initial zero with !properties.
     // Restore it through a chained slice, without copying the compressed data.
-    let props = u32::from(!input[0]);
-    let properties = LzmaProperties {
-        lc: props % 9,
-        lp: props / 9 % 5,
-        pb: props / 45,
-    };
-    if props >= 225 || properties.lc + properties.lp > 4 {
+    let (&first, input) = input
+        .split_first()
+        .ok_or_else(|| Error::CorruptedData("empty MicroLZMA data".to_string()))?;
+    let props = !first;
+    if props >= 225 || props % 9 + props / 9 % 5 > 4 {
         return Err(Error::CorruptedData(
             "invalid MicroLZMA properties".to_string(),
         ));
     }
-    // The raw API cannot stop in the middle of a match. A prefix-sized history
-    // flushes exactly at the requested byte, where the sink stops the decoder.
-    // This retains at most MAX_DECODED_SIZE bytes of history, including prefixes
-    // larger than the on-disk dictionary; no unreferenced suffix is decoded.
-    let dict_size = if partial {
-        output.len() as u32
+    // A partial reference may stop inside a match, so its prefix length must
+    // not be treated as the complete stream size. Only retain reachable history.
+    let size = if partial {
+        u64::MAX
     } else {
-        dict_size
+        output.len() as u64
     };
-    let params = LzmaParams::new(properties, dict_size, Some(output.len() as u64));
-    let mut decoder = LzmaDecoder::new(params, Some(dict_size as usize))
-        .map_err(|err| Error::CorruptedData(format!("invalid MicroLZMA parameters: {err}")))?;
+    let dict_size = dict_size.min(output.len() as u32);
     let prefix = [0u8];
-    let mut input = Read::chain(prefix.as_slice(), &input[1..]);
-    if partial {
-        struct Prefix<'a>(&'a mut [u8]);
-
-        impl std::io::Write for Prefix<'_> {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                let n = bytes.len().min(self.0.len());
-                self.0.put_slice(&bytes[..n]);
-                if self.0.is_empty() {
-                    return Err(std::io::ErrorKind::WriteZero.into());
-                }
-                Ok(n)
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut prefix = Prefix(output);
-        let result = decoder.decompress(&mut input, &mut prefix);
-        return if prefix.0.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::CorruptedData(format!(
-                "incomplete MicroLZMA prefix: {result:?}"
-            )))
-        };
-    }
-    let mut remaining = output;
+    let input = Read::chain(prefix.as_slice(), input);
+    let mut decoder = LzmaReader::new_with_props(input, size, props, dict_size, None)
+        .map_err(|err| Error::CorruptedData(format!("invalid MicroLZMA parameters: {err}")))?;
     decoder
-        .decompress(&mut input, &mut remaining)
+        .read_exact(output)
         .map_err(|err| Error::CorruptedData(format!("invalid MicroLZMA data: {err}")))?;
-    if !remaining.is_empty() || !input.get_ref().1.is_empty() {
-        return Err(Error::CorruptedData(
-            "MicroLZMA length or stream end mismatch".to_string(),
-        ));
+    if !partial {
+        // The decoder reads ahead: both buffered and unread trailing bytes
+        // must be rejected, including when the caller only requested a slice.
+        let (input, unused) = decoder.into_parts();
+        if !unused.is_empty() || !input.get_ref().1.is_empty() {
+            return Err(Error::CorruptedData(
+                "MicroLZMA length or stream end mismatch".to_string(),
+            ));
+        }
     }
     Ok(())
 }

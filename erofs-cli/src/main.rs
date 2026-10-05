@@ -10,7 +10,7 @@ mod source;
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Build an uncompressed image from a local directory.
+    /// Build an image from a local directory, optionally using compression.
     #[cfg(unix)]
     Build(build::BuildArgs),
     Dump(dump::DumpArgs),

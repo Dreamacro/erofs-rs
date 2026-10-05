@@ -126,7 +126,7 @@ mod tests {
         }
         assert_eq!(&bytes, b"abc");
 
-        let metadata = Metadata::default();
+        let metadata = &Metadata::default();
         let mut sync = Builder::new(Cursor::new(Vec::new())).unwrap();
         sync.append_file("file", metadata, 4, &b"data"[..]).unwrap();
         let mut output = BufWriter::with_capacity(17, Cursor::new(Vec::new()));
