@@ -1,5 +1,6 @@
 use crate::source;
 use anyhow::Result;
+use bitflags::Flags;
 use chrono::{DateTime, Local};
 use clap::Args;
 use erofs_rs::{
@@ -19,16 +20,24 @@ pub struct DumpArgs {
 
 // Filesystem magic number:                      0xE0F5E1E2
 // Filesystem blocksize:                         4096
-// Filesystem blocks:                            55
+// Filesystem blocks:                            5136
+// Filesystem additional devices:                0
 // Filesystem inode metadata start block:        0
 // Filesystem shared xattr metadata start block: 0
-// Filesystem root nid:                          38
-// Filesystem lz4_max_distance:                  0
+// Filesystem root nid:                          37
 // Filesystem sb_size:                           128
-// Filesystem inode count:                       516
-// Filesystem created:                           Fri Dec  5 00:48:29 2025
-// Filesystem features:                          sb_csum mtime xattr_filter
-// Filesystem UUID:                              71bd9ab4-fb8c-47b4-986c-5c901ad547c7
+// Filesystem inode count:                       476
+// Filesystem created:                           Thu Oct 22 20:33:33 2026
+// Filesystem compatible features:               sb_csum mtime plain_xattr_pfx
+// Filesystem incompatible features:             chunked_file xattr_prefixes
+// Filesystem UUID:                              f980c99a-21e7-4bc2-9f37-cbf3f5cb69c9
+
+fn feature_names(flags: impl Flags) -> Vec<&'static str> {
+    flags
+        .iter()
+        .flat_map(|flag| flag.iter_equal_names())
+        .collect()
+}
 
 pub async fn dump(args: DumpArgs) -> Result<()> {
     let (block, devices) = if source::is_remote(&args.path) {
@@ -109,8 +118,12 @@ pub async fn dump(args: DumpArgs) -> Result<()> {
         .unwrap_or_else(|| "<invalid timestamp>".to_string());
     println!("Filesystem created:                           {}", created);
     println!(
-        "Filesystem features:                          {}",
-        block.feature_compat
+        "Filesystem compatible features:               {}",
+        feature_names(block.feature_compat_flags()).join(" ")
+    );
+    println!(
+        "Filesystem incompatible features:             {}",
+        feature_names(block.feature_incompat_flags()).join(" ")
     );
 
     println!(

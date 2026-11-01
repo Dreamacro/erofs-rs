@@ -9,7 +9,7 @@ missing_const_for_fn = "allow"
 [workspace.dependencies]
 anyhow = "1"
 binrw = { version = "0.15", default-features = false }
-bitflags = "2"
+bitflags = "2.13"
 bytes = { version = "1", default-features = false }
 chrono = { version = "0.4", default-features = false }
 clap = { version = "4", default-features = false }

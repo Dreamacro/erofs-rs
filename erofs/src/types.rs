@@ -85,9 +85,63 @@ impl SuperBlock {
             }
     }
 
+    /// Compatible feature flags from `feature_compat`, unknown bits are kept if present.
+    pub fn feature_compat_flags(&self) -> FeatureCompat {
+        FeatureCompat::from_bits_retain(self.feature_compat)
+    }
+
+    /// Incompatible feature flags from `feature_incompat`, unknown bits are kept if present.
+    pub fn feature_incompat_flags(&self) -> FeatureIncompat {
+        FeatureIncompat::from_bits_retain(self.feature_incompat)
+    }
+
     #[inline]
     pub const fn size() -> usize {
         size_of::<Self>()
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FeatureCompat: u32 {
+        #[bitflags(flag_name = "sb_csum")]
+        const SB_CSUM = 0x01;
+        #[bitflags(flag_name = "mtime")]
+        const MTIME = 0x02;
+        #[bitflags(flag_name = "xattr_filter")]
+        const XATTR_FILTER = 0x04;
+        #[bitflags(flag_name = "shared_ea_in_metabox")]
+        const SHARED_EA_IN_METABOX = 0x08;
+        #[bitflags(flag_name = "plain_xattr_pfx")]
+        const PLAIN_XATTR_PFX = 0x10;
+        #[bitflags(flag_name = "ishare_xattrs")]
+        const ISHARE_XATTRS = 0x20;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FeatureIncompat: u32 {
+        #[bitflags(flag_name = "lz4_0padding")]
+        const LZ4_0PADDING = 0x001;
+        #[bitflags(flag_name = "compr_cfgs")]
+        const COMPR_CFGS = 0x002;
+        #[bitflags(flag_name = "big_pcluster")]
+        const BIG_PCLUSTER = 0x002;
+        #[bitflags(flag_name = "chunked_file")]
+        const CHUNKED_FILE = 0x004;
+        #[bitflags(flag_name = "device_table")]
+        const DEVICE_TABLE = 0x008;
+        #[bitflags(flag_name = "ztailpacking")]
+        const ZTAILPACKING = 0x010;
+        #[bitflags(flag_name = "fragments")]
+        const FRAGMENTS = 0x020;
+        #[bitflags(flag_name = "dedupe")]
+        const DEDUPE = 0x020;
+        #[bitflags(flag_name = "xattr_prefixes")]
+        const XATTR_PREFIXES = 0x040;
+        #[bitflags(flag_name = "48bit")]
+        const BIT_48 = 0x080;
+        #[bitflags(flag_name = "metabox")]
+        const METABOX = 0x100;
     }
 }
 
