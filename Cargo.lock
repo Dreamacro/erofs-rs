@@ -1078,14 +1078,13 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lz4_flex"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+source = "git+https://github.com/Dreamacro/lz4_flex?rev=46f45f2b6e15b9fd0fa3b8614891fb8228fe6e40#46f45f2b6e15b9fd0fa3b8614891fb8228fe6e40"
 
 [[package]]
 name = "lzma-rust2"
-version = "0.21.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fde178a3caf126c440fa15628147772d8ee590a39477d711353fbe2e58a73a5b"
+checksum = "ef1d73c59a56771343712b22ea5615092c612c16ba291c0979e3105dfeec4890"
 
 [[package]]
 name = "md-5"
@@ -1115,8 +1114,7 @@ dependencies = [
 [[package]]
 name = "miniz_oxide"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+source = "git+https://github.com/Frommi/miniz_oxide?rev=b28c237471f63efebe152bddd962dc57bbb531eb#b28c237471f63efebe152bddd962dc57bbb531eb"
 dependencies = [
  "adler2",
 ]

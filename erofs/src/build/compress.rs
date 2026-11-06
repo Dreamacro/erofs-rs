@@ -1,9 +1,8 @@
 //! Bounded compression and Compact indexes; both I/O drivers share decisions.
 
-#[cfg(any(feature = "lz4", feature = "deflate", feature = "zstd"))]
-use alloc::boxed::Box;
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use bytes::BufMut;
+#[cfg(any(feature = "lz4", feature = "deflate", feature = "zstd"))]
 use std::io;
 
 use super::{
@@ -13,6 +12,13 @@ use super::{
 use crate::{Error, Result};
 
 pub(super) const INPUT_SIZE: usize = 64 * 1024;
+
+impl Compression {
+    // These encoders stop at the destination size and report the consumed prefix.
+    fn fills_destination(self) -> bool {
+        matches!(self, Self::Lz4 | Self::Lzma | Self::Deflate)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Placement {
@@ -138,7 +144,10 @@ impl Compressor {
         self.data.clear();
         self.placement = Placement::External;
         let try_inline = final_input && self.inline_capacity != 0;
-        let mut consumed = if try_inline || encoder.limit >= INPUT_SIZE / 4 {
+        // Other codecs emit complete frames, so search for a prefix that fits.
+        let bounded = encoder.compression.fills_destination();
+        let limit = encoder.limit;
+        let mut trial_len = if bounded || try_inline || limit >= INPUT_SIZE / 4 {
             input.len()
         } else {
             input.len().min(self.hint)
@@ -148,25 +157,25 @@ impl Compressor {
         let mut best = 0;
 
         // Favor image size: stop within 8 bytes of the destination capacity.
-        // shortcut: cap probes at 20; use destination-size codecs if encoding dominates.
+        // shortcut: complete-frame codecs cap probes at 20; prefer destination-size APIs.
         // Prefix sizes need not be monotonic.
         for _ in 0..20 {
-            let encoded = if consumed > BLOCK_SIZE || try_inline {
-                encoder
-                    .compress(&input[..consumed])?
+            let encoded = if trial_len > BLOCK_SIZE || try_inline {
+                Some(encoder.compress(&input[..trial_len])?)
                     // EROFS skips leading zeros; a zero-leading DEFLATE stored
                     // block is indistinguishable from padding. Keep it PLAIN.
-                    .filter(|_| encoder.scratch[0] != 0)
+                    .filter(|(_, data)| data[0] != 0)
             } else {
                 None
             };
 
-            if try_inline && consumed == input.len() {
-                if let Some(len) = encoded
-                    && len < input.len()
-                    && len <= self.inline_capacity
+            if try_inline && trial_len == input.len() {
+                if let Some((consumed, data)) = encoded
+                    && consumed == input.len()
+                    && data.len() < input.len()
+                    && data.len() <= self.inline_capacity
                 {
-                    self.data.extend_from_slice(&encoder.scratch[..len]);
+                    self.data.extend_from_slice(data);
                     self.placement = Placement::Inline;
                     return Ok((input.len(), true));
                 }
@@ -186,38 +195,42 @@ impl Compressor {
                 self.placement = Placement::Fragment;
                 return Ok((input.len(), true));
             }
+            let Some((consumed, data)) = encoded else {
+                break;
+            };
             if consumed <= BLOCK_SIZE {
                 break;
             }
+            let len = data.len();
+            let profitable = len <= limit && len.next_multiple_of(BLOCK_SIZE) < consumed;
+            if profitable {
+                self.data.clear();
+                self.data.extend_from_slice(data);
+                best = consumed;
+            }
+            if bounded {
+                break;
+            }
 
-            let estimate = if let Some(len) = encoded {
-                let estimate = ((consumed as u64 * encoder.limit as u64 / len as u64)
-                    .min(INPUT_SIZE as u64)) as usize;
-                if len <= encoder.limit {
-                    if len.next_multiple_of(BLOCK_SIZE) < consumed {
-                        self.data.clear();
-                        self.data.extend_from_slice(&encoder.scratch[..len]);
-                        best = consumed;
-                        self.hint = estimate.max(BLOCK_SIZE + 1);
-                    }
-                    low = consumed;
-                    if consumed == input.len() || encoder.limit - len <= 8 {
-                        break;
-                    }
-                } else {
-                    high = consumed;
+            let estimate =
+                ((trial_len as u64 * limit as u64 / len as u64).min(INPUT_SIZE as u64)) as usize;
+            if len <= limit {
+                if profitable {
+                    self.hint = estimate.max(BLOCK_SIZE + 1);
                 }
-                estimate
+                low = trial_len;
+                if trial_len == input.len() || limit - len <= 8 {
+                    break;
+                }
             } else {
-                high = consumed;
-                (low + high) / 2
-            };
+                high = trial_len;
+            }
             if high <= low + 1 {
                 break;
             }
             // Heterogeneous prefixes can predict outside the bracket. Bisect
             // instead of alternating one-byte steps at its opposite edges.
-            consumed = if best == 0 && estimate <= low {
+            trial_len = if best == 0 && estimate <= low {
                 // Quickly reject incompressible input without twenty probes.
                 low + 1
             } else if estimate > low && estimate < high {
@@ -326,6 +339,8 @@ pub(super) struct Encoder {
     lz4_small: Option<Box<lz4_flex::block::CompressTable>>,
     #[cfg(feature = "lz4")]
     lz4_large: Option<Box<lz4_flex::block::CompressTable>>,
+    #[cfg(feature = "lzma")]
+    lzma: Option<Box<lzma_rust2::MicroLzmaEncoder>>,
     #[cfg(feature = "deflate")]
     deflate: Option<Box<miniz_oxide::deflate::core::CompressorOxide>>,
     #[cfg(feature = "zstd")]
@@ -342,6 +357,8 @@ impl Encoder {
             lz4_small: None,
             #[cfg(feature = "lz4")]
             lz4_large: None,
+            #[cfg(feature = "lzma")]
+            lzma: None,
             #[cfg(feature = "deflate")]
             deflate: None,
             #[cfg(feature = "zstd")]
@@ -349,15 +366,13 @@ impl Encoder {
         }
     }
 
-    // None means the encoder filled its bounded output before finishing.
-    fn compress(&mut self, input: &[u8]) -> Result<Option<usize>> {
+    // Returns the consumed prefix length and its complete independent stream.
+    fn compress(&mut self, input: &[u8]) -> Result<(usize, &[u8])> {
         debug_assert!(input.len() <= INPUT_SIZE);
-        let len = match self.compression {
+        let (consumed, written) = match self.compression {
             #[cfg(feature = "lz4")]
             Compression::Lz4 => {
-                use lz4_flex::block::{
-                    CompressTable, compress_into_with_table, get_maximum_output_size,
-                };
+                use lz4_flex::block::{CompressTable, compress_prefix_into_with_table};
 
                 // Keep both widths so a previous large input cannot change small-input output.
                 let small = input.len() < usize::from(u16::MAX);
@@ -373,49 +388,31 @@ impl Encoder {
                         CompressTable::large()
                     })
                 });
-                self.scratch.resize(get_maximum_output_size(input.len()), 0);
-                // compress_into_with_table clears history on every call.
-                compress_into_with_table(input, &mut self.scratch, table)
+                self.scratch.resize(self.limit, 0);
+                // compress_prefix_into_with_table clears history on every call.
+                compress_prefix_into_with_table(input, &mut self.scratch, table)
                     .map_err(io::Error::other)?
             }
             #[cfg(feature = "lzma")]
             Compression::Lzma => {
-                use lzma_rust2::{LzmaOptions, LzmaWriter};
-                use std::io::Write;
+                use lzma_rust2::{LzmaOptions, MicroLzmaEncoder};
 
-                // Keep a bounded oversized result so the fit search can use its
-                // measured ratio instead of repeatedly bisecting on WriteZero.
-                self.scratch.resize(self.limit.max(input.len() * 2), 0);
-                let mut output = io::Cursor::new(self.scratch.as_mut_slice());
-                let mut options = LzmaOptions::with_preset(1);
-                options.dict_size = super::encode::LZMA_DICT_SIZE;
-                let mut encoder = LzmaWriter::new(
-                    &mut output,
-                    &options,
-                    false,
-                    false,
-                    Some(input.len() as u64),
-                )?;
-                let props = encoder.props();
-                match encoder
-                    .write_all(input)
-                    .and_then(|()| encoder.finish().map(|_| ()))
-                {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::WriteZero => return Ok(None),
-                    Err(error) => return Err(error.into()),
-                }
-                let len = output.position() as usize;
-                // MicroLZMA is raw LZMA1 without an end marker, replacing its
-                // initial zero byte with the complemented properties byte.
-                debug_assert!(len >= 5 && self.scratch[0] == 0);
-                self.scratch[0] = !props;
-                len
+                let encoder = match &mut self.lzma {
+                    Some(encoder) => encoder,
+                    slot @ None => {
+                        let mut options = LzmaOptions::with_preset(1);
+                        options.dict_size = super::encode::LZMA_DICT_SIZE;
+                        slot.insert(Box::new(MicroLzmaEncoder::new(&options)?))
+                    }
+                };
+                self.scratch.resize(self.limit, 0);
+                // Each call resets history and emits a complete MicroLZMA prefix.
+                encoder.compress_prefix(input, &mut self.scratch)?
             }
             #[cfg(feature = "deflate")]
             Compression::Deflate => {
                 use miniz_oxide::deflate::core::{
-                    CompressorOxide, TDEFLFlush, TDEFLStatus, compress,
+                    CompressorOxide, TDEFLStatus, compress_prefix,
                     create_comp_flags_from_zip_params,
                 };
 
@@ -425,13 +422,11 @@ impl Encoder {
                         6, 0, 0,
                     )))
                 });
-                // Reset even after a trial exhausted its output before finishing.
-                encoder.reset();
-                let (status, read, written) =
-                    compress(encoder, input, &mut self.scratch, TDEFLFlush::Finish);
+                // compress_prefix resets history while retaining encoder allocations.
+                let (status, consumed, written) =
+                    compress_prefix(encoder, input, &mut self.scratch);
                 match status {
-                    TDEFLStatus::Done if read == input.len() => written,
-                    TDEFLStatus::Okay => return Ok(None),
+                    TDEFLStatus::Done => (consumed, written),
                     _ => return Err(io::Error::other("DEFLATE encoding failed").into()),
                 }
             }
@@ -447,9 +442,10 @@ impl Encoder {
                 };
                 self.scratch.resize(zrip::compress_bound(input.len()), 0);
                 // Each call starts an independent frame, retaining only allocations.
-                encoder
+                let len = encoder
                     .compress_into(input, &mut self.scratch)
-                    .map_err(io::Error::other)?
+                    .map_err(io::Error::other)?;
+                (input.len(), len)
             }
             _ => {
                 return Err(Error::NotSupported(format!(
@@ -458,11 +454,13 @@ impl Encoder {
                 )));
             }
         };
-        Ok(Some(len))
+        debug_assert!(consumed <= input.len());
+        debug_assert!(written != 0);
+        Ok((consumed, &self.scratch[..written]))
     }
 }
 
-#[cfg(all(test, any(feature = "lz4", feature = "deflate", feature = "zstd")))]
+#[cfg(test)]
 mod test {
     use super::*;
 
@@ -478,21 +476,35 @@ mod test {
             })
             .collect();
         let zeros = vec![0; INPUT_SIZE];
+        let moderate: Vec<_> = random
+            .as_chunks::<512>()
+            .0
+            .iter()
+            .flat_map(|chunk| chunk.iter().chain(chunk))
+            .copied()
+            .take(INPUT_SIZE)
+            .collect();
         let repeated: Vec<_> = random[..1024]
             .iter()
             .copied()
             .cycle()
             .take(INPUT_SIZE)
             .collect();
-        for compression in [Compression::Lz4, Compression::Deflate, Compression::Zstd]
-            .into_iter()
-            .filter(|compression| compression.enabled())
+        for compression in [
+            Compression::Lz4,
+            Compression::Lzma,
+            Compression::Deflate,
+            Compression::Zstd,
+        ]
+        .into_iter()
+        .filter(|compression| compression.enabled())
         {
             let options = Options::default().compression(compression);
             let mut reused = Encoder::new(&options);
-            let mut exhausted = false;
+            let mut partial = false;
             for input in [
                 random.as_slice(),
+                moderate.as_slice(),
                 &repeated[..8192],
                 &repeated[..65535],
                 &random[..32768],
@@ -504,35 +516,47 @@ mod test {
                 &repeated[..16384],
             ] {
                 let mut fresh = Encoder::new(&options);
-                let actual = reused.compress(input).unwrap();
-                assert_eq!(actual, fresh.compress(input).unwrap());
-                let Some(len) = actual else {
-                    exhausted = true;
-                    continue;
-                };
-                let encoded = &reused.scratch[..len];
-                assert_eq!(encoded, &fresh.scratch[..len]);
+                let (used, encoded) = reused.compress(input).unwrap();
+                assert_eq!((used, encoded), fresh.compress(input).unwrap());
+                let len = encoded.len();
+                assert!(used > 0 && used <= input.len());
+                partial |= used < input.len() && len.next_multiple_of(BLOCK_SIZE) < used;
                 match compression {
                     #[cfg(feature = "lz4")]
                     Compression::Lz4 => {
-                        // Preserve the one-shot API's choice of table width as well as bytes.
-                        let mut expected =
-                            vec![0; lz4_flex::block::get_maximum_output_size(input.len())];
-                        let len = lz4_flex::block::compress_into(input, &mut expected).unwrap();
-                        assert_eq!(encoded, &expected[..len]);
-                        let mut decoded = vec![0; input.len()];
+                        let mut decoded = vec![0; used];
                         assert_eq!(
                             lz4_flex::block::decompress_into(encoded, &mut decoded).unwrap(),
-                            input.len()
+                            used
                         );
-                        assert_eq!(decoded, input);
+                        assert_eq!(decoded, input[..used]);
+                    }
+                    #[cfg(feature = "lzma")]
+                    Compression::Lzma => {
+                        use std::io::Read;
+
+                        // MicroLZMA is LZMA1 without an end marker; its always-zero
+                        // first range-coder byte stores the complemented properties.
+                        let mut decoder = lzma_rust2::LzmaReader::new_with_props(
+                            [0].as_slice().chain(&encoded[1..]),
+                            used as u64,
+                            !encoded[0],
+                            super::super::encode::LZMA_DICT_SIZE,
+                            None,
+                        )
+                        .unwrap();
+                        let mut decoded = Vec::new();
+                        decoder.read_to_end(&mut decoded).unwrap();
+                        assert_eq!(decoded, input[..used]);
+                        // Decoding `used` bytes must consume the whole stream.
+                        let (reader, unused) = decoder.into_parts();
+                        assert!(unused.is_empty() && reader.get_ref().1.is_empty());
                     }
                     #[cfg(feature = "deflate")]
                     Compression::Deflate => {
-                        assert_eq!(encoded, miniz_oxide::deflate::compress_to_vec(input, 6));
                         assert_eq!(
                             miniz_oxide::inflate::decompress_to_vec(encoded).unwrap(),
-                            input
+                            input[..used]
                         );
                     }
                     #[cfg(feature = "zstd")]
@@ -546,7 +570,50 @@ mod test {
                     _ => unreachable!(),
                 }
             }
-            assert_eq!(exhausted, compression == Compression::Deflate);
+            assert_eq!(partial, compression.fills_destination());
+        }
+    }
+
+    #[test]
+    fn incomplete_prefixes_are_not_inlined() {
+        let input = vec![42; INPUT_SIZE];
+        for (compression, minimum) in [
+            (Compression::Lz4, 1),
+            (Compression::Lzma, 5),
+            (Compression::Deflate, 2),
+        ]
+        .into_iter()
+        .filter(|(compression, _)| compression.enabled())
+        {
+            let options = Options::default()
+                .compression(compression)
+                .inline_compressed_tails(true);
+            let mut encoder = Encoder::new(&options);
+            let mut node = Node::new(
+                &super::super::Metadata::default(),
+                super::super::encode::Content::File,
+                input.len() as u64,
+            )
+            .unwrap();
+            node.compression = compression;
+            for limit in [minimum, 64] {
+                // Force empty and nonempty partial prefixes that would fit inline.
+                encoder.limit = limit;
+                let (prefix_len, _) = encoder.compress(&input).unwrap();
+                assert_eq!(prefix_len == 0, limit == minimum);
+                assert!(prefix_len < input.len());
+                let mut compressor = Compressor::new(&node, &options);
+                assert!(compressor.inline_capacity > limit);
+                let (consumed, compressed) = compressor
+                    .encode_data(&mut encoder, &input, true, 0)
+                    .unwrap();
+                assert_eq!(consumed, prefix_len.max(BLOCK_SIZE));
+                assert_eq!(compressed, prefix_len > BLOCK_SIZE);
+                assert!(matches!(compressor.placement, Placement::External));
+                if !compressed {
+                    assert_eq!(compressor.data, input[..BLOCK_SIZE]);
+                }
+            }
         }
     }
 
@@ -568,9 +635,8 @@ mod test {
             // Interleave files on the same thread, including different input bytes.
             other.compress(&vec![42; INPUT_SIZE - size]).unwrap();
             let input = &data[..size];
-            let len = compressor.compress(input).unwrap().unwrap();
-            let frame = &compressor.scratch[..len];
-            assert!(compressor.zstd.is_some());
+            let (used, frame) = compressor.compress(input).unwrap();
+            assert_eq!(used, input.len());
             assert_eq!(frame, zrip::compress(input, 1).unwrap());
             let header = zrip::frame::header::parse_frame_header(frame).unwrap();
             assert!(header.content_checksum);
@@ -578,6 +644,7 @@ mod test {
             assert!(header.window_size <= 1 << super::super::encode::ZSTD_WINDOW_LOG);
             assert_eq!(zrip::decompress_with_limit(frame, size).unwrap(), input);
             let mut corrupt = frame.to_vec();
+            assert!(compressor.zstd.is_some());
             *corrupt.last_mut().unwrap() ^= 1;
             assert!(zrip::decompress_with_limit(&corrupt, size).is_err());
         }

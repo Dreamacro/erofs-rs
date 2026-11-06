@@ -47,7 +47,7 @@ pub use sync::Builder;
 /// unprofitable regions stay PLAIN, with compression-index overhead.
 /// Inline compressed tails and fragment packing are separately opt-in.
 /// Working memory is bounded by the input window and codec, not by file size.
-/// LZ4, DEFLATE and Zstd encoder allocations are reused across files until the builder is dropped.
+/// Encoder allocations are reused across files until the builder is dropped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Compression {
     /// Flat data with inline tails where possible.
