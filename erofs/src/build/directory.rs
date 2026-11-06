@@ -2,7 +2,7 @@ use alloc::{format, string::ToString, vec::Vec};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, Metadata as HostMetadata, OpenOptions},
-    io::{self, Read, Seek, Write},
+    io::{self, Seek, Write},
     os::unix::{
         ffi::OsStrExt,
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
@@ -37,10 +37,12 @@ pub(super) struct Source {
 ///
 /// The source tree must remain stable throughout the build. Detectable changes
 /// cause an error, but this is not a snapshot or secure traversal of a concurrently
-/// mutable tree. The root path is resolved once; symlinks within it are not followed.
+/// mutable tree; regular files are checked while read, not afterwards. The root path is
+/// resolved once; symlinks within it are not followed.
 /// Unsupported types or xattr namespaces, oversized attributes and attribute read
 /// failures are errors, never silently discarded. ACL and security values are opaque.
 /// Failed builds remove their incomplete output, reporting cleanup failures as well.
+/// Like `mkfs.erofs`, the output is not synced; call `File::sync_all` for durability.
 ///
 /// ```no_run
 /// # #[cfg(all(feature = "std", unix))]
@@ -89,7 +91,6 @@ impl Options {
                 .create_new(true)
                 .open(&destination)?;
             write_image(&sources, &mut output, self)
-                .and_then(|()| output.sync_all().map_err(Error::from))
         };
         if let Err(error) = result {
             if let Err(cleanup) = fs::remove_file(&destination) {
@@ -120,7 +121,8 @@ pub(super) fn scan(root: &Path) -> Result<Vec<Source>> {
                 fs::read_dir(&sources[index].path)?.collect::<io::Result<Vec<_>>>()?;
             children.sort_by_cached_key(|child| child.file_name());
             for child in children {
-                let metadata = fs::symlink_metadata(child.path())?;
+                // Relative to the open directory; does not follow symlinks.
+                let metadata = child.metadata()?;
                 if metadata.is_dir() && !directories.insert((metadata.dev(), metadata.ino())) {
                     return Err(Error::NotSupported(format!(
                         "directory cycle or alias at {}",
@@ -143,9 +145,10 @@ pub(super) fn scan(root: &Path) -> Result<Vec<Source>> {
 ))]
 fn read_xattrs(path: &Path) -> Result<Xattrs> {
     use super::encode::{MAX_XATTR_SIZE, xattr_entry_size, xattr_name};
-    use rustix::fs::{lgetxattr, llistxattr};
+    use rustix::fs::{lgetxattr, lgetxattr_query, llistxattr, llistxattr_query};
 
-    let len = llistxattr(path, &mut [0u8; 0]).map_err(io::Error::from)?;
+    // rustix 1.1.6+ no longer treats an empty buffer as a size query.
+    let len = llistxattr_query(path).map_err(io::Error::from)?;
     if len == 0 {
         return Ok(Xattrs::new());
     }
@@ -164,7 +167,7 @@ fn read_xattrs(path: &Path) -> Result<Xattrs> {
     let mut size = size_of::<crate::types::XattrHeader>();
     for name in names[..len - 1].split(|&byte| byte == 0) {
         let (_, suffix) = xattr_name(name)?;
-        let len = lgetxattr(path, name, &mut [0u8; 0]).map_err(io::Error::from)?;
+        let len = lgetxattr_query(path, name).map_err(io::Error::from)?;
         size += xattr_entry_size(suffix.len(), len)?;
         if size > MAX_XATTR_SIZE {
             return Err(Error::Overflow("inode xattr size"));
@@ -262,7 +265,6 @@ pub(super) fn write_image(
 ) -> Result<()> {
     let mut links = HashMap::new();
     for source in sources {
-        verify(source, &fs::symlink_metadata(&source.path)?)?;
         if !source.metadata.is_dir() {
             let identity = (source.metadata.dev(), source.metadata.ino());
             let (count, _) = links.entry(identity).or_insert((0u32, None));
@@ -320,14 +322,13 @@ pub(super) fn write_image(
                 .open(&source.path)?;
             verify(source, &file.metadata()?)?;
             builder.append_payload(path, &metadata, Content::File, host.len(), nlink, &mut file)?;
-            if file.read(&mut [0; 1])? != 0 {
-                return Err(io::Error::other("source file grew during image build").into());
-            }
+            // Size and ctime also reveal growth or edits during the read.
             verify(source, &file.metadata()?)?;
         }
         links.get_mut(&identity).unwrap().1 = Some(path.as_bytes().to_vec());
     }
-    for source in sources {
+    // Files were verified around their reads; directory times reveal renames and replacements.
+    for source in sources.iter().filter(|source| !source.metadata.is_file()) {
         verify(source, &fs::symlink_metadata(&source.path)?)?;
     }
     builder.finish()?;
