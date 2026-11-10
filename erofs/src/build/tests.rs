@@ -808,6 +808,29 @@ mod directory {
         ));
         assert!(!output.exists());
     }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apple_provenance_is_skipped_but_other_unsupported_xattrs_are_rejected() {
+        let temp = Temp::new();
+        let root = temp.0.join("root");
+        fs::create_dir(&root).unwrap();
+        let file = root.join("file");
+        fs::write(&file, b"data").unwrap();
+        let output = temp.0.join("image.erofs");
+        from_directory(&root, &output).unwrap();
+        let image = fs::read(&output).unwrap();
+        let image = crate::EroFS::new(SliceImage::new(&image)).unwrap();
+        assert!(image.xattrs("/").unwrap().is_empty());
+        assert!(image.xattrs("file").unwrap().is_empty());
+        fs::remove_file(&output).unwrap();
+        set_xattr(&file, b"com.example.unsupported", b"value");
+        assert!(matches!(
+            from_directory(&root, &output),
+            Err(Error::NotSupported(_))
+        ));
+        assert!(!output.exists());
+    }
 }
 
 mod r#async {

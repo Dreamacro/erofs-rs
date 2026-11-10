@@ -166,6 +166,10 @@ fn read_xattrs(path: &Path) -> Result<Xattrs> {
     let mut attrs = Xattrs::new();
     let mut size = size_of::<crate::types::XattrHeader>();
     for name in names[..len - 1].split(|&byte| byte == 0) {
+        // Kernel-managed; cannot be removed.
+        if cfg!(target_vendor = "apple") && name == b"com.apple.provenance" {
+            continue;
+        }
         let (_, suffix) = xattr_name(name)?;
         let len = lgetxattr_query(path, name).map_err(io::Error::from)?;
         size += xattr_entry_size(suffix.len(), len)?;
