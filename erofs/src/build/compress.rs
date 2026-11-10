@@ -54,18 +54,14 @@ pub(super) struct FittedFile {
 impl FittedFile {
     // A complete short file can fall back to flat storage without rereading
     // input or output. Larger files retain the streaming extent path.
-    pub fn fit(
-        node: &Node,
-        options: &Options,
-        encoder: &mut Encoder,
-        mut input: &[u8],
-    ) -> Result<Self> {
-        let mut fitter = ExtentFitter::new(node, options);
+    pub fn fit(options: &Options, encoder: &mut Encoder, mut input: &[u8]) -> Result<Self> {
+        let mut fitter = ExtentFitter::sized(input.len() as u64, options);
         debug_assert_eq!(fitter.position, 0);
         debug_assert_eq!(input.len() as u64, fitter.file_size);
         debug_assert!(
             input.len() <= INPUT_SIZE && fitter.inline_capacity == 0 && !fitter.fragments
         );
+        debug_assert!(!options.inline_compressed_tails);
         let mut file = Self {
             data: Vec::with_capacity(input.len().next_multiple_of(BLOCK_SIZE)),
             extents: Vec::new(),
@@ -150,17 +146,24 @@ struct ExtentFitter {
 impl ExtentFitter {
     fn new(node: &Node, options: &Options) -> Self {
         Self {
-            data: Vec::new(),
-            placement: Placement::External,
             inline_capacity: if options.inline_compressed_tails {
                 ((BLOCK_SIZE as u64 - node.index_end() % BLOCK_SIZE as u64) % BLOCK_SIZE as u64)
                     as usize
             } else {
                 0
             },
+            ..Self::sized(node.size, options)
+        }
+    }
+
+    fn sized(file_size: u64, options: &Options) -> Self {
+        Self {
+            data: Vec::new(),
+            placement: Placement::External,
+            inline_capacity: 0,
             fragments: options.fragments,
             position: 0,
-            file_size: node.size,
+            file_size,
             hint: 4 * BLOCK_SIZE,
         }
     }
@@ -753,7 +756,7 @@ mod test {
                         }
                         multiple_extents |= extents > 1;
 
-                        let fitted = FittedFile::fit(&node, &options, &mut reused, input).unwrap();
+                        let fitted = FittedFile::fit(&options, &mut reused, input).unwrap();
                         assert_eq!(fitted.extents.len(), extents);
                         let actual = fitted.into_buffered(&node, block);
                         assert_eq!(actual.data, data);

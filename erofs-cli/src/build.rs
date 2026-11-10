@@ -50,6 +50,9 @@ pub struct BuildArgs {
     /// Fail on host xattrs outside EROFS namespaces instead of skipping them.
     #[arg(long)]
     reject_unsupported_xattrs: bool,
+    /// Compression threads for short files; the image is identical for any count.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    workers: u16,
 }
 
 pub fn build(args: BuildArgs) -> Result<()> {
@@ -74,6 +77,7 @@ pub fn build(args: BuildArgs) -> Result<()> {
         .shared_xattrs(args.shared_xattrs)
         .xattr_prefixes(args.xattr_prefixes)
         .skip_unsupported_xattrs(!args.reject_unsupported_xattrs)
+        .workers(args.workers.into())
         .build_from_directory(args.source, args.output)
         .context("failed to build EROFS image")
 }

@@ -8,11 +8,29 @@ use std::{
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
+    thread,
+};
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+use std::{
+    io::Read,
+    sync::{Arc, Condvar, Mutex, mpsc},
 };
 
 use rustix::fs::OFlags;
 use typed_path::UnixPath;
 
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+use super::compress::{Encoder, FittedFile};
 use super::{Metadata, Options, SpecialFile, encode::Content, symlink_target};
 use crate::{Error, Result, Xattrs};
 
@@ -280,6 +298,29 @@ pub(super) fn write_image(
     output: &mut (impl Write + Seek),
     options: Options,
 ) -> Result<()> {
+    thread::scope(|scope| append_sources(scope, sources, output, options))
+}
+
+fn append_sources<'scope, 'env>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    sources: &'env [Source],
+    output: &mut (impl Write + Seek),
+    options: Options,
+) -> Result<()> {
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    let mut prefetch = Prefetch::start(scope, sources, options);
+    #[cfg(not(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    )))]
+    let _ = scope;
     let mut links = HashMap::new();
     for source in sources {
         if !source.metadata.is_dir() {
@@ -333,10 +374,19 @@ pub(super) fn write_image(
         } else if let Some(kind) = special_file(host) {
             builder.append_payload(path, &metadata, Content::Special(kind), 0, nlink, &[][..])?;
         } else {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .custom_flags((OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32)
-                .open(&source.path)?;
+            #[cfg(any(
+                feature = "lz4",
+                feature = "lzma",
+                feature = "deflate",
+                feature = "zstd"
+            ))]
+            if let Some(prepared) = prefetch.take(source) {
+                let Prepared { input, fitted } = prepared?;
+                builder.append_fitted(path, &metadata, nlink, &input, fitted)?;
+                links.get_mut(&identity).unwrap().1 = Some(path.as_bytes().to_vec());
+                continue;
+            }
+            let mut file = open_file(&source.path)?;
             verify(source, &file.metadata()?)?;
             builder.append_payload(path, &metadata, Content::File, host.len(), nlink, &mut file)?;
             // Size and ctime also reveal growth or edits during the read.
@@ -350,4 +400,196 @@ pub(super) fn write_image(
     }
     builder.finish()?;
     Ok(())
+}
+
+fn open_file(path: &Path) -> io::Result<fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32)
+        .open(path)
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+struct Prepared {
+    input: Vec<u8>,
+    fitted: FittedFile,
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+fn prepare(source: &Source, options: &Options, encoder: &mut Encoder) -> Result<Prepared> {
+    let mut file = open_file(&source.path)?;
+    verify(source, &file.metadata()?)?;
+    let mut input = vec![0; source.metadata.len() as usize];
+    file.read_exact(&mut input)?;
+    verify(source, &file.metadata()?)?;
+    let fitted = FittedFile::fit(options, encoder, &input)?;
+    Ok(Prepared { input, fitted })
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+#[derive(Default)]
+struct Window {
+    state: Mutex<WindowState>,
+    changed: Condvar,
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+#[derive(Default)]
+struct WindowState {
+    claimed: usize,
+    consumed: usize,
+    closed: bool,
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+impl Window {
+    fn claim(&self, jobs: usize, capacity: usize) -> Option<usize> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if state.closed || state.claimed == jobs {
+                return None;
+            }
+            if state.claimed < state.consumed + capacity {
+                state.claimed += 1;
+                return Some(state.claimed - 1);
+            }
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn update(&self, change: impl FnOnce(&mut WindowState)) {
+        change(&mut self.state.lock().unwrap());
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+struct Prefetch<'env> {
+    sources: &'env [Source],
+    jobs: Arc<[usize]>,
+    next: usize,
+    window: Arc<Window>,
+    results: mpsc::Receiver<(usize, Result<Prepared>)>,
+    ready: HashMap<usize, Result<Prepared>>,
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+impl<'env> Prefetch<'env> {
+    fn start<'scope>(
+        scope: &'scope thread::Scope<'scope, 'env>,
+        sources: &'env [Source],
+        options: Options,
+    ) -> Self {
+        let jobs: Arc<[usize]> = if options.workers > 1 {
+            let mut seen = HashSet::new();
+            sources
+                .iter()
+                .enumerate()
+                .filter(|(_, source)| {
+                    let host = &source.metadata;
+                    host.is_file()
+                        && seen.insert((host.dev(), host.ino()))
+                        && options.buffers_file(host.len())
+                })
+                .map(|(index, _)| index)
+                .collect()
+        } else {
+            Arc::new([])
+        };
+        let window = Arc::new(Window::default());
+        let (sender, results) = mpsc::channel();
+        let capacity = options.workers.saturating_mul(8);
+        for _ in 0..options.workers.min(jobs.len()) {
+            let (jobs, window, sender) = (Arc::clone(&jobs), Arc::clone(&window), sender.clone());
+            scope.spawn(move || {
+                let mut encoder = Encoder::new(&options);
+                while let Some(job) = window.claim(jobs.len(), capacity) {
+                    let result = prepare(&sources[jobs[job]], &options, &mut encoder);
+                    if sender.send((job, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        Self {
+            sources,
+            jobs,
+            next: 0,
+            window,
+            results,
+            ready: HashMap::new(),
+        }
+    }
+
+    fn take(&mut self, source: &Source) -> Option<Result<Prepared>> {
+        if !self
+            .jobs
+            .get(self.next)
+            .is_some_and(|&job| core::ptr::eq(&self.sources[job], source))
+        {
+            return None;
+        }
+        let job = self.next;
+        let result = loop {
+            if let Some(result) = self.ready.remove(&job) {
+                break result;
+            }
+            match self.results.recv() {
+                Ok((done, result)) => {
+                    self.ready.insert(done, result);
+                }
+                Err(_) => break Err(io::Error::other("compression worker stopped").into()),
+            }
+        };
+        self.next += 1;
+        self.window.update(|state| state.consumed = self.next);
+        Some(result)
+    }
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+impl Drop for Prefetch<'_> {
+    fn drop(&mut self) {
+        self.window.update(|state| state.closed = true);
+    }
 }

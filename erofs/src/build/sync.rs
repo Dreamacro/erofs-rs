@@ -238,11 +238,7 @@ impl<W: Write + Seek> Builder<W> {
             let mut input = vec![0; size];
             data.read_exact(&mut input)?;
             let encoded = self.state.buffer_file(&mut entry, &input)?;
-            self.prepare_metadata(&entry.node)?;
-            if let Some(encoded) = encoded {
-                return self.append_buffered(entry, encoded);
-            }
-            return self.append_flat(entry, &mut input.as_slice());
+            return self.append_encoded(entry, encoded, &input);
         }
         self.prepare_metadata(&entry.node)?;
         #[cfg(any(
@@ -255,6 +251,50 @@ impl<W: Write + Seek> Builder<W> {
             return self.append_compressed(entry, &mut data);
         }
         self.append_flat(entry, &mut data)
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    pub(super) fn append_fitted(
+        &mut self,
+        path: &UnixPath,
+        metadata: &Metadata,
+        nlink: u32,
+        input: &[u8],
+        fitted: super::compress::FittedFile,
+    ) -> Result<()> {
+        let mut entry =
+            self.state
+                .prepare_payload(path, metadata, Content::File, input.len() as u64, nlink)?;
+        debug_assert_eq!(
+            self.state.buffered_file_size(&entry.node),
+            Some(input.len())
+        );
+        let encoded = self.state.place_fitted(&mut entry, fitted)?;
+        self.append_encoded(entry, encoded, input)
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    fn append_encoded(
+        &mut self,
+        entry: super::PendingEntry,
+        encoded: Option<super::compress::BufferedFile>,
+        input: &[u8],
+    ) -> Result<()> {
+        self.prepare_metadata(&entry.node)?;
+        if let Some(encoded) = encoded {
+            return self.append_buffered(entry, encoded);
+        }
+        self.append_flat(entry, &mut &input[..])
     }
 
     fn append_flat(&mut self, entry: super::PendingEntry, data: &mut impl Read) -> Result<()> {
