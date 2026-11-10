@@ -39,72 +39,77 @@ pub(super) struct EncodedExtent<'a> {
     pub placement: Placement,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct FittedExtent {
+    pub consumed: usize,
+    pub compressed: bool,
+    pub blocks: u32,
+}
+
+pub(super) struct FittedFile {
+    pub data: Vec<u8>,
+    extents: Vec<FittedExtent>,
+}
+
+impl FittedFile {
+    // A complete short file can fall back to flat storage without rereading
+    // input or output. Larger files retain the streaming extent path.
+    pub fn fit(
+        node: &Node,
+        options: &Options,
+        encoder: &mut Encoder,
+        mut input: &[u8],
+    ) -> Result<Self> {
+        let mut fitter = ExtentFitter::new(node, options);
+        debug_assert_eq!(fitter.position, 0);
+        debug_assert_eq!(input.len() as u64, fitter.file_size);
+        debug_assert!(
+            input.len() <= INPUT_SIZE && fitter.inline_capacity == 0 && !fitter.fragments
+        );
+        let mut file = Self {
+            data: Vec::with_capacity(input.len().next_multiple_of(BLOCK_SIZE)),
+            extents: Vec::new(),
+        };
+        while !input.is_empty() {
+            let extent = fitter.fit(encoder, input, 0)?;
+            file.data.extend_from_slice(&fitter.data);
+            file.extents.push(extent);
+            input = &input[extent.consumed..];
+        }
+        Ok(file)
+    }
+
+    pub fn into_buffered(self, node: &Node, mut block: u32) -> BufferedFile {
+        debug_assert_eq!(
+            self.extents
+                .iter()
+                .map(|extent| extent.consumed as u64)
+                .sum::<u64>(),
+            node.size
+        );
+        let mut indexes = IndexWriter::new(node);
+        for extent in &self.extents {
+            indexes.push(*extent, block);
+            block += extent.blocks;
+        }
+        BufferedFile {
+            data: self.data,
+            indexes: indexes.indexes,
+        }
+    }
+}
+
 pub(super) struct Compressor {
-    data: Vec<u8>,
-    placement: Placement,
-    inline_capacity: usize,
-    big_pcluster: bool,
-    fragments: bool,
-    // A completed pending pack plus this extent's Compact entries.
-    indexes: Vec<u8>,
-    pack: [u8; 32],
-    pack_len: usize,
-    next_index: u64,
-    index_count: u64,
-    position: u64,
-    file_size: u64,
-    hint: usize,
-    two_byte_indexes: core::ops::Range<u64>,
+    fitter: ExtentFitter,
+    indexes: IndexWriter,
 }
 
 impl Compressor {
     pub fn new(node: &Node, options: &Options) -> Self {
         Self {
-            data: Vec::new(),
-            placement: Placement::External,
-            inline_capacity: if options.inline_compressed_tails {
-                ((BLOCK_SIZE as u64 - node.index_end() % BLOCK_SIZE as u64) % BLOCK_SIZE as u64)
-                    as usize
-            } else {
-                0
-            },
-            big_pcluster: node.big_pcluster,
-            fragments: options.fragments,
-            indexes: Vec::with_capacity(32 + INPUT_SIZE / BLOCK_SIZE * 4),
-            pack: [0; 32],
-            pack_len: 0,
-            next_index: 0,
-            index_count: node.size.div_ceil(BLOCK_SIZE as u64),
-            position: 0,
-            file_size: node.size,
-            hint: 4 * BLOCK_SIZE,
-            two_byte_indexes: node.two_byte_indexes(),
+            fitter: ExtentFitter::new(node, options),
+            indexes: IndexWriter::new(node),
         }
-    }
-
-    // A complete short file can fall back to flat storage without rereading
-    // input or output. Larger files retain the streaming extent path.
-    pub fn encode_file(
-        mut self,
-        encoder: &mut Encoder,
-        mut input: &[u8],
-        mut block: u32,
-    ) -> Result<BufferedFile> {
-        debug_assert_eq!(self.position, 0);
-        debug_assert_eq!(input.len() as u64, self.file_size);
-        debug_assert!(input.len() <= INPUT_SIZE && self.inline_capacity == 0 && !self.fragments);
-        let mut file = BufferedFile {
-            data: Vec::with_capacity(input.len().next_multiple_of(BLOCK_SIZE)),
-            indexes: Vec::new(),
-        };
-        while !input.is_empty() {
-            let extent = self.encode(encoder, input, block, 0)?;
-            file.data.extend_from_slice(extent.data);
-            file.indexes.extend_from_slice(extent.indexes);
-            block += (extent.data.len() / BLOCK_SIZE) as u32;
-            input = &input[extent.consumed..];
-        }
-        Ok(file)
     }
 
     /// Consumes a byte-granular prefix. Complete Compact packs stream out;
@@ -116,22 +121,71 @@ impl Compressor {
         block: u32,
         fragment_offset: u64,
     ) -> Result<EncodedExtent<'_>> {
-        debug_assert!(!input.is_empty() && input.len() <= INPUT_SIZE);
-        let final_input = self.position + input.len() as u64 == self.file_size;
-        self.indexes.clear();
-        let (consumed, compressed) =
-            self.encode_data(encoder, input, final_input, fragment_offset)?;
-        self.write_indexes(consumed, compressed, block);
+        self.indexes.indexes.clear();
+        let extent = self.fitter.fit(encoder, input, fragment_offset)?;
+        self.indexes.push(extent, block);
         Ok(EncodedExtent {
-            consumed,
-            data: &self.data,
-            indexes: &self.indexes,
-            placement: self.placement,
+            consumed: extent.consumed,
+            data: &self.fitter.data,
+            indexes: &self.indexes.indexes,
+            placement: self.fitter.placement,
         })
     }
 
     pub fn inline_tail(&self) -> Option<&[u8]> {
-        (self.placement == Placement::Inline).then_some(self.data.as_slice())
+        (self.fitter.placement == Placement::Inline).then_some(self.fitter.data.as_slice())
+    }
+}
+
+struct ExtentFitter {
+    data: Vec<u8>,
+    placement: Placement,
+    inline_capacity: usize,
+    fragments: bool,
+    position: u64,
+    file_size: u64,
+    hint: usize,
+}
+
+impl ExtentFitter {
+    fn new(node: &Node, options: &Options) -> Self {
+        Self {
+            data: Vec::new(),
+            placement: Placement::External,
+            inline_capacity: if options.inline_compressed_tails {
+                ((BLOCK_SIZE as u64 - node.index_end() % BLOCK_SIZE as u64) % BLOCK_SIZE as u64)
+                    as usize
+            } else {
+                0
+            },
+            fragments: options.fragments,
+            position: 0,
+            file_size: node.size,
+            hint: 4 * BLOCK_SIZE,
+        }
+    }
+
+    fn fit(
+        &mut self,
+        encoder: &mut Encoder,
+        input: &[u8],
+        fragment_offset: u64,
+    ) -> Result<FittedExtent> {
+        debug_assert!(!input.is_empty() && input.len() <= INPUT_SIZE);
+        let final_input = self.position + input.len() as u64 == self.file_size;
+        let (consumed, compressed) =
+            self.encode_data(encoder, input, final_input, fragment_offset)?;
+        self.position += consumed as u64;
+        let blocks = if self.placement == Placement::Fragment {
+            0
+        } else {
+            self.data.len().div_ceil(BLOCK_SIZE) as u32
+        };
+        Ok(FittedExtent {
+            consumed,
+            compressed,
+            blocks,
+        })
     }
 
     fn encode_data(
@@ -254,16 +308,45 @@ impl Compressor {
         self.data.resize(BLOCK_SIZE, 0);
         Ok((consumed, false))
     }
+}
 
-    fn write_indexes(&mut self, consumed: usize, compressed: bool, block: u32) {
+struct IndexWriter {
+    // A completed pending pack plus this extent's Compact entries.
+    indexes: Vec<u8>,
+    pack: [u8; 32],
+    pack_len: usize,
+    next_index: u64,
+    index_count: u64,
+    position: u64,
+    file_size: u64,
+    big_pcluster: bool,
+    two_byte_indexes: core::ops::Range<u64>,
+}
+
+impl IndexWriter {
+    fn new(node: &Node) -> Self {
+        Self {
+            indexes: Vec::with_capacity(32 + INPUT_SIZE / BLOCK_SIZE * 4),
+            pack: [0; 32],
+            pack_len: 0,
+            next_index: 0,
+            index_count: node.size.div_ceil(BLOCK_SIZE as u64),
+            position: 0,
+            file_size: node.size,
+            big_pcluster: node.big_pcluster,
+            two_byte_indexes: node.two_byte_indexes(),
+        }
+    }
+
+    fn push(&mut self, extent: FittedExtent, block: u32) {
+        let FittedExtent {
+            consumed,
+            compressed,
+            blocks,
+        } = extent;
         let offset = (self.position % BLOCK_SIZE as u64) as usize;
         let whole = (offset + consumed) / BLOCK_SIZE;
         let count = whole.max(1);
-        let blocks = if self.placement == Placement::Fragment {
-            0
-        } else {
-            self.data.len().div_ceil(BLOCK_SIZE) as u32
-        };
         for index in 0..count {
             // A pack starting in NONHEADs predicts the current extent, or the
             // following physical block after a big-pcluster count entry.
@@ -602,19 +685,84 @@ mod test {
                 let (prefix_len, _) = encoder.compress(&input).unwrap();
                 assert_eq!(prefix_len == 0, limit == minimum);
                 assert!(prefix_len < input.len());
-                let mut compressor = Compressor::new(&node, &options);
-                assert!(compressor.inline_capacity > limit);
-                let (consumed, compressed) = compressor
-                    .encode_data(&mut encoder, &input, true, 0)
-                    .unwrap();
+                let mut fitter = ExtentFitter::new(&node, &options);
+                assert!(fitter.inline_capacity > limit);
+                let (consumed, compressed) =
+                    fitter.encode_data(&mut encoder, &input, true, 0).unwrap();
                 assert_eq!(consumed, prefix_len.max(BLOCK_SIZE));
                 assert_eq!(compressed, prefix_len > BLOCK_SIZE);
-                assert!(matches!(compressor.placement, Placement::External));
+                assert!(matches!(fitter.placement, Placement::External));
                 if !compressed {
-                    assert_eq!(compressor.data, input[..BLOCK_SIZE]);
+                    assert_eq!(fitter.data, input[..BLOCK_SIZE]);
                 }
             }
         }
+    }
+
+    #[test]
+    fn fitted_files_match_streaming_extents_at_any_block() {
+        use super::super::{Metadata, encode::Content};
+
+        let mut seed = 11u32;
+        let data: Vec<_> = (0..INPUT_SIZE)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                if i % 5000 < 2500 {
+                    seed as u8
+                } else {
+                    (i / 7) as u8
+                }
+            })
+            .collect();
+        let mut multiple_extents = false;
+        for compression in [
+            Compression::Lz4,
+            Compression::Lzma,
+            Compression::Deflate,
+            Compression::Zstd,
+        ]
+        .into_iter()
+        .filter(|compression| compression.enabled())
+        {
+            for cluster in [4096, 16384] {
+                let options = Options::default()
+                    .compression(compression)
+                    .pcluster_size(cluster);
+                let mut reused = Encoder::new(&options);
+                for size in [4097, 12_345, 40_000, INPUT_SIZE] {
+                    let input = &data[INPUT_SIZE - size..];
+                    let mut node =
+                        Node::new(&Metadata::default(), Content::File, size as u64).unwrap();
+                    node.select_format(&options, 1).unwrap();
+                    node.compression = compression;
+                    node.big_pcluster = cluster > 4096;
+                    for block in [1, 77, 4096] {
+                        let mut compressor = Compressor::new(&node, &options);
+                        let mut fresh = Encoder::new(&options);
+                        let (mut data, mut indexes) = (Vec::new(), Vec::new());
+                        let (mut rest, mut at, mut extents) = (input, block, 0);
+                        while !rest.is_empty() {
+                            let extent = compressor.encode(&mut fresh, rest, at, 0).unwrap();
+                            data.extend_from_slice(extent.data);
+                            indexes.extend_from_slice(extent.indexes);
+                            at += (extent.data.len() / BLOCK_SIZE) as u32;
+                            rest = &rest[extent.consumed..];
+                            extents += 1;
+                        }
+                        multiple_extents |= extents > 1;
+
+                        let fitted = FittedFile::fit(&node, &options, &mut reused, input).unwrap();
+                        assert_eq!(fitted.extents.len(), extents);
+                        let actual = fitted.into_buffered(&node, block);
+                        assert_eq!(actual.data, data);
+                        assert_eq!(actual.indexes, indexes);
+                    }
+                }
+            }
+        }
+        assert!(multiple_extents);
     }
 
     #[cfg(feature = "zstd")]

@@ -606,19 +606,16 @@ impl State {
         entry: &mut PendingEntry,
         input: &[u8],
     ) -> Result<Option<compress::BufferedFile>> {
-        let encoded = compress::Compressor::new(&entry.node, &self.options).encode_file(
-            &mut self.encoder,
-            input,
-            entry.next_block,
-        )?;
+        let fitted =
+            compress::FittedFile::fit(&entry.node, &self.options, &mut self.encoder, input)?;
         let node = &entry.node;
         let inline = node.flat_inline_size();
         let flat_cost = (node.size - inline as u64).next_multiple_of(BLOCK_SIZE as u64)
             + (node.inode_size() + node.xattr_size + inline).next_multiple_of(INODE_SLOT_SIZE)
                 as u64;
-        let compressed_cost = encoded.data.len() as u64 + node.record_size();
+        let compressed_cost = fitted.data.len() as u64 + node.record_size();
         if compressed_cost < flat_cost {
-            return Ok(Some(encoded));
+            return Ok(Some(fitted.into_buffered(node, entry.next_block)));
         }
         // Neither layout owns a slot until commit, so fallback needs no rollback.
         entry.node.compression = Compression::None;
