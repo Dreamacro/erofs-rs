@@ -47,6 +47,9 @@ pub struct BuildArgs {
     /// Deduplicate long xattr name prefixes (up to 128 prefixes).
     #[arg(long)]
     xattr_prefixes: bool,
+    /// Fail on host xattrs outside EROFS namespaces instead of skipping them.
+    #[arg(long)]
+    reject_unsupported_xattrs: bool,
 }
 
 pub fn build(args: BuildArgs) -> Result<()> {
@@ -70,6 +73,7 @@ pub fn build(args: BuildArgs) -> Result<()> {
         .fragments(args.fragments)
         .shared_xattrs(args.shared_xattrs)
         .xattr_prefixes(args.xattr_prefixes)
+        .skip_unsupported_xattrs(!args.reject_unsupported_xattrs)
         .build_from_directory(args.source, args.output)
         .context("failed to build EROFS image")
 }

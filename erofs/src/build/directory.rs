@@ -39,8 +39,9 @@ pub(super) struct Source {
 /// cause an error, but this is not a snapshot or secure traversal of a concurrently
 /// mutable tree; regular files are checked while read, not afterwards. The root path is
 /// resolved once; symlinks within it are not followed.
-/// Unsupported types or xattr namespaces, oversized attributes and attribute read
-/// failures are errors, never silently discarded. ACL and security values are opaque.
+/// Unsupported types, oversized attributes and attribute read failures are errors.
+/// Xattrs outside EROFS namespaces are skipped unless
+/// [`Options::skip_unsupported_xattrs`] is disabled. ACL and security values are opaque.
 /// Failed builds remove their incomplete output, reporting cleanup failures as well.
 /// Like `mkfs.erofs`, the output is not synced; call `File::sync_all` for durability.
 ///
@@ -84,7 +85,7 @@ impl Options {
             )
             .into());
         }
-        let sources = scan(&source)?;
+        let sources = scan(&source, self)?;
         let result = {
             let mut output = OpenOptions::new()
                 .write(true)
@@ -106,13 +107,13 @@ impl Options {
     }
 }
 
-pub(super) fn scan(root: &Path) -> Result<Vec<Source>> {
+pub(super) fn scan(root: &Path, options: Options) -> Result<Vec<Source>> {
     let metadata = fs::symlink_metadata(root)?;
     if !metadata.is_dir() {
         return Err(Error::NotADirectory(root.display().to_string()));
     }
     let mut directories = HashSet::from([(metadata.dev(), metadata.ino())]);
-    let mut sources = vec![new_source(root.to_path_buf(), metadata)?];
+    let mut sources = vec![new_source(root.to_path_buf(), metadata, options)?];
     // Iterate the growing list instead of recursing on host directory depth.
     let mut index = 0;
     while index < sources.len() {
@@ -129,7 +130,7 @@ pub(super) fn scan(root: &Path) -> Result<Vec<Source>> {
                         child.path().display()
                     )));
                 }
-                sources.push(new_source(child.path(), metadata)?);
+                sources.push(new_source(child.path(), metadata, options)?);
             }
         }
         index += 1;
@@ -143,8 +144,8 @@ pub(super) fn scan(root: &Path) -> Result<Vec<Source>> {
     target_vendor = "apple",
     target_os = "hurd"
 ))]
-fn read_xattrs(path: &Path) -> Result<Xattrs> {
-    use super::encode::{MAX_XATTR_SIZE, xattr_entry_size, xattr_name};
+fn read_xattrs(path: &Path, skip_unsupported: bool) -> Result<Xattrs> {
+    use super::encode::{MAX_XATTR_SIZE, xattr_entry_size};
     use rustix::fs::{lgetxattr, lgetxattr_query, llistxattr, llistxattr_query};
 
     // rustix 1.1.6+ no longer treats an empty buffer as a size query.
@@ -166,11 +167,9 @@ fn read_xattrs(path: &Path) -> Result<Xattrs> {
     let mut attrs = Xattrs::new();
     let mut size = size_of::<crate::types::XattrHeader>();
     for name in names[..len - 1].split(|&byte| byte == 0) {
-        // Kernel-managed; cannot be removed.
-        if cfg!(target_vendor = "apple") && name == b"com.apple.provenance" {
+        let Some(suffix) = importable_suffix(name, skip_unsupported)? else {
             continue;
-        }
-        let (_, suffix) = xattr_name(name)?;
+        };
         let len = lgetxattr_query(path, name).map_err(io::Error::from)?;
         size += xattr_entry_size(suffix.len(), len)?;
         if size > MAX_XATTR_SIZE {
@@ -185,13 +184,27 @@ fn read_xattrs(path: &Path) -> Result<Xattrs> {
     Ok(attrs)
 }
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "hurd"
+))]
+pub(super) fn importable_suffix(name: &[u8], skip_unsupported: bool) -> Result<Option<&[u8]>> {
+    match super::encode::xattr_name(name) {
+        Ok((_, suffix)) => Ok(Some(suffix)),
+        Err(Error::NotSupported(_)) if skip_unsupported => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(not(any(
     target_os = "linux",
     target_os = "android",
     target_vendor = "apple",
     target_os = "hurd"
 )))]
-fn read_xattrs(_path: &Path) -> Result<Xattrs> {
+fn read_xattrs(_path: &Path, _skip_unsupported: bool) -> Result<Xattrs> {
     Err(Error::NotSupported(
         "directory import without xattr enumeration on this platform".into(),
     ))
@@ -214,7 +227,7 @@ fn special_file(metadata: &HostMetadata) -> Option<SpecialFile> {
     }
 }
 
-fn new_source(path: PathBuf, metadata: HostMetadata) -> Result<Source> {
+fn new_source(path: PathBuf, metadata: HostMetadata, options: Options) -> Result<Source> {
     if let Some(kind) = special_file(&metadata) {
         kind.validate()?;
     } else if !metadata.is_dir() && !metadata.is_file() && !metadata.is_symlink() {
@@ -223,7 +236,7 @@ fn new_source(path: PathBuf, metadata: HostMetadata) -> Result<Source> {
             path.display()
         )));
     }
-    let has_xattrs = !read_xattrs(&path)?.is_empty();
+    let has_xattrs = !read_xattrs(&path, options.skip_unsupported_xattrs)?.is_empty();
     if !(0..1_000_000_000).contains(&metadata.mtime_nsec()) || metadata.mode() > u32::from(u16::MAX)
     {
         return Err(Error::NotSupported(format!(
@@ -296,7 +309,7 @@ pub(super) fn write_image(
             gid: host.gid(),
             modified: (host.mtime(), host.mtime_nsec() as u32),
             xattrs: if source.has_xattrs {
-                read_xattrs(&source.path)?
+                read_xattrs(&source.path, options.skip_unsupported_xattrs)?
             } else {
                 Xattrs::new()
             },

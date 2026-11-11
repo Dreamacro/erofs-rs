@@ -467,7 +467,7 @@ fn inline_tails_pack_metadata_and_preserve_boundaries() {
     target_os = "hurd"
 ))]
 mod directory {
-    use super::super::directory::{from_directory, scan, write_image};
+    use super::super::directory::{from_directory, importable_suffix, scan, write_image};
     use super::*;
     use crate::types::Layout;
     use core::sync::atomic::Ordering::Relaxed;
@@ -675,7 +675,7 @@ mod directory {
                 inode.modified_unix() => (metadata.mtime(), metadata.mtime_nsec() as u32);
             }
         }
-        let sources = scan(&root).unwrap();
+        let sources = scan(&root, Options::default()).unwrap();
         fs::remove_file(&fifo).unwrap();
         fs::write(&fifo, []).unwrap();
         assert!(write_image(&sources, &mut Cursor::new(Vec::new()), Options::default()).is_err());
@@ -729,7 +729,7 @@ mod directory {
             fs.super_block().root_inode_id(),
             (encode::ROOT_OFFSET / 32) as u64
         );
-        let sources = scan(&root).unwrap();
+        let sources = scan(&root, Options::default()).unwrap();
         set_xattr(&file, b"user.empty", b"changed");
         assert!(write_image(&sources, &mut Cursor::new(Vec::new()), Options::default()).is_err());
     }
@@ -795,10 +795,10 @@ mod directory {
         let image = crate::EroFS::new(SliceImage::new(&image)).unwrap();
         assert_eq_all!(image.xattrs("file").unwrap().get(b"user.key".as_slice()).unwrap() => b"value");
         fs::remove_file(&output).unwrap();
-        let sources = scan(&root).unwrap();
+        let sources = scan(&root, Options::default()).unwrap();
         rustix::fs::removexattr(&file, "user.key").unwrap();
         assert!(write_image(&sources, &mut Cursor::new(Vec::new()), Options::default()).is_err());
-        let sources = scan(&root).unwrap();
+        let sources = scan(&root, Options::default()).unwrap();
         fs::write(&file, b"changed length").unwrap();
         assert!(write_image(&sources, &mut Cursor::new(Vec::new()), Options::default()).is_err());
         let _socket = UnixListener::bind(root.join("socket")).unwrap();
@@ -809,24 +809,56 @@ mod directory {
         assert!(!output.exists());
     }
 
+    #[test]
+    fn importable_suffix_skips_only_unsupported_names() {
+        for skip in [true, false] {
+            assert_eq!(
+                importable_suffix(b"user.key", skip).unwrap(),
+                Some(&b"key"[..])
+            );
+            assert_eq!(
+                importable_suffix(b"system.posix_acl_access", skip).unwrap(),
+                Some(&b""[..])
+            );
+            for name in [&b"com.apple.provenance"[..], b"system.nfs4_acl"] {
+                let result = importable_suffix(name, skip);
+                if skip {
+                    assert!(matches!(result, Ok(None)));
+                } else {
+                    assert!(matches!(result, Err(Error::NotSupported(_))));
+                }
+            }
+            for name in [&b""[..], b"user.", b"user.a\0b", &[b'u'; 256]] {
+                assert!(matches!(importable_suffix(name, skip),
+                    Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidInput));
+            }
+        }
+    }
+
     #[cfg(target_vendor = "apple")]
     #[test]
-    fn apple_provenance_is_skipped_but_other_unsupported_xattrs_are_rejected() {
+    fn unsupported_host_xattrs_are_skipped_unless_rejected() {
         let temp = Temp::new();
         let root = temp.0.join("root");
         fs::create_dir(&root).unwrap();
         let file = root.join("file");
         fs::write(&file, b"data").unwrap();
+        set_xattr(&file, b"user.key", b"value");
+        set_xattr(&file, b"com.example.unsupported", b"value");
         let output = temp.0.join("image.erofs");
         from_directory(&root, &output).unwrap();
         let image = fs::read(&output).unwrap();
         let image = crate::EroFS::new(SliceImage::new(&image)).unwrap();
         assert!(image.xattrs("/").unwrap().is_empty());
-        assert!(image.xattrs("file").unwrap().is_empty());
+        assert_eq!(
+            image.xattrs("file").unwrap(),
+            xattrs([(b"user.key", b"value")])
+        );
         fs::remove_file(&output).unwrap();
-        set_xattr(&file, b"com.example.unsupported", b"value");
         assert!(matches!(
-            from_directory(&root, &output),
+            Options::default()
+                .skip_unsupported_xattrs(false)
+                .build_from_directory(&root, &output),
             Err(Error::NotSupported(_))
         ));
         assert!(!output.exists());
