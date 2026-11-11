@@ -141,6 +141,7 @@ pub struct Options {
     fragments: bool,
     shared_xattrs: bool,
     xattr_prefixes: bool,
+    skip_unsupported_xattrs: bool,
 }
 
 impl Default for Options {
@@ -155,6 +156,7 @@ impl Default for Options {
             fragments: false,
             shared_xattrs: false,
             xattr_prefixes: false,
+            skip_unsupported_xattrs: true,
         }
     }
 }
@@ -222,6 +224,13 @@ impl Options {
     /// otherwise its primary-image address must start below 16 GiB.
     pub fn xattr_prefixes(mut self, enabled: bool) -> Self {
         self.xattr_prefixes = enabled;
+        self
+    }
+
+    /// Skip host xattrs outside EROFS namespaces during directory import.
+    /// Defaults to true; malformed or oversized attributes still fail.
+    pub fn skip_unsupported_xattrs(mut self, enabled: bool) -> Self {
+        self.skip_unsupported_xattrs = enabled;
         self
     }
 
