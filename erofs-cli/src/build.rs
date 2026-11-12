@@ -50,7 +50,7 @@ pub struct BuildArgs {
     /// Fail on host xattrs outside EROFS namespaces instead of skipping them.
     #[arg(long)]
     reject_unsupported_xattrs: bool,
-    /// Compression threads for short files; the image is identical for any count.
+    /// Compression threads; the image is identical for any count.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     workers: u16,
 }

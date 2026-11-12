@@ -52,22 +52,19 @@ pub(super) struct FittedFile {
 }
 
 impl FittedFile {
-    // A complete short file can fall back to flat storage without rereading
-    // input or output. Larger files retain the streaming extent path.
+    // Fitting needs no physical addresses; short files can still fall back to flat storage.
     pub fn fit(options: &Options, encoder: &mut Encoder, mut input: &[u8]) -> Result<Self> {
         let mut fitter = ExtentFitter::sized(input.len() as u64, options);
         debug_assert_eq!(fitter.position, 0);
         debug_assert_eq!(input.len() as u64, fitter.file_size);
-        debug_assert!(
-            input.len() <= INPUT_SIZE && fitter.inline_capacity == 0 && !fitter.fragments
-        );
+        debug_assert!(fitter.inline_capacity == 0 && !fitter.fragments);
         debug_assert!(!options.inline_compressed_tails);
         let mut file = Self {
             data: Vec::with_capacity(input.len().next_multiple_of(BLOCK_SIZE)),
             extents: Vec::new(),
         };
         while !input.is_empty() {
-            let extent = fitter.fit(encoder, input, 0)?;
+            let extent = fitter.fit(encoder, &input[..input.len().min(INPUT_SIZE)], 0)?;
             file.data.extend_from_slice(&fitter.data);
             file.extents.push(extent);
             input = &input[extent.consumed..];
@@ -75,7 +72,7 @@ impl FittedFile {
         Ok(file)
     }
 
-    pub fn into_buffered(self, node: &Node, mut block: u32) -> BufferedFile {
+    pub fn into_buffered(self, node: &Node, block: u32) -> BufferedFile {
         debug_assert_eq!(
             self.extents
                 .iter()
@@ -84,10 +81,7 @@ impl FittedFile {
             node.size
         );
         let mut indexes = IndexWriter::new(node);
-        for extent in &self.extents {
-            indexes.push(*extent, block);
-            block += extent.blocks;
-        }
+        indexes.append(&self, block);
         BufferedFile {
             data: self.data,
             indexes: indexes.indexes,
@@ -313,7 +307,7 @@ impl ExtentFitter {
     }
 }
 
-struct IndexWriter {
+pub(super) struct IndexWriter {
     // A completed pending pack plus this extent's Compact entries.
     indexes: Vec<u8>,
     pack: [u8; 32],
@@ -327,7 +321,7 @@ struct IndexWriter {
 }
 
 impl IndexWriter {
-    fn new(node: &Node) -> Self {
+    pub fn new(node: &Node) -> Self {
         Self {
             indexes: Vec::with_capacity(32 + INPUT_SIZE / BLOCK_SIZE * 4),
             pack: [0; 32],
@@ -339,6 +333,15 @@ impl IndexWriter {
             big_pcluster: node.big_pcluster,
             two_byte_indexes: node.two_byte_indexes(),
         }
+    }
+
+    pub fn append(&mut self, fitted: &FittedFile, mut block: u32) -> &[u8] {
+        self.indexes.clear();
+        for extent in &fitted.extents {
+            self.push(*extent, block);
+            block += extent.blocks;
+        }
+        &self.indexes
     }
 
     fn push(&mut self, extent: FittedExtent, block: u32) {
@@ -707,7 +710,7 @@ mod test {
         use super::super::{Metadata, encode::Content};
 
         let mut seed = 11u32;
-        let data: Vec<_> = (0..INPUT_SIZE)
+        let data: Vec<_> = (0..3 * INPUT_SIZE + 17)
             .map(|i| {
                 seed ^= seed << 13;
                 seed ^= seed >> 17;
@@ -734,8 +737,8 @@ mod test {
                     .compression(compression)
                     .pcluster_size(cluster);
                 let mut reused = Encoder::new(&options);
-                for size in [4097, 12_345, 40_000, INPUT_SIZE] {
-                    let input = &data[INPUT_SIZE - size..];
+                for size in [4097, 12_345, 40_000, INPUT_SIZE, INPUT_SIZE + 1, data.len()] {
+                    let input = &data[data.len() - size..];
                     let mut node =
                         Node::new(&Metadata::default(), Content::File, size as u64).unwrap();
                     node.select_format(&options, 1).unwrap();
@@ -747,7 +750,9 @@ mod test {
                         let (mut data, mut indexes) = (Vec::new(), Vec::new());
                         let (mut rest, mut at, mut extents) = (input, block, 0);
                         while !rest.is_empty() {
-                            let extent = compressor.encode(&mut fresh, rest, at, 0).unwrap();
+                            let extent = compressor
+                                .encode(&mut fresh, &rest[..rest.len().min(INPUT_SIZE)], at, 0)
+                                .unwrap();
                             data.extend_from_slice(extent.data);
                             indexes.extend_from_slice(extent.indexes);
                             at += (extent.data.len() / BLOCK_SIZE) as u32;

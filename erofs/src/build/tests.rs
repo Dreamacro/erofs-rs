@@ -809,6 +809,73 @@ mod directory {
         feature = "zstd"
     ))]
     #[test]
+    fn segmented_workers_preserve_large_files() {
+        use super::super::directory::SEGMENT_SIZE;
+
+        let temp = Temp::new();
+        let root = temp.0.join("root");
+        fs::create_dir(&root).unwrap();
+        let data: Vec<u8> = (0..2 * SEGMENT_SIZE + 17)
+            .map(|i| b"segment boundaries"[i % 18] ^ (i / 32749 % 17) as u8)
+            .collect();
+        let file = root.join("large");
+        fs::write(&file, &data).unwrap();
+        fs::hard_link(&file, root.join("alias")).unwrap();
+        set_xattr(&file, b"user.segment", &[42; 3000]);
+        let sources = scan(&root, Options::default()).unwrap();
+        for compression in COMPRESSIONS
+            .into_iter()
+            .filter(|compression| *compression != Compression::None && compression.enabled())
+        {
+            for cluster in [4096, 16384] {
+                let options = Options::default()
+                    .compression(compression)
+                    .pcluster_size(cluster);
+                let mut expected = Cursor::new(Vec::new());
+                write_image(&sources, &mut expected, options).unwrap();
+                let expected = expected.into_inner();
+                for workers in [2, 8] {
+                    let mut image = Cursor::new(Vec::new());
+                    write_image(&sources, &mut image, options.workers(workers)).unwrap();
+                    assert!(image.into_inner() == expected);
+                }
+                let image = source(&expected);
+                let fs = crate::EroFS::new(&image).unwrap();
+                let afs = ready(crate::r#async::EroFS::new(&image)).unwrap();
+                let file = fs.open("large").unwrap();
+                let afile = ready(afs.open("large")).unwrap();
+                check_read_at(&file, &afile, &data);
+                assert!(read_all(file) == data);
+                assert!(read_all(fs.open("alias").unwrap()) == data);
+                assert_eq!(
+                    fs.xattrs("large").unwrap(),
+                    xattrs([(b"user.segment", &[42; 3000])])
+                );
+                assert!(write_image(&sources, &mut Output::new(0), options.workers(8)).is_err());
+            }
+        }
+        fs::write(&file, b"changed").unwrap();
+        let compression = COMPRESSIONS
+            .into_iter()
+            .find(|compression| *compression != Compression::None && compression.enabled())
+            .unwrap();
+        assert!(
+            write_image(
+                &sources,
+                &mut Cursor::new(Vec::new()),
+                Options::default().compression(compression).workers(8)
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    #[test]
     fn worker_errors_fail_the_build() {
         let temp = Temp::new();
         let root = temp.0.join("root");

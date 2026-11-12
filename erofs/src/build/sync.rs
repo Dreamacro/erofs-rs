@@ -284,6 +284,46 @@ impl<W: Write + Seek> Builder<W> {
         feature = "deflate",
         feature = "zstd"
     ))]
+    pub(super) fn append_segments(
+        &mut self,
+        path: &UnixPath,
+        metadata: &Metadata,
+        size: u64,
+        nlink: u32,
+        segments: impl Iterator<Item = Result<super::compress::FittedFile>>,
+    ) -> Result<()> {
+        use super::compress::IndexWriter;
+
+        let mut entry = self
+            .state
+            .prepare_payload(path, metadata, Content::File, size, nlink)?;
+        self.prepare_metadata(&entry.node)?;
+        let mut indexes = IndexWriter::new(&entry.node);
+        let mut index_offset = entry.node.index_offset();
+        for fitted in segments {
+            let fitted = fitted?;
+            let bytes = indexes.append(&fitted, entry.next_block);
+            self.output.seek(SeekFrom::Start(
+                u64::from(entry.next_block) * BLOCK_SIZE as u64,
+            ))?;
+            self.output.write_all(&fitted.data)?;
+            let blocks = (fitted.data.len() / BLOCK_SIZE) as u32;
+            entry.next_block += blocks;
+            entry.node.data_block += blocks;
+            for page in self.state.write_indexes(&entry.node, index_offset, bytes) {
+                write_at(&mut self.output, page.offset(), page.bytes())?;
+            }
+            index_offset += bytes.len() as u64;
+        }
+        self.finish_compressed(entry, index_offset, None)
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
     fn append_encoded(
         &mut self,
         entry: super::PendingEntry,
@@ -421,9 +461,24 @@ impl<W: Write + Seek> Builder<W> {
             input.copy_within(extent.consumed..buffered, 0);
             buffered -= extent.consumed;
         }
+        self.finish_compressed(entry, index_offset, compressor.inline_tail())
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    fn finish_compressed(
+        &mut self,
+        entry: super::PendingEntry,
+        index_offset: u64,
+        inline_tail: Option<&[u8]>,
+    ) -> Result<()> {
         debug_assert_eq!(index_offset, entry.node.index_end());
         let page = self.state.pending_metadata.as_mut().unwrap();
-        if let Some(tail) = compressor.inline_tail() {
+        if let Some(tail) = inline_tail {
             page.write_at(index_offset, tail);
         }
         page.write_inode(&entry.node, self.state.nodes.len());
