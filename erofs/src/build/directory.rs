@@ -597,9 +597,25 @@ struct Prefetch<'env> {
     sources: &'env [Source],
     jobs: Arc<[usize]>,
     cursor: Cursor,
-    window: Arc<Window>,
-    results: mpsc::Receiver<(usize, Result<Prepared>)>,
-    ready: HashMap<usize, Result<Prepared>>,
+    mode: Mode,
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+enum Mode {
+    Inline {
+        options: Options,
+        encoder: Encoder,
+    },
+    Workers {
+        window: Arc<Window>,
+        results: mpsc::Receiver<(usize, Result<Prepared>)>,
+        ready: HashMap<usize, Result<Prepared>>,
+    },
 }
 
 #[cfg(any(
@@ -626,6 +642,28 @@ impl<'env> Prefetch<'env> {
             })
             .map(|(index, _)| index)
             .collect();
+        let mode = if options.workers == 1 {
+            Mode::Inline {
+                options,
+                encoder: Encoder::new(&options),
+            }
+        } else {
+            Self::spawn(scope, sources, &jobs, options)
+        };
+        Self {
+            sources,
+            jobs,
+            cursor: Cursor::default(),
+            mode,
+        }
+    }
+
+    fn spawn<'scope>(
+        scope: &'scope thread::Scope<'scope, 'env>,
+        sources: &'env [Source],
+        jobs: &Arc<[usize]>,
+        options: Options,
+    ) -> Mode {
         let window = Arc::new(Window::default());
         let (sender, results) = mpsc::channel();
         let capacity = options.workers.saturating_mul(8);
@@ -638,7 +676,7 @@ impl<'env> Prefetch<'env> {
             .workers
             .min(usize::try_from(segments).unwrap_or(usize::MAX))
         {
-            let (jobs, window, sender) = (Arc::clone(&jobs), Arc::clone(&window), sender.clone());
+            let (jobs, window, sender) = (Arc::clone(jobs), Arc::clone(&window), sender.clone());
             scope.spawn(move || {
                 let mut encoder = Encoder::new(&options);
                 while let Some(segment) = window.claim(sources, &jobs, capacity, byte_capacity) {
@@ -649,10 +687,7 @@ impl<'env> Prefetch<'env> {
                 }
             });
         }
-        Self {
-            sources,
-            jobs,
-            cursor: Cursor::default(),
+        Mode::Workers {
             window,
             results,
             ready: HashMap::new(),
@@ -668,20 +703,30 @@ impl<'env> Prefetch<'env> {
             return None;
         }
         let segment = self.cursor.next(self.sources, &self.jobs)?;
+        let (window, results, ready) = match &mut self.mode {
+            Mode::Inline { options, encoder } => {
+                return Some(prepare(source, segment, options, encoder));
+            }
+            Mode::Workers {
+                window,
+                results,
+                ready,
+            } => (window, results, ready),
+        };
         let result = loop {
-            if let Some(result) = self.ready.remove(&segment.job) {
+            if let Some(result) = ready.remove(&segment.job) {
                 break result;
             }
-            match self.results.recv() {
+            match results.recv() {
                 Ok((done, result)) => {
-                    self.ready.insert(done, result);
+                    ready.insert(done, result);
                 }
                 Err(_) => {
                     return Some(Err(io::Error::other("compression worker stopped").into()));
                 }
             }
         };
-        self.window.update(|state| {
+        window.update(|state| {
             state.consumed = segment.job + 1;
             state.bytes -= segment.charge();
         });
@@ -697,6 +742,8 @@ impl<'env> Prefetch<'env> {
 ))]
 impl Drop for Prefetch<'_> {
     fn drop(&mut self) {
-        self.window.update(|state| state.closed = true);
+        if let Mode::Workers { window, .. } = &self.mode {
+            window.update(|state| state.closed = true);
+        }
     }
 }
