@@ -65,6 +65,18 @@ pub struct Builder<W: Write + Seek> {
     state: State,
 }
 
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+pub(super) struct SegmentedFile {
+    entry: super::PendingEntry,
+    indexes: super::compress::IndexWriter,
+    index_offset: u64,
+}
+
 impl Options {
     /// Creates a synchronous builder with these settings and an empty output.
     ///
@@ -284,38 +296,62 @@ impl<W: Write + Seek> Builder<W> {
         feature = "deflate",
         feature = "zstd"
     ))]
-    pub(super) fn append_segments(
+    pub(super) fn begin_segments(
         &mut self,
         path: &UnixPath,
         metadata: &Metadata,
         size: u64,
         nlink: u32,
-        segments: impl Iterator<Item = Result<super::compress::FittedFile>>,
-    ) -> Result<()> {
-        use super::compress::IndexWriter;
-
-        let mut entry = self
+    ) -> Result<SegmentedFile> {
+        let entry = self
             .state
             .prepare_payload(path, metadata, Content::File, size, nlink)?;
         self.prepare_metadata(&entry.node)?;
-        let mut indexes = IndexWriter::new(&entry.node);
-        let mut index_offset = entry.node.index_offset();
-        for fitted in segments {
-            let fitted = fitted?;
-            let bytes = indexes.append(&fitted, entry.next_block);
-            self.output.seek(SeekFrom::Start(
-                u64::from(entry.next_block) * BLOCK_SIZE as u64,
-            ))?;
-            self.output.write_all(&fitted.data)?;
-            let blocks = (fitted.data.len() / BLOCK_SIZE) as u32;
-            entry.next_block += blocks;
-            entry.node.data_block += blocks;
-            for page in self.state.write_indexes(&entry.node, index_offset, bytes) {
-                write_at(&mut self.output, page.offset(), page.bytes())?;
-            }
-            index_offset += bytes.len() as u64;
+        Ok(SegmentedFile {
+            indexes: super::compress::IndexWriter::new(&entry.node),
+            index_offset: entry.node.index_offset(),
+            entry,
+        })
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    pub(super) fn append_segment(
+        &mut self,
+        file: &mut SegmentedFile,
+        fitted: super::compress::FittedFile,
+    ) -> Result<()> {
+        let entry = &mut file.entry;
+        let bytes = file.indexes.append(&fitted, entry.next_block);
+        self.output.seek(SeekFrom::Start(
+            u64::from(entry.next_block) * BLOCK_SIZE as u64,
+        ))?;
+        self.output.write_all(&fitted.data)?;
+        let blocks = (fitted.data.len() / BLOCK_SIZE) as u32;
+        entry.next_block += blocks;
+        entry.node.data_block += blocks;
+        for page in self
+            .state
+            .write_indexes(&entry.node, file.index_offset, bytes)
+        {
+            write_at(&mut self.output, page.offset(), page.bytes())?;
         }
-        self.finish_compressed(entry, index_offset, None)
+        file.index_offset += bytes.len() as u64;
+        Ok(())
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    pub(super) fn finish_segments(&mut self, file: SegmentedFile) -> Result<()> {
+        self.finish_compressed(file.entry, file.index_offset, None)
     }
 
     #[cfg(any(

@@ -12,6 +12,7 @@ use super::{
 use crate::{Error, Result};
 
 pub(super) const INPUT_SIZE: usize = 64 * 1024;
+pub(super) const SEGMENT_SIZE: usize = 16 * 1024 * 1024;
 
 impl Compression {
     // These encoders stop at the destination size and report the consumed prefix.

@@ -253,9 +253,18 @@ impl Options {
         feature = "zstd"
     ))]
     fn buffers_file(self, size: u64) -> bool {
+        self.prefits_file(size) && size <= compress::INPUT_SIZE as u64
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    fn prefits_file(self, size: u64) -> bool {
         self.compression != Compression::None
             && size > BLOCK_SIZE as u64
-            && size <= compress::INPUT_SIZE as u64
             && !self.inline_compressed_tails
             && !self.fragments
     }

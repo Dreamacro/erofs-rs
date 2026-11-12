@@ -810,7 +810,7 @@ mod directory {
     ))]
     #[test]
     fn segmented_workers_preserve_large_files() {
-        use super::super::directory::SEGMENT_SIZE;
+        use super::super::compress::SEGMENT_SIZE;
 
         let temp = Temp::new();
         let root = temp.0.join("root");

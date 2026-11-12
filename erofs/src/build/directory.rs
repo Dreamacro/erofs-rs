@@ -30,15 +30,7 @@ use typed_path::UnixPath;
     feature = "deflate",
     feature = "zstd"
 ))]
-use super::compress::{Encoder, FittedFile};
-
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
-pub(super) const SEGMENT_SIZE: usize = 16 * 1024 * 1024;
+use super::compress::{Encoder, FittedFile, SEGMENT_SIZE};
 use super::{Metadata, Options, SpecialFile, encode::Content, symlink_target};
 use crate::{Error, Result, Xattrs};
 
@@ -393,12 +385,12 @@ fn append_sources<'scope, 'env>(
                 if options.buffers_file(host.len()) {
                     builder.append_fitted(path, &metadata, nlink, &input, fitted)?;
                 } else {
-                    let segments = core::iter::once(Ok(fitted)).chain(core::iter::from_fn(|| {
-                        prefetch
-                            .take(source)
-                            .map(|result| result.map(|prepared| prepared.fitted))
-                    }));
-                    builder.append_segments(path, &metadata, host.len(), nlink, segments)?;
+                    let mut file = builder.begin_segments(path, &metadata, host.len(), nlink)?;
+                    builder.append_segment(&mut file, fitted)?;
+                    while let Some(prepared) = prefetch.take(source) {
+                        builder.append_segment(&mut file, prepared?.fitted)?;
+                    }
+                    builder.finish_segments(file)?;
                 }
                 links.get_mut(&identity).unwrap().1 = Some(path.as_bytes().to_vec());
                 continue;
@@ -443,19 +435,84 @@ struct Prepared {
     feature = "deflate",
     feature = "zstd"
 ))]
-fn prepare(
-    source: &Source,
+#[derive(Clone, Copy)]
+struct Segment {
+    job: usize,
+    source: usize,
     offset: u64,
     len: usize,
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+impl Segment {
+    fn charge(self) -> usize {
+        2 * self.len.next_multiple_of(super::encode::BLOCK_SIZE)
+    }
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+#[derive(Clone, Copy, Default)]
+struct Cursor {
+    job: usize,
+    source: usize,
+    offset: u64,
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+impl Cursor {
+    fn next(&mut self, sources: &[Source], jobs: &[usize]) -> Option<Segment> {
+        let &source = jobs.get(self.source)?;
+        let size = sources[source].metadata.len();
+        let len = (size - self.offset).min(SEGMENT_SIZE as u64) as usize;
+        let segment = Segment {
+            job: self.job,
+            source,
+            offset: self.offset,
+            len,
+        };
+        self.job += 1;
+        self.offset += len as u64;
+        if self.offset == size {
+            self.source += 1;
+            self.offset = 0;
+        }
+        Some(segment)
+    }
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+fn prepare(
+    source: &Source,
+    segment: Segment,
     options: &Options,
     encoder: &mut Encoder,
 ) -> Result<Prepared> {
     let mut file = open_file(&source.path)?;
     verify(source, &file.metadata()?)?;
-    if offset != 0 {
-        file.seek(io::SeekFrom::Start(offset))?;
+    if segment.offset != 0 {
+        file.seek(io::SeekFrom::Start(segment.offset))?;
     }
-    let mut input = vec![0; len];
+    let mut input = vec![0; segment.len];
     file.read_exact(&mut input)?;
     verify(source, &file.metadata()?)?;
     let fitted = FittedFile::fit(options, encoder, &input)?;
@@ -486,9 +543,7 @@ struct Window {
 ))]
 #[derive(Default)]
 struct WindowState {
-    source: usize,
-    offset: u64,
-    claimed: usize,
+    cursor: Cursor,
     consumed: usize,
     bytes: usize,
     closed: bool,
@@ -507,26 +562,20 @@ impl Window {
         jobs: &[usize],
         capacity: usize,
         byte_capacity: usize,
-    ) -> Option<(usize, usize, u64, usize)> {
+    ) -> Option<Segment> {
         let mut state = self.state.lock().unwrap();
         loop {
-            if state.closed || state.source == jobs.len() {
+            if state.closed {
                 return None;
             }
-            let source = jobs[state.source];
-            let size = sources[source].metadata.len();
-            let len = (size - state.offset).min(SEGMENT_SIZE as u64) as usize;
-            let bytes = 2 * len.next_multiple_of(super::encode::BLOCK_SIZE);
-            if state.claimed - state.consumed < capacity && bytes <= byte_capacity - state.bytes {
-                let job = (state.claimed, source, state.offset, len);
-                state.claimed += 1;
-                state.bytes += bytes;
-                state.offset += len as u64;
-                if state.offset == size {
-                    state.source += 1;
-                    state.offset = 0;
-                }
-                return Some(job);
+            let mut cursor = state.cursor;
+            let segment = cursor.next(sources, jobs)?;
+            if segment.job - state.consumed < capacity
+                && state.bytes + segment.charge() <= byte_capacity
+            {
+                state.cursor = cursor;
+                state.bytes += segment.charge();
+                return Some(segment);
             }
             state = self.changed.wait(state).unwrap();
         }
@@ -547,9 +596,7 @@ impl Window {
 struct Prefetch<'env> {
     sources: &'env [Source],
     jobs: Arc<[usize]>,
-    source: usize,
-    offset: u64,
-    next: usize,
+    cursor: Cursor,
     window: Arc<Window>,
     results: mpsc::Receiver<(usize, Result<Prepared>)>,
     ready: HashMap<usize, Result<Prepared>>,
@@ -567,44 +614,36 @@ impl<'env> Prefetch<'env> {
         sources: &'env [Source],
         options: Options,
     ) -> Self {
-        let jobs: Arc<[usize]> = if options.compression != super::Compression::None
-            && !options.inline_compressed_tails
-            && !options.fragments
-        {
-            let mut seen = HashSet::new();
-            sources
-                .iter()
-                .enumerate()
-                .filter(|(_, source)| {
-                    let host = &source.metadata;
-                    host.is_file()
-                        && seen.insert((host.dev(), host.ino()))
-                        && host.len() > super::encode::BLOCK_SIZE as u64
-                })
-                .map(|(index, _)| index)
-                .collect()
-        } else {
-            Arc::new([])
-        };
+        let mut seen = HashSet::new();
+        let jobs: Arc<[usize]> = sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| {
+                let host = &source.metadata;
+                host.is_file()
+                    && seen.insert((host.dev(), host.ino()))
+                    && options.prefits_file(host.len())
+            })
+            .map(|(index, _)| index)
+            .collect();
         let window = Arc::new(Window::default());
         let (sender, results) = mpsc::channel();
         let capacity = options.workers.saturating_mul(8);
         let byte_capacity = options.workers.saturating_mul(2 * SEGMENT_SIZE);
-        let count = jobs.iter().fold(0usize, |count, &source| {
-            count.saturating_add(
-                usize::try_from(sources[source].metadata.len().div_ceil(SEGMENT_SIZE as u64))
-                    .unwrap_or(usize::MAX),
-            )
-        });
-        for _ in 0..options.workers.min(count) {
+        let segments = jobs
+            .iter()
+            .map(|&source| sources[source].metadata.len().div_ceil(SEGMENT_SIZE as u64))
+            .sum::<u64>();
+        for _ in 0..options
+            .workers
+            .min(usize::try_from(segments).unwrap_or(usize::MAX))
+        {
             let (jobs, window, sender) = (Arc::clone(&jobs), Arc::clone(&window), sender.clone());
             scope.spawn(move || {
                 let mut encoder = Encoder::new(&options);
-                while let Some((job, source, offset, len)) =
-                    window.claim(sources, &jobs, capacity, byte_capacity)
-                {
-                    let result = prepare(&sources[source], offset, len, &options, &mut encoder);
-                    if sender.send((job, result)).is_err() {
+                while let Some(segment) = window.claim(sources, &jobs, capacity, byte_capacity) {
+                    let result = prepare(&sources[segment.source], segment, &options, &mut encoder);
+                    if sender.send((segment.job, result)).is_err() {
                         break;
                     }
                 }
@@ -613,9 +652,7 @@ impl<'env> Prefetch<'env> {
         Self {
             sources,
             jobs,
-            source: 0,
-            offset: 0,
-            next: 0,
+            cursor: Cursor::default(),
             window,
             results,
             ready: HashMap::new(),
@@ -625,14 +662,14 @@ impl<'env> Prefetch<'env> {
     fn take(&mut self, source: &Source) -> Option<Result<Prepared>> {
         if !self
             .jobs
-            .get(self.source)
+            .get(self.cursor.source)
             .is_some_and(|&job| core::ptr::eq(&self.sources[job], source))
         {
             return None;
         }
-        let job = self.next;
+        let segment = self.cursor.next(self.sources, &self.jobs)?;
         let result = loop {
-            if let Some(result) = self.ready.remove(&job) {
+            if let Some(result) = self.ready.remove(&segment.job) {
                 break result;
             }
             match self.results.recv() {
@@ -644,16 +681,9 @@ impl<'env> Prefetch<'env> {
                 }
             }
         };
-        let len = (source.metadata.len() - self.offset).min(SEGMENT_SIZE as u64) as usize;
-        self.offset += len as u64;
-        if self.offset == source.metadata.len() {
-            self.source += 1;
-            self.offset = 0;
-        }
-        self.next += 1;
         self.window.update(|state| {
-            state.consumed = self.next;
-            state.bytes -= 2 * len.next_multiple_of(super::encode::BLOCK_SIZE);
+            state.consumed = segment.job + 1;
+            state.bytes -= segment.charge();
         });
         Some(result)
     }
