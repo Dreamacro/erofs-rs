@@ -237,9 +237,9 @@ impl Options {
     }
 
     /// Threads compressing files during directory import. Defaults to 1.
-    /// Images are identical for any count. Large files use fixed 16 MiB segments;
-    /// up to 8 jobs and 32 MiB of input/output buffers per worker are prefetched,
-    /// plus the segment being committed, indexes and encoder state.
+    /// Images are identical for any count. Large files use fixed 16 MiB segments,
+    /// read through a 1 MiB buffer per worker; up to 8 jobs and 32 MiB of fitted
+    /// output per worker are prefetched, plus indexes and encoder state.
     /// Inline compressed tails and fragments retain the serial streaming path.
     pub fn workers(mut self, workers: usize) -> Self {
         self.workers = workers;

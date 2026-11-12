@@ -13,6 +13,7 @@ use crate::{Error, Result};
 
 pub(super) const INPUT_SIZE: usize = 64 * 1024;
 pub(super) const SEGMENT_SIZE: usize = 16 * 1024 * 1024;
+const READ_SIZE: usize = 1024 * 1024;
 
 impl Compression {
     // These encoders stop at the destination size and report the consumed prefix.
@@ -70,6 +71,44 @@ impl FittedFile {
             file.extents.push(extent);
             input = &input[extent.consumed..];
         }
+        Ok(file)
+    }
+
+    // Like `fit`, streaming input through `buffer`.
+    pub fn fit_from(
+        options: &Options,
+        encoder: &mut Encoder,
+        size: usize,
+        input: &mut impl std::io::Read,
+        buffer: &mut Vec<u8>,
+    ) -> Result<Self> {
+        let mut fitter = ExtentFitter::sized(size as u64, options);
+        debug_assert!(fitter.inline_capacity == 0 && !fitter.fragments);
+        debug_assert!(!options.inline_compressed_tails);
+        if buffer.len() < READ_SIZE {
+            buffer.resize(READ_SIZE, 0);
+        }
+        let mut file = Self {
+            data: Vec::with_capacity(size.next_multiple_of(BLOCK_SIZE)),
+            extents: Vec::new(),
+        };
+        let (mut start, mut end, mut unread) = (0, 0, size);
+        while start < end || unread != 0 {
+            if end - start < INPUT_SIZE && unread != 0 {
+                buffer.copy_within(start..end, 0);
+                end -= start;
+                start = 0;
+                let len = unread.min(buffer.len() - end);
+                input.read_exact(&mut buffer[end..end + len])?;
+                end += len;
+                unread -= len;
+            }
+            let extent = fitter.fit(encoder, &buffer[start..end.min(start + INPUT_SIZE)], 0)?;
+            file.data.extend_from_slice(&fitter.data);
+            file.extents.push(extent);
+            start += extent.consumed;
+        }
+        debug_assert_eq!(fitter.position, size as u64);
         Ok(file)
     }
 
@@ -702,6 +741,51 @@ mod test {
                 if !compressed {
                     assert_eq!(fitter.data, input[..BLOCK_SIZE]);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn reading_through_a_buffer_fits_the_same_extents() {
+        let mut seed = 3u32;
+        let data: Vec<u8> = (0..READ_SIZE + INPUT_SIZE + 4099)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                if i % 7000 < 3000 {
+                    seed as u8
+                } else {
+                    (i / 11) as u8
+                }
+            })
+            .collect();
+        for compression in [
+            Compression::Lz4,
+            Compression::Lzma,
+            Compression::Deflate,
+            Compression::Zstd,
+        ]
+        .into_iter()
+        .filter(|compression| compression.enabled())
+        {
+            let options = Options::default().compression(compression);
+            let mut encoder = Encoder::new(&options);
+            let mut buffer = Vec::new();
+            for size in [4097, INPUT_SIZE + 1, READ_SIZE + 1, data.len()] {
+                let input = &data[data.len() - size..];
+                let expected = FittedFile::fit(&options, &mut encoder, input).unwrap();
+                let actual =
+                    FittedFile::fit_from(&options, &mut encoder, size, &mut &*input, &mut buffer)
+                        .unwrap();
+                assert!(actual.data == expected.data);
+                let extents = |file: &FittedFile| {
+                    file.extents
+                        .iter()
+                        .map(|extent| (extent.consumed, extent.compressed, extent.blocks))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(extents(&actual), extents(&expected));
             }
         }
     }

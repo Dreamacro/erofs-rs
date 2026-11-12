@@ -30,7 +30,7 @@ use typed_path::UnixPath;
     feature = "deflate",
     feature = "zstd"
 ))]
-use super::compress::{Encoder, FittedFile, SEGMENT_SIZE};
+use super::compress::{Encoder, FittedFile, INPUT_SIZE, SEGMENT_SIZE};
 use super::{Metadata, Options, SpecialFile, encode::Content, symlink_target};
 use crate::{Error, Result, Xattrs};
 
@@ -435,6 +435,20 @@ struct Prepared {
     feature = "deflate",
     feature = "zstd"
 ))]
+impl Prepared {
+    fn held(result: &Result<Self>) -> usize {
+        result.as_ref().map_or(0, |prepared| {
+            prepared.input.len() + prepared.fitted.data.len()
+        })
+    }
+}
+
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
 #[derive(Clone, Copy)]
 struct Segment {
     job: usize,
@@ -451,7 +465,7 @@ struct Segment {
 ))]
 impl Segment {
     fn charge(self) -> usize {
-        2 * self.len.next_multiple_of(super::encode::BLOCK_SIZE)
+        self.len.next_multiple_of(super::encode::BLOCK_SIZE) + self.len.min(INPUT_SIZE)
     }
 }
 
@@ -506,21 +520,28 @@ fn prepare(
     segment: Segment,
     options: &Options,
     encoder: &mut Encoder,
+    buffer: &mut Vec<u8>,
 ) -> Result<Prepared> {
     let mut file = open_file(&source.path)?;
     verify(source, &file.metadata()?)?;
-    if segment.offset != 0 {
-        file.seek(io::SeekFrom::Start(segment.offset))?;
-    }
-    let mut input = vec![0; segment.len];
-    file.read_exact(&mut input)?;
-    verify(source, &file.metadata()?)?;
-    let fitted = FittedFile::fit(options, encoder, &input)?;
     // Only whole short files need their input for flat fallback at commit time.
-    if !options.buffers_file(source.metadata.len()) {
-        input = Vec::new();
-    }
-    Ok(Prepared { input, fitted })
+    let prepared = if options.buffers_file(source.metadata.len()) {
+        let mut input = vec![0; segment.len];
+        file.read_exact(&mut input)?;
+        let fitted = FittedFile::fit(options, encoder, &input)?;
+        Prepared { input, fitted }
+    } else {
+        if segment.offset != 0 {
+            file.seek(io::SeekFrom::Start(segment.offset))?;
+        }
+        let fitted = FittedFile::fit_from(options, encoder, segment.len, &mut file, buffer)?;
+        Prepared {
+            input: Vec::new(),
+            fitted,
+        }
+    };
+    verify(source, &file.metadata()?)?;
+    Ok(prepared)
 }
 
 #[cfg(any(
@@ -610,6 +631,7 @@ enum Mode {
     Inline {
         options: Options,
         encoder: Encoder,
+        buffer: Vec<u8>,
     },
     Workers {
         window: Arc<Window>,
@@ -646,6 +668,7 @@ impl<'env> Prefetch<'env> {
             Mode::Inline {
                 options,
                 encoder: Encoder::new(&options),
+                buffer: Vec::new(),
             }
         } else {
             Self::spawn(scope, sources, &jobs, options)
@@ -679,8 +702,12 @@ impl<'env> Prefetch<'env> {
             let (jobs, window, sender) = (Arc::clone(jobs), Arc::clone(&window), sender.clone());
             scope.spawn(move || {
                 let mut encoder = Encoder::new(&options);
+                let mut buffer = Vec::new();
                 while let Some(segment) = window.claim(sources, &jobs, capacity, byte_capacity) {
-                    let result = prepare(&sources[segment.source], segment, &options, &mut encoder);
+                    let source = &sources[segment.source];
+                    let result = prepare(source, segment, &options, &mut encoder, &mut buffer);
+                    let held = Prepared::held(&result);
+                    window.update(|state| state.bytes = state.bytes + held - segment.charge());
                     if sender.send((segment.job, result)).is_err() {
                         break;
                     }
@@ -704,9 +731,11 @@ impl<'env> Prefetch<'env> {
         }
         let segment = self.cursor.next(self.sources, &self.jobs)?;
         let (window, results, ready) = match &mut self.mode {
-            Mode::Inline { options, encoder } => {
-                return Some(prepare(source, segment, options, encoder));
-            }
+            Mode::Inline {
+                options,
+                encoder,
+                buffer,
+            } => return Some(prepare(source, segment, options, encoder, buffer)),
             Mode::Workers {
                 window,
                 results,
@@ -726,9 +755,10 @@ impl<'env> Prefetch<'env> {
                 }
             }
         };
+        let held = Prepared::held(&result);
         window.update(|state| {
             state.consumed = segment.job + 1;
-            state.bytes -= segment.charge();
+            state.bytes -= held;
         });
         Some(result)
     }
