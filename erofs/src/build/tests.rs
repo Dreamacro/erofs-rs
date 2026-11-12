@@ -734,6 +734,171 @@ mod directory {
         assert!(write_image(&sources, &mut Cursor::new(Vec::new()), Options::default()).is_err());
     }
 
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    #[test]
+    fn workers_produce_identical_images() {
+        let temp = Temp::new();
+        let root = temp.0.join("root");
+        fs::create_dir_all(root.join("dir/nested")).unwrap();
+        let mut seed = 5u32;
+        let mut files = Vec::new();
+        for (n, size) in [
+            0, 100, 4096, 4097, 5000, 12_345, 40_000, 65_536, 65_537, 100_000,
+        ]
+        .into_iter()
+        .cycle()
+        .take(60)
+        .enumerate()
+        {
+            let data: Vec<u8> = (0..size)
+                .map(|i| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    if n % 3 == 0 {
+                        seed as u8
+                    } else {
+                        b"erofs workers "[i % 14] ^ (seed % 4) as u8
+                    }
+                })
+                .collect();
+            let path = root
+                .join(["", "dir", "dir/nested"][n % 3])
+                .join(format!("file{n}"));
+            fs::write(&path, &data).unwrap();
+            files.push((path, data));
+        }
+        fs::hard_link(&files[5].0, root.join("alias")).unwrap();
+        symlink("dir/file1", root.join("link")).unwrap();
+        let sources = scan(&root, Options::default()).unwrap();
+        for compression in COMPRESSIONS
+            .into_iter()
+            .filter(|compression| *compression != Compression::None && compression.enabled())
+        {
+            for cluster in [4096, 16384] {
+                let options = Options::default()
+                    .compression(compression)
+                    .pcluster_size(cluster);
+                let mut expected = Cursor::new(Vec::new());
+                write_image(&sources, &mut expected, options).unwrap();
+                let expected = expected.into_inner();
+                for workers in [2, 8] {
+                    let mut image = Cursor::new(Vec::new());
+                    write_image(&sources, &mut image, options.workers(workers)).unwrap();
+                    assert!(image.into_inner() == expected);
+                }
+                let source = source(&expected);
+                let fs = crate::EroFS::new(&source).unwrap();
+                for (path, data) in &files {
+                    let path = path.strip_prefix(&root).unwrap().to_str().unwrap();
+                    assert!(read_all(fs.open(path).unwrap()) == *data);
+                }
+            }
+        }
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    #[test]
+    fn segmented_workers_preserve_large_files() {
+        use super::super::compress::SEGMENT_SIZE;
+
+        let temp = Temp::new();
+        let root = temp.0.join("root");
+        fs::create_dir(&root).unwrap();
+        let data: Vec<u8> = (0..2 * SEGMENT_SIZE + 17)
+            .map(|i| b"segment boundaries"[i % 18] ^ (i / 32749 % 17) as u8)
+            .collect();
+        let file = root.join("large");
+        fs::write(&file, &data).unwrap();
+        fs::hard_link(&file, root.join("alias")).unwrap();
+        set_xattr(&file, b"user.segment", &[42; 3000]);
+        let sources = scan(&root, Options::default()).unwrap();
+        for compression in COMPRESSIONS
+            .into_iter()
+            .filter(|compression| *compression != Compression::None && compression.enabled())
+        {
+            for cluster in [4096, 16384] {
+                let options = Options::default()
+                    .compression(compression)
+                    .pcluster_size(cluster);
+                let mut expected = Cursor::new(Vec::new());
+                write_image(&sources, &mut expected, options).unwrap();
+                let expected = expected.into_inner();
+                for workers in [2, 8] {
+                    let mut image = Cursor::new(Vec::new());
+                    write_image(&sources, &mut image, options.workers(workers)).unwrap();
+                    assert!(image.into_inner() == expected);
+                }
+                let image = source(&expected);
+                let fs = crate::EroFS::new(&image).unwrap();
+                let afs = ready(crate::r#async::EroFS::new(&image)).unwrap();
+                let file = fs.open("large").unwrap();
+                let afile = ready(afs.open("large")).unwrap();
+                check_read_at(&file, &afile, &data);
+                assert!(read_all(file) == data);
+                assert!(read_all(fs.open("alias").unwrap()) == data);
+                assert_eq!(
+                    fs.xattrs("large").unwrap(),
+                    xattrs([(b"user.segment", &[42; 3000])])
+                );
+                assert!(write_image(&sources, &mut Output::new(0), options.workers(8)).is_err());
+            }
+        }
+        fs::write(&file, b"changed").unwrap();
+        let compression = COMPRESSIONS
+            .into_iter()
+            .find(|compression| *compression != Compression::None && compression.enabled())
+            .unwrap();
+        assert!(
+            write_image(
+                &sources,
+                &mut Cursor::new(Vec::new()),
+                Options::default().compression(compression).workers(8)
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    #[test]
+    fn worker_errors_fail_the_build() {
+        let temp = Temp::new();
+        let root = temp.0.join("root");
+        fs::create_dir(&root).unwrap();
+        for n in 0..40u8 {
+            fs::write(root.join(format!("file{n:02}")), vec![n; 8192]).unwrap();
+        }
+        let compression = COMPRESSIONS
+            .into_iter()
+            .find(|compression| *compression != Compression::None && compression.enabled())
+            .unwrap();
+        let options = Options::default().compression(compression).workers(4);
+        let sources = scan(&root, options).unwrap();
+        fs::write(root.join("file30"), b"changed").unwrap();
+        assert!(write_image(&sources, &mut Cursor::new(Vec::new()), options).is_err());
+        let output = temp.0.join("image.erofs");
+        assert!(
+            matches!(options.workers(0).build_from_directory(&root, &output),
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidInput)
+        );
+        assert!(!output.exists());
+    }
+
     #[test]
     fn invalid_options_do_not_access_the_source_or_create_or_remove_output() {
         let temp = Temp::new();

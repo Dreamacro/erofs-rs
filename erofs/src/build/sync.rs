@@ -65,6 +65,18 @@ pub struct Builder<W: Write + Seek> {
     state: State,
 }
 
+#[cfg(any(
+    feature = "lz4",
+    feature = "lzma",
+    feature = "deflate",
+    feature = "zstd"
+))]
+pub(super) struct SegmentedFile {
+    entry: super::PendingEntry,
+    indexes: super::compress::IndexWriter,
+    index_offset: u64,
+}
+
 impl Options {
     /// Creates a synchronous builder with these settings and an empty output.
     ///
@@ -238,11 +250,7 @@ impl<W: Write + Seek> Builder<W> {
             let mut input = vec![0; size];
             data.read_exact(&mut input)?;
             let encoded = self.state.buffer_file(&mut entry, &input)?;
-            self.prepare_metadata(&entry.node)?;
-            if let Some(encoded) = encoded {
-                return self.append_buffered(entry, encoded);
-            }
-            return self.append_flat(entry, &mut input.as_slice());
+            return self.append_encoded(entry, encoded, &input);
         }
         self.prepare_metadata(&entry.node)?;
         #[cfg(any(
@@ -255,6 +263,114 @@ impl<W: Write + Seek> Builder<W> {
             return self.append_compressed(entry, &mut data);
         }
         self.append_flat(entry, &mut data)
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    pub(super) fn append_fitted(
+        &mut self,
+        path: &UnixPath,
+        metadata: &Metadata,
+        nlink: u32,
+        input: &[u8],
+        fitted: super::compress::FittedFile,
+    ) -> Result<()> {
+        let mut entry =
+            self.state
+                .prepare_payload(path, metadata, Content::File, input.len() as u64, nlink)?;
+        debug_assert_eq!(
+            self.state.buffered_file_size(&entry.node),
+            Some(input.len())
+        );
+        let encoded = self.state.place_fitted(&mut entry, fitted)?;
+        self.append_encoded(entry, encoded, input)
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    pub(super) fn begin_segments(
+        &mut self,
+        path: &UnixPath,
+        metadata: &Metadata,
+        size: u64,
+        nlink: u32,
+    ) -> Result<SegmentedFile> {
+        let entry = self
+            .state
+            .prepare_payload(path, metadata, Content::File, size, nlink)?;
+        self.prepare_metadata(&entry.node)?;
+        Ok(SegmentedFile {
+            indexes: super::compress::IndexWriter::new(&entry.node),
+            index_offset: entry.node.index_offset(),
+            entry,
+        })
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    pub(super) fn append_segment(
+        &mut self,
+        file: &mut SegmentedFile,
+        fitted: super::compress::FittedFile,
+    ) -> Result<()> {
+        let entry = &mut file.entry;
+        let bytes = file.indexes.append(&fitted, entry.next_block);
+        self.output.seek(SeekFrom::Start(
+            u64::from(entry.next_block) * BLOCK_SIZE as u64,
+        ))?;
+        self.output.write_all(&fitted.data)?;
+        let blocks = (fitted.data.len() / BLOCK_SIZE) as u32;
+        entry.next_block += blocks;
+        entry.node.data_block += blocks;
+        for page in self
+            .state
+            .write_indexes(&entry.node, file.index_offset, bytes)
+        {
+            write_at(&mut self.output, page.offset(), page.bytes())?;
+        }
+        file.index_offset += bytes.len() as u64;
+        Ok(())
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    pub(super) fn finish_segments(&mut self, file: SegmentedFile) -> Result<()> {
+        self.finish_compressed(file.entry, file.index_offset, None)
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    fn append_encoded(
+        &mut self,
+        entry: super::PendingEntry,
+        encoded: Option<super::compress::BufferedFile>,
+        input: &[u8],
+    ) -> Result<()> {
+        self.prepare_metadata(&entry.node)?;
+        if let Some(encoded) = encoded {
+            return self.append_buffered(entry, encoded);
+        }
+        self.append_flat(entry, &mut &input[..])
     }
 
     fn append_flat(&mut self, entry: super::PendingEntry, data: &mut impl Read) -> Result<()> {
@@ -381,9 +497,24 @@ impl<W: Write + Seek> Builder<W> {
             input.copy_within(extent.consumed..buffered, 0);
             buffered -= extent.consumed;
         }
+        self.finish_compressed(entry, index_offset, compressor.inline_tail())
+    }
+
+    #[cfg(any(
+        feature = "lz4",
+        feature = "lzma",
+        feature = "deflate",
+        feature = "zstd"
+    ))]
+    fn finish_compressed(
+        &mut self,
+        entry: super::PendingEntry,
+        index_offset: u64,
+        inline_tail: Option<&[u8]>,
+    ) -> Result<()> {
         debug_assert_eq!(index_offset, entry.node.index_end());
         let page = self.state.pending_metadata.as_mut().unwrap();
-        if let Some(tail) = compressor.inline_tail() {
+        if let Some(tail) = inline_tail {
             page.write_at(index_offset, tail);
         }
         page.write_inode(&entry.node, self.state.nodes.len());
