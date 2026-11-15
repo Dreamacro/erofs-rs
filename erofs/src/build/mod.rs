@@ -20,12 +20,7 @@ use crate::{
 use encode::{BLOCK_SIZE, Content, Entry, INODE_SLOT_SIZE, MetadataBlock, Node, ROOT_OFFSET};
 
 mod r#async;
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 mod compress;
 #[cfg(unix)]
 mod directory;
@@ -142,6 +137,7 @@ pub struct Options {
     shared_xattrs: bool,
     xattr_prefixes: bool,
     skip_unsupported_xattrs: bool,
+    workers: usize,
 }
 
 impl Default for Options {
@@ -157,6 +153,7 @@ impl Default for Options {
             shared_xattrs: false,
             xattr_prefixes: false,
             skip_unsupported_xattrs: true,
+            workers: 1,
         }
     }
 }
@@ -234,6 +231,29 @@ impl Options {
         self
     }
 
+    /// Threads compressing files during directory import. Defaults to 1.
+    /// Images are identical for any count. Large files use fixed 16 MiB segments,
+    /// read through a 1 MiB buffer per worker; up to 8 jobs and 32 MiB of fitted
+    /// output per worker are prefetched, plus indexes and encoder state.
+    /// Inline compressed tails and fragments retain the serial streaming path.
+    pub fn workers(mut self, workers: usize) -> Self {
+        self.workers = workers;
+        self
+    }
+
+    #[cfg(codecs)]
+    fn buffers_file(self, size: u64) -> bool {
+        self.prefits_file(size) && size <= compress::INPUT_SIZE as u64
+    }
+
+    #[cfg(codecs)]
+    fn prefits_file(self, size: u64) -> bool {
+        self.compression != Compression::None
+            && size > BLOCK_SIZE as u64
+            && !self.inline_compressed_tails
+            && !self.fragments
+    }
+
     fn config_size(self) -> usize {
         if self.compression == Compression::Lz4 && self.pcluster_size > BLOCK_SIZE as u32 {
             16
@@ -270,6 +290,9 @@ impl Options {
                 "invalid filesystem build time nanoseconds",
             )
             .into());
+        }
+        if self.workers == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid worker count").into());
         }
         Ok(())
     }
@@ -360,12 +383,7 @@ impl SpecialFile {
 // Shared namespace, layout and commit state; neither builder duplicates these rules.
 struct State {
     options: Options,
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     encoder: compress::Encoder,
     nodes: Vec<Node>,
     paths: BTreeMap<Vec<u8>, usize>,
@@ -394,12 +412,7 @@ struct Fragments {
     size: u64,
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 impl Fragments {
     fn append(&mut self, entry: &mut PendingEntry, data: &[u8]) -> usize {
         entry.node.fragment_offset.get_or_insert(self.size);
@@ -422,12 +435,7 @@ impl State {
     fn new(options: Options) -> Result<Self> {
         options.validate()?;
         Ok(Self {
-            #[cfg(any(
-                feature = "lz4",
-                feature = "lzma",
-                feature = "deflate",
-                feature = "zstd"
-            ))]
+            #[cfg(codecs)]
             encoder: compress::Encoder::new(&options),
             options,
             nodes: vec![Node::new(
@@ -590,33 +598,28 @@ impl State {
         Ok(next_block)
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     fn buffered_file_size(&self, node: &Node) -> Option<usize> {
-        (node.compression != Compression::None
-            && node.size <= compress::INPUT_SIZE as u64
-            && !self.options.inline_compressed_tails
-            && !self.options.fragments)
+        (node.compression != Compression::None && self.options.buffers_file(node.size))
             .then_some(node.size as usize)
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     fn buffer_file(
         &mut self,
         entry: &mut PendingEntry,
         input: &[u8],
     ) -> Result<Option<compress::BufferedFile>> {
-        let fitted =
-            compress::FittedFile::fit(&entry.node, &self.options, &mut self.encoder, input)?;
+        let fitted = compress::FittedFile::fit(&self.options, &mut self.encoder, input)?;
+        self.place_fitted(entry, fitted)
+    }
+
+    #[cfg(codecs)]
+    fn place_fitted(
+        &self,
+        entry: &mut PendingEntry,
+        fitted: compress::FittedFile,
+    ) -> Result<Option<compress::BufferedFile>> {
         let node = &entry.node;
         let inline = node.flat_inline_size();
         let flat_cost = (node.size - inline as u64).next_multiple_of(BLOCK_SIZE as u64)
@@ -661,12 +664,7 @@ impl State {
 
     // Consume the iterator to write displaced pages. The final page stays pending
     // for more indexes or inline data.
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     fn write_indexes(
         &mut self,
         node: &Node,

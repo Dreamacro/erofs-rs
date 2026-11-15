@@ -197,12 +197,7 @@ impl<W: AsyncWrite + AsyncSeek> AsyncBuilder<W> {
         let entry = self
             .state
             .prepare_payload(path, metadata, content, size, 1)?;
-        #[cfg(any(
-            feature = "lz4",
-            feature = "lzma",
-            feature = "deflate",
-            feature = "zstd"
-        ))]
+        #[cfg(codecs)]
         if let Some(size) = self.state.buffered_file_size(&entry.node) {
             let mut entry = entry;
             let mut input = vec![0; size];
@@ -215,12 +210,7 @@ impl<W: AsyncWrite + AsyncSeek> AsyncBuilder<W> {
             return self.append_flat(entry, &mut input.as_slice()).await;
         }
         self.prepare_metadata(&entry.node).await?;
-        #[cfg(any(
-            feature = "lz4",
-            feature = "lzma",
-            feature = "deflate",
-            feature = "zstd"
-        ))]
+        #[cfg(codecs)]
         if entry.node.compression != super::Compression::None {
             return self.append_compressed(entry, &mut data).await;
         }
@@ -250,12 +240,7 @@ impl<W: AsyncWrite + AsyncSeek> AsyncBuilder<W> {
         Ok(())
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     async fn append_buffered(
         &mut self,
         mut entry: super::PendingEntry,
@@ -288,12 +273,7 @@ impl<W: AsyncWrite + AsyncSeek> AsyncBuilder<W> {
         Ok(())
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     async fn append_compressed(
         &mut self,
         mut entry: super::PendingEntry,
