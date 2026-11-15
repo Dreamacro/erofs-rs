@@ -6,12 +6,7 @@ use crate::{
 };
 use bytes::BufMut;
 use core::sync::atomic::{AtomicBool, AtomicUsize};
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 use {crate::tests::Read, core::sync::atomic::Ordering::Relaxed};
 
 // Independent native liblz4, liblzma (MicroLZMA), zlib (raw), and libzstd
@@ -542,12 +537,7 @@ fn decoded_extent_limit_is_checked_before_decoding() {
     }
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 #[test]
 fn codec_samples_require_complete_input_and_exact_output() {
     let wanted = expected();
@@ -906,12 +896,7 @@ fn plain_extent_mapping_and_interlaced_crop() {
     }
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 #[test]
 fn partial_references_stop_inside_literals_and_matches() {
     for (algorithm, encoding, payload) in enabled_samples() {
@@ -968,12 +953,7 @@ fn check_image(data: &[u8], wanted: &[u8]) {
     }
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 #[test]
 fn multiple_blocks_inline_tails_and_nondefault_clusters() {
     for (algorithm, _, payload) in enabled_samples() {
@@ -1019,12 +999,7 @@ fn multiple_blocks_inline_tails_and_nondefault_clusters() {
     }
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 #[test]
 fn extent_record_sizes_holes_and_partial_references() {
     for (algorithm, _, payload) in enabled_samples() {
@@ -1194,12 +1169,7 @@ fn compact_nondefault_cluster_pack_regions_use_filesystem_blocks() {
     assert_eq!(layout.end, 96);
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 #[test]
 fn packed_fragments_are_bounded_and_cannot_recurse() {
     for (algorithm, _, payload) in enabled_samples() {
@@ -1244,12 +1214,7 @@ fn packed_fragments_are_bounded_and_cannot_recurse() {
     }
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 #[test]
 fn sync_async_block_assembly_cache_and_retry_contracts() {
     let wanted = [expected(), vec![b'C'; 475]].concat();

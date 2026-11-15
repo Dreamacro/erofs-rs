@@ -48,3 +48,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["io-util"] }
 typed-path = { workspace = true }
 zrip = { workspace = true, optional = true }
+
+[build-dependencies]
+cfg_aliases = { workspace = true }

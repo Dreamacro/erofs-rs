@@ -10,12 +10,7 @@ use std::{
     path::{Path, PathBuf},
     thread,
 };
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 use std::{
     io::Read,
     sync::{Arc, Condvar, Mutex, mpsc},
@@ -24,12 +19,7 @@ use std::{
 use rustix::fs::OFlags;
 use typed_path::UnixPath;
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 use super::compress::{Encoder, FittedFile, INPUT_SIZE, SEGMENT_SIZE};
 use super::{Metadata, Options, SpecialFile, encode::Content, symlink_target};
 use crate::{Error, Result, Xattrs};
@@ -307,19 +297,9 @@ fn append_sources<'scope, 'env>(
     output: &mut (impl Write + Seek),
     options: Options,
 ) -> Result<()> {
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     let mut prefetch = Prefetch::start(scope, sources, options);
-    #[cfg(not(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    )))]
+    #[cfg(not(codecs))]
     let _ = scope;
     let mut links = HashMap::new();
     for source in sources {
@@ -374,12 +354,7 @@ fn append_sources<'scope, 'env>(
         } else if let Some(kind) = special_file(host) {
             builder.append_payload(path, &metadata, Content::Special(kind), 0, nlink, &[][..])?;
         } else {
-            #[cfg(any(
-                feature = "lz4",
-                feature = "lzma",
-                feature = "deflate",
-                feature = "zstd"
-            ))]
+            #[cfg(codecs)]
             if let Some(prepared) = prefetch.take(source) {
                 let Prepared { input, fitted } = prepared?;
                 if options.buffers_file(host.len()) {
@@ -418,23 +393,13 @@ fn open_file(path: &Path) -> io::Result<fs::File> {
         .open(path)
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 struct Prepared {
     input: Vec<u8>,
     fitted: FittedFile,
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 impl Prepared {
     fn held(result: &Result<Self>) -> usize {
         result.as_ref().map_or(0, |prepared| {
@@ -443,12 +408,7 @@ impl Prepared {
     }
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 #[derive(Clone, Copy)]
 struct Segment {
     job: usize,
@@ -457,24 +417,14 @@ struct Segment {
     len: usize,
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 impl Segment {
     fn charge(self) -> usize {
         self.len.next_multiple_of(super::encode::BLOCK_SIZE) + self.len.min(INPUT_SIZE)
     }
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 #[derive(Clone, Copy, Default)]
 struct Cursor {
     job: usize,
@@ -482,12 +432,7 @@ struct Cursor {
     offset: u64,
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 impl Cursor {
     fn next(&mut self, sources: &[Source], jobs: &[usize]) -> Option<Segment> {
         let &source = jobs.get(self.source)?;
@@ -509,12 +454,7 @@ impl Cursor {
     }
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 fn prepare(
     source: &Source,
     segment: Segment,
@@ -544,24 +484,14 @@ fn prepare(
     Ok(prepared)
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 #[derive(Default)]
 struct Window {
     state: Mutex<WindowState>,
     changed: Condvar,
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 #[derive(Default)]
 struct WindowState {
     cursor: Cursor,
@@ -570,12 +500,7 @@ struct WindowState {
     closed: bool,
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 impl Window {
     fn claim(
         &self,
@@ -608,12 +533,7 @@ impl Window {
     }
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 struct Prefetch<'env> {
     sources: &'env [Source],
     jobs: Arc<[usize]>,
@@ -621,12 +541,7 @@ struct Prefetch<'env> {
     mode: Mode,
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 enum Mode {
     Inline {
         options: Options,
@@ -640,12 +555,7 @@ enum Mode {
     },
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 impl<'env> Prefetch<'env> {
     fn start<'scope>(
         scope: &'scope thread::Scope<'scope, 'env>,
@@ -764,12 +674,7 @@ impl<'env> Prefetch<'env> {
     }
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 impl Drop for Prefetch<'_> {
     fn drop(&mut self) {
         if let Mode::Workers { window, .. } = &self.mode {

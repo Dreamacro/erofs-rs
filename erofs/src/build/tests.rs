@@ -81,12 +81,7 @@ fn superblock_checksum(image: &[u8]) -> u32 {
     !crc32c::crc32c(&covered)
 }
 
-#[cfg(any(
-    feature = "lz4",
-    feature = "lzma",
-    feature = "deflate",
-    feature = "zstd"
-))]
+#[cfg(codecs)]
 #[test]
 fn rejected_inline_candidates_fall_back_to_external_storage() {
     let mut seed = 7u32;
@@ -734,12 +729,7 @@ mod directory {
         assert!(write_image(&sources, &mut Cursor::new(Vec::new()), Options::default()).is_err());
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn workers_produce_identical_images() {
         let temp = Temp::new();
@@ -802,12 +792,7 @@ mod directory {
         }
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn segmented_workers_preserve_large_files() {
         use super::super::compress::SEGMENT_SIZE;
@@ -869,12 +854,7 @@ mod directory {
         );
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn worker_errors_fail_the_build() {
         let temp = Temp::new();
@@ -1226,12 +1206,7 @@ mod r#async {
         }
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn compressed_async_builders_migrate_between_threads() {
         let data: Vec<_> = (0..131_169).map(|i| ((i * 31) ^ (i / 97)) as u8).collect();
@@ -1290,12 +1265,7 @@ mod r#async {
         }
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn compressed_compact_indexes_preserve_streams_metadata_and_boundaries() {
         use crate::types::Layout;
@@ -1426,12 +1396,7 @@ mod r#async {
         }
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn short_files_use_compression_only_when_it_beats_flat_storage() {
         use crate::types::Layout;
@@ -1491,12 +1456,7 @@ mod r#async {
         }
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn compression_fallback_preserves_reusable_metadata_slots() {
         let mut seed = 7u32;
@@ -1550,12 +1510,7 @@ mod r#async {
         }
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn byte_granular_extents_refill_input_and_compress_eof_tails() {
         use super::super::compress::{Compressor, Encoder, INPUT_SIZE};
@@ -1631,12 +1586,7 @@ mod r#async {
         }
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn compact_index_packs_cover_alignment_transitions_and_odd_counts() {
         use crate::types::Layout;
@@ -1741,12 +1691,7 @@ mod r#async {
         }
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn compression_validation_io_errors_and_cancellation() {
         for compression in COMPRESSIONS
@@ -1822,12 +1767,7 @@ mod r#async {
         }
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn advanced_compression_keeps_streams_and_metadata_in_both_drivers() {
         let mut seed = 7u32;
@@ -1923,12 +1863,7 @@ mod r#async {
         }
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn packed_indexes_stream_across_pages_and_fragment_flush_errors_poison() {
         let compression = COMPRESSIONS
@@ -2078,12 +2013,7 @@ mod r#async {
         }
     }
 
-    #[cfg(any(
-        feature = "lz4",
-        feature = "lzma",
-        feature = "deflate",
-        feature = "zstd"
-    ))]
+    #[cfg(codecs)]
     #[test]
     fn compressed_indexes_stream_across_metadata_pages() {
         let zeros = vec![0; 12 * 1024 * 1024];
