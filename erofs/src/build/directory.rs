@@ -356,16 +356,33 @@ fn append_sources<'scope, 'env>(
         } else {
             #[cfg(codecs)]
             if let Some(prepared) = prefetch.take(source) {
-                let Prepared { input, fitted } = prepared?;
-                if options.buffers_file(host.len()) {
-                    builder.append_fitted(path, &metadata, nlink, &input, fitted)?;
-                } else {
-                    let mut file = builder.begin_segments(path, &metadata, host.len(), nlink)?;
-                    builder.append_segment(&mut file, fitted)?;
-                    while let Some(prepared) = prefetch.take(source) {
-                        builder.append_segment(&mut file, prepared?.fitted)?;
+                match prepared? {
+                    Prepared::Flat(input) => builder.append_payload(
+                        path,
+                        &metadata,
+                        Content::File,
+                        host.len(),
+                        nlink,
+                        &input[..],
+                    )?,
+                    Prepared::Buffered { input, fitted } => {
+                        builder.append_fitted(path, &metadata, nlink, &input, fitted)?;
                     }
-                    builder.finish_segments(file)?;
+                    Prepared::Segment(fitted) => {
+                        let mut file =
+                            builder.begin_segments(path, &metadata, host.len(), nlink)?;
+                        builder.append_segment(&mut file, fitted)?;
+                        while let Some(prepared) = prefetch.take(source) {
+                            let Prepared::Segment(fitted) = prepared? else {
+                                return Err(io::Error::other(
+                                    "whole-file result in a segmented file",
+                                )
+                                .into());
+                            };
+                            builder.append_segment(&mut file, fitted)?;
+                        }
+                        builder.finish_segments(file)?;
+                    }
                 }
                 links.get_mut(&identity).unwrap().1 = Some(path.as_bytes().to_vec());
                 continue;
@@ -394,16 +411,19 @@ fn open_file(path: &Path) -> io::Result<fs::File> {
 }
 
 #[cfg(codecs)]
-struct Prepared {
-    input: Vec<u8>,
-    fitted: FittedFile,
+enum Prepared {
+    Flat(Vec<u8>),
+    Buffered { input: Vec<u8>, fitted: FittedFile },
+    Segment(FittedFile),
 }
 
 #[cfg(codecs)]
 impl Prepared {
     fn held(result: &Result<Self>) -> usize {
-        result.as_ref().map_or(0, |prepared| {
-            prepared.input.len() + prepared.fitted.data.len()
+        result.as_ref().map_or(0, |prepared| match prepared {
+            Self::Flat(input) => input.len(),
+            Self::Buffered { input, fitted } => input.len() + fitted.data.len(),
+            Self::Segment(fitted) => fitted.data.len(),
         })
     }
 }
@@ -464,31 +484,33 @@ fn prepare(
 ) -> Result<Prepared> {
     let mut file = open_file(&source.path)?;
     verify(source, &file.metadata()?)?;
-    // Only whole short files need their input for flat fallback at commit time.
-    let prepared = if options.buffers_file(source.metadata.len()) {
+    // Whole short files retain their input for flat storage or compression fallback.
+    let prepared = if source.metadata.len() <= INPUT_SIZE as u64 {
         let mut input = vec![0; segment.len];
         file.read_exact(&mut input)?;
-        let fitted = FittedFile::fit(options, encoder, &input)?;
-        Prepared { input, fitted }
+        if options.buffers_file(source.metadata.len()) {
+            let fitted = FittedFile::fit(options, encoder, &input)?;
+            Prepared::Buffered { input, fitted }
+        } else {
+            Prepared::Flat(input)
+        }
     } else {
         if segment.offset != 0 {
             file.seek(io::SeekFrom::Start(segment.offset))?;
         }
         let fitted = FittedFile::fit_from(options, encoder, segment.len, &mut file, buffer)?;
-        Prepared {
-            input: Vec::new(),
-            fitted,
-        }
+        Prepared::Segment(fitted)
     };
     verify(source, &file.metadata()?)?;
     Ok(prepared)
 }
 
 #[cfg(codecs)]
-#[derive(Default)]
 struct Window {
     state: Mutex<WindowState>,
     changed: Condvar,
+    capacity: usize,
+    byte_capacity: usize,
 }
 
 #[cfg(codecs)]
@@ -502,13 +524,21 @@ struct WindowState {
 
 #[cfg(codecs)]
 impl Window {
-    fn claim(
-        &self,
-        sources: &[Source],
-        jobs: &[usize],
-        capacity: usize,
-        byte_capacity: usize,
-    ) -> Option<Segment> {
+    fn new(capacity: usize, byte_capacity: usize) -> Self {
+        Self {
+            state: Mutex::default(),
+            changed: Condvar::new(),
+            capacity,
+            byte_capacity,
+        }
+    }
+
+    fn can_claim(&self, state: &WindowState, segment: Segment) -> bool {
+        segment.job - state.consumed < self.capacity
+            && state.bytes + segment.charge() <= self.byte_capacity
+    }
+
+    fn claim(&self, sources: &[Source], jobs: &[usize]) -> Option<Segment> {
         let mut state = self.state.lock().unwrap();
         loop {
             if state.closed {
@@ -516,19 +546,46 @@ impl Window {
             }
             let mut cursor = state.cursor;
             let segment = cursor.next(sources, jobs)?;
-            if segment.job - state.consumed < capacity
-                && state.bytes + segment.charge() <= byte_capacity
-            {
+            if self.can_claim(&state, segment) {
                 state.cursor = cursor;
                 state.bytes += segment.charge();
+                let next = cursor.next(sources, jobs);
+                let wake_next = next.is_some_and(|next| self.can_claim(&state, next));
+                drop(state);
+                if next.is_none() {
+                    self.changed.notify_all();
+                } else if wake_next {
+                    // A byte-budget release can admit more than one job.
+                    self.changed.notify_one();
+                }
                 return Some(segment);
             }
             state = self.changed.wait(state).unwrap();
         }
     }
 
-    fn update(&self, change: impl FnOnce(&mut WindowState)) {
-        change(&mut self.state.lock().unwrap());
+    fn prepared(&self, segment: Segment, held: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.bytes = state.bytes + held - segment.charge();
+        let wake = held < segment.charge()
+            && state.cursor.job - state.consumed < self.capacity
+            && !state.closed;
+        drop(state);
+        if wake {
+            self.changed.notify_one();
+        }
+    }
+
+    fn consume(&self, job: usize, held: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.consumed = job + 1;
+        state.bytes -= held;
+        drop(state);
+        self.changed.notify_one();
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
         self.changed.notify_all();
     }
 }
@@ -570,7 +627,7 @@ impl<'env> Prefetch<'env> {
                 let host = &source.metadata;
                 host.is_file()
                     && seen.insert((host.dev(), host.ino()))
-                    && options.prefits_file(host.len())
+                    && options.prefetches_file(host.len())
             })
             .map(|(index, _)| index)
             .collect();
@@ -597,10 +654,11 @@ impl<'env> Prefetch<'env> {
         jobs: &Arc<[usize]>,
         options: Options,
     ) -> Mode {
-        let window = Arc::new(Window::default());
+        let window = Arc::new(Window::new(
+            options.workers.saturating_mul(8),
+            options.workers.saturating_mul(2 * SEGMENT_SIZE),
+        ));
         let (sender, results) = mpsc::channel();
-        let capacity = options.workers.saturating_mul(8);
-        let byte_capacity = options.workers.saturating_mul(2 * SEGMENT_SIZE);
         let segments = jobs
             .iter()
             .map(|&source| sources[source].metadata.len().div_ceil(SEGMENT_SIZE as u64))
@@ -613,11 +671,11 @@ impl<'env> Prefetch<'env> {
             scope.spawn(move || {
                 let mut encoder = Encoder::new(&options);
                 let mut buffer = Vec::new();
-                while let Some(segment) = window.claim(sources, &jobs, capacity, byte_capacity) {
+                while let Some(segment) = window.claim(sources, &jobs) {
                     let source = &sources[segment.source];
                     let result = prepare(source, segment, &options, &mut encoder, &mut buffer);
                     let held = Prepared::held(&result);
-                    window.update(|state| state.bytes = state.bytes + held - segment.charge());
+                    window.prepared(segment, held);
                     if sender.send((segment.job, result)).is_err() {
                         break;
                     }
@@ -661,15 +719,14 @@ impl<'env> Prefetch<'env> {
                     ready.insert(done, result);
                 }
                 Err(_) => {
-                    return Some(Err(io::Error::other("compression worker stopped").into()));
+                    return Some(Err(
+                        io::Error::other("file preparation worker stopped").into()
+                    ));
                 }
             }
         };
         let held = Prepared::held(&result);
-        window.update(|state| {
-            state.consumed = segment.job + 1;
-            state.bytes -= held;
-        });
+        window.consume(segment.job, held);
         Some(result)
     }
 }
@@ -678,7 +735,279 @@ impl<'env> Prefetch<'env> {
 impl Drop for Prefetch<'_> {
     fn drop(&mut self) {
         if let Mode::Workers { window, .. } = &self.mode {
-            window.update(|state| state.closed = true);
+            window.close();
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    codecs,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "hurd"
+    )
+))]
+mod tests {
+    use super::super::{
+        Compression,
+        encode::BLOCK_SIZE,
+        tests::{COMPRESSIONS, directory::Temp},
+    };
+    use super::*;
+    use std::time::Duration;
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    struct UnblockOnDrop<'a>(&'a Window);
+
+    impl Drop for UnblockOnDrop<'_> {
+        fn drop(&mut self) {
+            // Clean up even when the notification under test is broken.
+            self.0
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closed = true;
+            self.0.changed.notify_all();
+        }
+    }
+
+    fn window_sources(sizes: &[usize]) -> (Temp, Vec<Source>, Vec<usize>) {
+        let temp = Temp::new();
+        for (index, &size) in sizes.iter().enumerate() {
+            fs::File::create(temp.0.join(format!("file-{index}")))
+                .unwrap()
+                .set_len(size as u64)
+                .unwrap();
+        }
+        let sources = scan(&temp.0, Options::default()).unwrap();
+        let jobs = sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| source.metadata.is_file())
+            .map(|(index, _)| index)
+            .collect();
+        (temp, sources, jobs)
+    }
+
+    fn parked_claimants<'scope, 'env>(
+        scope: &'scope thread::Scope<'scope, 'env>,
+        window: &'env Window,
+        sources: &'env [Source],
+        jobs: &'env [usize],
+        count: usize,
+    ) -> mpsc::Receiver<Option<Segment>> {
+        let (waiting, registered) = mpsc::channel();
+        let (finished, results) = mpsc::channel();
+        for _ in 0..count {
+            let (waiting, finished) = (waiting.clone(), finished.clone());
+            scope.spawn(move || {
+                let state = window.state.lock().unwrap();
+                let _ = waiting.send(());
+                let state = window
+                    .changed
+                    .wait_while(state, |state| {
+                        let mut cursor = state.cursor;
+                        !state.closed
+                            && cursor
+                                .next(sources, jobs)
+                                .is_some_and(|next| !window.can_claim(state, next))
+                    })
+                    .unwrap();
+                drop(state);
+                let _ = finished.send(window.claim(sources, jobs));
+            });
+        }
+        for _ in 0..count {
+            registered.recv_timeout(WAIT).unwrap();
+        }
+        // Each readiness send holds this mutex until the atomic wait releases it.
+        drop(window.state.lock().unwrap());
+        results
+    }
+
+    #[test]
+    fn window_job_slots_and_exhaustion_wake_waiters() {
+        let (_temp, sources, jobs) = window_sources(&[1, 1, 1]);
+        let window = Window::new(1, 8 * BLOCK_SIZE);
+        let first = window.claim(&sources, &jobs).unwrap();
+        thread::scope(|scope| {
+            let _cleanup = UnblockOnDrop(&window);
+            let results = parked_claimants(scope, &window, &sources, &jobs, 4);
+            window.prepared(first, 1);
+            assert!(matches!(results.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            window.consume(first.job, 1);
+            let second = results.recv_timeout(WAIT).unwrap().unwrap();
+            assert_eq!(second.job, 1);
+            assert!(matches!(results.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            window.prepared(second, 1);
+            window.consume(second.job, 1);
+            let claimed: Vec<_> = (0..3)
+                .filter_map(|_| results.recv_timeout(WAIT).unwrap())
+                .collect();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].job, 2);
+            // Exhaustion must wake the other two waiters before close or further progress.
+            window.prepared(claimed[0], 1);
+            window.consume(claimed[0].job, 1);
+            let WindowState {
+                bytes, consumed, ..
+            } = *window.state.lock().unwrap();
+            assert_eq!((bytes, consumed), (0, 3));
+        });
+    }
+
+    #[test]
+    fn window_byte_releases_pass_the_wakeup_to_all_admissible_jobs() {
+        let (_temp, sources, jobs) = window_sources(&[INPUT_SIZE, 1, 1, 1]);
+        for held in [0, INPUT_SIZE + BLOCK_SIZE, 2 * INPUT_SIZE] {
+            let window = Window::new(4, 2 * INPUT_SIZE);
+            let first = window.claim(&sources, &jobs).unwrap();
+            thread::scope(|scope| {
+                let _cleanup = UnblockOnDrop(&window);
+                let results = parked_claimants(scope, &window, &sources, &jobs, 3);
+                window.prepared(first, held);
+                let consumed = held == first.charge();
+                if consumed {
+                    window.consume(first.job, held);
+                }
+                // No claimant finishes or consumes its job to trigger another notification.
+                let mut claimed: Vec<_> = (0..3)
+                    .map(|_| results.recv_timeout(WAIT).unwrap().unwrap())
+                    .collect();
+                claimed.sort_unstable_by_key(|segment| segment.job);
+                assert_eq!(
+                    claimed
+                        .iter()
+                        .map(|segment| segment.job)
+                        .collect::<Vec<_>>(),
+                    [1, 2, 3]
+                );
+                let expected_bytes = claimed
+                    .iter()
+                    .map(|segment| segment.charge())
+                    .sum::<usize>()
+                    + if consumed { 0 } else { held };
+                let WindowState {
+                    bytes,
+                    consumed: count,
+                    ..
+                } = *window.state.lock().unwrap();
+                assert_eq!((bytes, count), (expected_bytes, usize::from(consumed)));
+            });
+        }
+    }
+
+    #[test]
+    fn window_close_wakes_all_waiters() {
+        let (_temp, sources, jobs) = window_sources(&[1, 1]);
+        let window = Window::new(1, 8 * BLOCK_SIZE);
+        window.claim(&sources, &jobs).unwrap();
+        thread::scope(|scope| {
+            let _cleanup = UnblockOnDrop(&window);
+            let results = parked_claimants(scope, &window, &sources, &jobs, 4);
+            window.close();
+            for _ in 0..4 {
+                assert!(results.recv_timeout(WAIT).unwrap().is_none());
+            }
+            assert!(window.claim(&sources, &jobs).is_none());
+        });
+    }
+
+    #[test]
+    fn prefetch_selects_and_prepares_file_kinds() {
+        let temp = Temp::new();
+        for (index, size) in [
+            0,
+            1,
+            BLOCK_SIZE - 1,
+            BLOCK_SIZE,
+            BLOCK_SIZE + 1,
+            INPUT_SIZE,
+            INPUT_SIZE + 1,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fs::write(temp.0.join(format!("file-{index}")), vec![42; size]).unwrap();
+        }
+        fs::hard_link(temp.0.join("file-3"), temp.0.join("z-hardlink")).unwrap();
+        std::os::unix::fs::symlink("file-3", temp.0.join("z-symlink")).unwrap();
+        let sources = scan(&temp.0, Options::default()).unwrap();
+        let compression = COMPRESSIONS
+            .into_iter()
+            .find(|codec| *codec != Compression::None && codec.enabled())
+            .unwrap();
+        let options = Options::default().compression(compression).workers(2);
+        for (options, prepares) in [
+            (options.workers(1), true),
+            (options, true),
+            (options.compression(Compression::None), false),
+            (options.inline_compressed_tails(true), false),
+            (options.fragments(true), false),
+        ] {
+            thread::scope(|scope| {
+                let mut prefetch = Prefetch::start(scope, &sources, options);
+                assert_eq!(
+                    matches!(&prefetch.mode, Mode::Inline { .. }),
+                    options.workers == 1
+                );
+                for (index, source) in sources.iter().enumerate() {
+                    let size = source.metadata.len() as usize;
+                    let original_file = source
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .as_bytes()
+                        .starts_with(b"file-");
+                    let eligible = original_file
+                        && prepares
+                        && size != 0
+                        && (options.workers > 1 || size > BLOCK_SIZE);
+                    assert_eq!(prefetch.jobs.contains(&index), eligible);
+                    let result = prefetch.take(source);
+                    if !eligible {
+                        assert!(result.is_none());
+                        continue;
+                    }
+                    let result = result.expect("eligible file must be prepared");
+                    let held = Prepared::held(&result);
+                    match result.unwrap() {
+                        Prepared::Flat(input) => {
+                            assert!((1..=BLOCK_SIZE).contains(&size));
+                            assert!(options.workers > 1);
+                            assert_eq!(input, vec![42; size]);
+                            assert_eq!(held, size);
+                        }
+                        Prepared::Buffered { input, fitted } => {
+                            assert!(size > BLOCK_SIZE && size <= INPUT_SIZE);
+                            assert_eq!(input, vec![42; size]);
+                            assert!(!fitted.data.is_empty());
+                            assert_eq!(held, size + fitted.data.len());
+                        }
+                        Prepared::Segment(fitted) => {
+                            assert!(size > INPUT_SIZE);
+                            assert!(!fitted.data.is_empty());
+                            assert_eq!(held, fitted.data.len());
+                        }
+                    }
+                    assert!(prefetch.take(source).is_none());
+                }
+                if let Mode::Workers { window, .. } = &prefetch.mode {
+                    let WindowState {
+                        consumed, bytes, ..
+                    } = *window.state.lock().unwrap();
+                    assert_eq!(consumed, prefetch.jobs.len());
+                    assert_eq!(bytes, 0);
+                }
+            });
+        }
+        assert_eq!(
+            Prepared::held(&Err(io::Error::other("test error").into())),
+            0
+        );
     }
 }

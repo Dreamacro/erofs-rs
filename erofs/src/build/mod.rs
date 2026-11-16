@@ -231,11 +231,14 @@ impl Options {
         self
     }
 
-    /// Threads compressing files during directory import. Defaults to 1.
-    /// Images are identical for any count. Large files use fixed 16 MiB segments,
-    /// read through a 1 MiB buffer per worker; up to 8 jobs and 32 MiB of fitted
-    /// output per worker are prefetched, plus indexes and encoder state.
-    /// Inline compressed tails and fragments retain the serial streaming path.
+    /// Threads preparing file data during compressed directory import. Defaults to 1.
+    /// One worker executes directly; multiple workers also prefetch nonempty files
+    /// up to 4 KiB without compressing them. Images are identical for any count.
+    /// Large files use fixed 16 MiB segments, read through a 1 MiB buffer per worker.
+    /// The prefetch window allows up to 8 jobs and 32 MiB of input/output bytes per
+    /// worker. Read buffers, spare allocation capacity, indexes and encoder state
+    /// are additional; this is not a total memory limit.
+    /// Uncompressed builds, inline compressed tails and fragments remain serial.
     pub fn workers(mut self, workers: usize) -> Self {
         self.workers = workers;
         self
@@ -243,15 +246,19 @@ impl Options {
 
     #[cfg(codecs)]
     fn buffers_file(self, size: u64) -> bool {
-        self.prefits_file(size) && size <= compress::INPUT_SIZE as u64
+        self.supports_prefitting()
+            && size > BLOCK_SIZE as u64
+            && size <= compress::INPUT_SIZE as u64
     }
 
     #[cfg(codecs)]
-    fn prefits_file(self, size: u64) -> bool {
-        self.compression != Compression::None
-            && size > BLOCK_SIZE as u64
-            && !self.inline_compressed_tails
-            && !self.fragments
+    fn prefetches_file(self, size: u64) -> bool {
+        self.supports_prefitting() && size != 0 && (self.workers > 1 || size > BLOCK_SIZE as u64)
+    }
+
+    #[cfg(codecs)]
+    fn supports_prefitting(self) -> bool {
+        self.compression != Compression::None && !self.inline_compressed_tails && !self.fragments
     }
 
     fn config_size(self) -> usize {

@@ -9,7 +9,7 @@ use crate::{
 };
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 
-const COMPRESSIONS: [Compression; 5] = [
+pub(super) const COMPRESSIONS: [Compression; 5] = [
     Compression::None,
     Compression::Lz4,
     Compression::Lzma,
@@ -461,7 +461,7 @@ fn inline_tails_pack_metadata_and_preserve_boundaries() {
     target_vendor = "apple",
     target_os = "hurd"
 ))]
-mod directory {
+pub(super) mod directory {
     use super::super::directory::{from_directory, importable_suffix, scan, write_image};
     use super::*;
     use crate::types::Layout;
@@ -482,10 +482,10 @@ mod directory {
         rustix::fs::setxattr(path, name, value, rustix::fs::XattrFlags::empty()).unwrap();
     }
 
-    struct Temp(PathBuf);
+    pub(in crate::build) struct Temp(pub(in crate::build) PathBuf);
 
     impl Temp {
-        fn new() -> Self {
+        pub(in crate::build) fn new() -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             loop {
                 let path = std::env::temp_dir().join(format!(
@@ -807,6 +807,10 @@ mod directory {
         fs::write(&file, &data).unwrap();
         fs::hard_link(&file, root.join("alias")).unwrap();
         set_xattr(&file, b"user.segment", &[42; 3000]);
+        for n in 0..96 {
+            let size = [1, 4096, 8192][n % 3];
+            fs::write(root.join(format!("file{n:03}")), vec![n as u8; size]).unwrap();
+        }
         let sources = scan(&root, Options::default()).unwrap();
         for compression in COMPRESSIONS
             .into_iter()
@@ -832,11 +836,23 @@ mod directory {
                 check_read_at(&file, &afile, &data);
                 assert!(read_all(file) == data);
                 assert!(read_all(fs.open("alias").unwrap()) == data);
+                for n in 0..96 {
+                    let size = [1, 4096, 8192][n % 3];
+                    assert_eq!(
+                        read_all(fs.open(format!("file{n:03}")).unwrap()),
+                        vec![n as u8; size]
+                    );
+                }
                 assert_eq!(
                     fs.xattrs("large").unwrap(),
                     xattrs([(b"user.segment", &[42; 3000])])
                 );
-                assert!(write_image(&sources, &mut Output::new(0), options.workers(8)).is_err());
+                for limit in [0, encode::BLOCK_SIZE + 1] {
+                    assert!(matches!(
+                        write_image(&sources, &mut Output::new(limit), options.workers(8)),
+                        Err(Error::Io(error)) if error.kind() == io::ErrorKind::WriteZero
+                    ));
+                }
             }
         }
         fs::write(&file, b"changed").unwrap();
@@ -852,6 +868,72 @@ mod directory {
             )
             .is_err()
         );
+    }
+
+    #[cfg(codecs)]
+    #[test]
+    fn tiny_workers_preserve_images_and_errors() {
+        let temp = Temp::new();
+        let root = temp.0.join("root");
+        fs::create_dir(&root).unwrap();
+        for n in 0..192 {
+            let size = [0, 1, 4095, 4096][n % 4];
+            fs::write(root.join(format!("file{n:03}")), vec![n as u8; size]).unwrap();
+        }
+        fs::hard_link(root.join("file002"), root.join("alias")).unwrap();
+        symlink("file003", root.join("link")).unwrap();
+        set_xattr(&root.join("file001"), b"user.tiny", b"value");
+        for compression in COMPRESSIONS.into_iter().filter(|codec| codec.enabled()) {
+            for (tails, fragments) in [(false, false), (true, false), (false, true)] {
+                if compression == Compression::None && (tails || fragments) {
+                    continue;
+                }
+                let options = Options::default()
+                    .compression(compression)
+                    .inline_compressed_tails(tails)
+                    .fragments(fragments);
+                let sources = scan(&root, options).unwrap();
+                let mut expected = Cursor::new(Vec::new());
+                write_image(&sources, &mut expected, options).unwrap();
+                for workers in [2, 8] {
+                    let mut actual = Cursor::new(Vec::new());
+                    write_image(&sources, &mut actual, options.workers(workers)).unwrap();
+                    assert_eq!(actual.into_inner(), *expected.get_ref());
+                    for limit in [0, encode::BLOCK_SIZE + 1, 3 * encode::BLOCK_SIZE + 1] {
+                        let mut output = Output::new(limit);
+                        assert!(matches!(
+                            write_image(&sources, &mut output, options.workers(workers)),
+                            Err(Error::Io(error)) if error.kind() == io::ErrorKind::WriteZero
+                        ));
+                        assert_eq!(output.remaining, 0);
+                        if limit > encode::BLOCK_SIZE {
+                            assert!(output.data.get_ref().len() > encode::BLOCK_SIZE);
+                        }
+                    }
+                }
+                let image = source(expected.get_ref());
+                let fs = crate::EroFS::new(&image).unwrap();
+                for n in 0..192 {
+                    let size = [0, 1, 4095, 4096][n % 4];
+                    assert_eq!(
+                        read_all(fs.open(format!("file{n:03}")).unwrap()),
+                        vec![n as u8; size]
+                    );
+                }
+                assert_eq!(
+                    fs.xattrs("file001").unwrap(),
+                    xattrs([(b"user.tiny", &b"value"[..])])
+                );
+            }
+        }
+        let compression = COMPRESSIONS
+            .into_iter()
+            .find(|codec| *codec != Compression::None && codec.enabled())
+            .unwrap();
+        let options = Options::default().compression(compression).workers(8);
+        let sources = scan(&root, options).unwrap();
+        fs::write(root.join("file129"), b"changed").unwrap();
+        assert!(write_image(&sources, &mut Cursor::new(Vec::new()), options).is_err());
     }
 
     #[cfg(codecs)]
