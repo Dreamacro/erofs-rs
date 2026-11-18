@@ -1,8 +1,7 @@
 use std::{io::Write, os::unix::fs::PermissionsExt};
 
-use crate::source;
+use crate::{local_time, source};
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Local};
 use clap::{Args, Subcommand};
 use erofs_rs::{
     EroFS, Xattrs,
@@ -10,6 +9,7 @@ use erofs_rs::{
     backend::{AsyncImage, Image},
     types::Inode,
 };
+use jiff::ZonedDateTime;
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
@@ -131,18 +131,13 @@ fn format_size(inode: &Inode) -> String {
 }
 
 fn format_time(inode: &Inode) -> String {
-    let (secs, nanos) = inode.modified_unix();
-    let dt = DateTime::from_timestamp(secs, nanos)
-        .map(|dt| dt.with_timezone(&Local))
-        .and_then(|dt| dt.naive_utc().checked_add_offset(*dt.offset()));
-    let Some(dt) = dt else {
+    let Some(dt) = local_time(inode.modified_unix()) else {
         return "<invalid timestamp>".to_string();
     };
-    let now = Local::now();
-    if dt.year() == now.year() {
-        dt.format("%b %e %H:%M").to_string()
+    if dt.year() == ZonedDateTime::now().year() {
+        dt.strftime("%b %e %H:%M").to_string()
     } else {
-        dt.format("%b %e  %Y").to_string()
+        dt.strftime("%b %e  %Y").to_string()
     }
 }
 

@@ -15,12 +15,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 bitflags.workspace = true
-chrono = { workspace = true, default-features = false, features = [
-    "std",
-    "clock",
-] }
 clap = { workspace = true, default-features = true, features = ["derive"] }
 erofs-rs = { path = "../erofs", features = ["opendal", "lz4", "lzma", "deflate", "zstd"] }
+jiff.workspace = true
 memmap2 = { workspace = true, default-features = true }
 opendal = { workspace = true, default-features = true, features = ["services-http"] }
 tar = { workspace = true, default-features = true }

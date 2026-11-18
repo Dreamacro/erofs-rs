@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use jiff::{Timestamp, ZonedDateTime, tz::TimeZone};
 
 #[cfg(unix)]
 mod build;
@@ -22,6 +23,11 @@ enum Commands {
 struct Opt {
     #[command(subcommand)]
     command: Commands,
+}
+
+fn local_time((seconds, nanos): (i64, u32)) -> Option<ZonedDateTime> {
+    let timestamp = Timestamp::new(seconds, nanos.try_into().ok()?).ok()?;
+    Some(timestamp.to_zoned_datetime(TimeZone::system()))
 }
 
 #[tokio::main]

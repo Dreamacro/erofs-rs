@@ -1,7 +1,6 @@
-use crate::source;
+use crate::{local_time, source};
 use anyhow::Result;
 use bitflags::Flags;
-use chrono::{DateTime, Local};
 use clap::Args;
 use erofs_rs::{
     EroFS,
@@ -111,10 +110,8 @@ pub async fn dump(args: DumpArgs) -> Result<()> {
     );
     let created = block
         .created_unix()
-        .and_then(|(seconds, nanos)| DateTime::from_timestamp(seconds, nanos))
-        .map(|dt| dt.with_timezone(&Local))
-        .and_then(|dt| dt.naive_utc().checked_add_offset(*dt.offset()))
-        .map(|dt| dt.format("%a %b %e %H:%M:%S %Y").to_string())
+        .and_then(local_time)
+        .map(|dt| dt.strftime("%a %b %e %H:%M:%S %Y").to_string())
         .unwrap_or_else(|| "<invalid timestamp>".to_string());
     println!("Filesystem created:                           {}", created);
     println!(
