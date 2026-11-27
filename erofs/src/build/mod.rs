@@ -235,7 +235,7 @@ impl Options {
     /// One worker executes directly; multiple workers also prefetch nonempty files
     /// up to 4 KiB without compressing them. Images are identical for any count.
     /// Large files use fixed 16 MiB segments, read through a 1 MiB buffer per worker.
-    /// The prefetch window allows up to 8 jobs and 32 MiB of input/output bytes per
+    /// The prefetch window allows up to 32 jobs and 32 MiB of input/output bytes per
     /// worker. Read buffers, spare allocation capacity, indexes and encoder state
     /// are additional; this is not a total memory limit.
     /// Uncompressed builds, inline compressed tails and fragments remain serial.

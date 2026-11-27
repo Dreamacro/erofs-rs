@@ -742,7 +742,7 @@ impl<'env> Prefetch<'env> {
         options: Options,
     ) -> Mode {
         let window = Arc::new(Window::new(
-            options.workers.saturating_mul(8),
+            options.workers.saturating_mul(32),
             options.workers.saturating_mul(2 * SEGMENT_SIZE),
         ));
         let (sender, results) = mpsc::channel();
