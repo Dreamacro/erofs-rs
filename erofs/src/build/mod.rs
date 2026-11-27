@@ -239,6 +239,7 @@ impl Options {
     /// worker. Read buffers, spare allocation capacity, indexes and encoder state
     /// are additional; this is not a total memory limit.
     /// Uncompressed builds, inline compressed tails and fragments remain serial.
+    /// Directory scanning uses the same count in every build.
     pub fn workers(mut self, workers: usize) -> Self {
         self.workers = workers;
         self
