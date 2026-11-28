@@ -200,7 +200,7 @@ fn describe(
     let (next, failed) = (AtomicUsize::new(0), AtomicBool::new(false));
     thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(|| {
+            let spawned = thread::Builder::new().spawn_scoped(scope, || {
                 while !failed.load(Ordering::Relaxed) {
                     let start = next.fetch_add(CHUNK, Ordering::Relaxed);
                     if start >= entries.len() {
@@ -209,13 +209,20 @@ fn describe(
                     for index in start..(start + CHUNK).min(entries.len()) {
                         let (path, metadata) = &entries[index];
                         let result = describe(path, metadata.as_deref().cloned());
-                        failed.fetch_or(result.is_err(), Ordering::Relaxed);
+                        if result.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
                         let _ = results[index].set(result);
                     }
                 }
             });
+            if let Err(error) = spawned {
+                failed.store(true, Ordering::Relaxed);
+                return Err(error);
+            }
         }
-    });
+        Ok(())
+    })?;
     // Chunks are claimed in order, so no gap precedes the first error.
     let described = results
         .into_iter()
