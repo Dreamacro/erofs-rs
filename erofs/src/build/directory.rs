@@ -1,4 +1,4 @@
-use alloc::{format, string::ToString, vec::Vec};
+use alloc::{boxed::Box, format, string::ToString, vec::Vec};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, Metadata as HostMetadata, OpenOptions},
@@ -8,6 +8,10 @@ use std::{
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
 };
 #[cfg(codecs)]
@@ -121,29 +125,122 @@ pub(super) fn scan(root: &Path, options: Options) -> Result<Vec<Source>> {
         return Err(Error::NotADirectory(root.display().to_string()));
     }
     let mut directories = HashSet::from([(metadata.dev(), metadata.ino())]);
-    let mut sources = vec![new_source(root.to_path_buf(), metadata, options)?];
+    let mut entries = vec![(root.to_path_buf(), Some(Box::new(metadata)))];
     // Iterate the growing list instead of recursing on host directory depth.
     let mut index = 0;
-    while index < sources.len() {
-        if sources[index].metadata.is_dir() {
-            let mut children =
-                fs::read_dir(&sources[index].path)?.collect::<io::Result<Vec<_>>>()?;
+    while index < entries.len() {
+        if entries[index]
+            .1
+            .as_deref()
+            .is_some_and(HostMetadata::is_dir)
+        {
+            let mut children = fs::read_dir(&entries[index].0)?.collect::<io::Result<Vec<_>>>()?;
             children.sort_by_cached_key(|child| child.file_name());
             for child in children {
-                // Relative to the open directory; does not follow symlinks.
-                let metadata = child.metadata()?;
-                if metadata.is_dir() && !directories.insert((metadata.dev(), metadata.ino())) {
-                    return Err(Error::NotSupported(format!(
-                        "directory cycle or alias at {}",
-                        child.path().display()
-                    )));
-                }
-                sources.push(new_source(child.path(), metadata, options)?);
+                // Other entries are stat'ed by `describe`.
+                let metadata = if child.file_type()?.is_dir() {
+                    // Relative to the open directory; does not follow symlinks.
+                    let metadata = child.metadata()?;
+                    if metadata.is_dir() && !directories.insert((metadata.dev(), metadata.ino())) {
+                        return Err(Error::NotSupported(format!(
+                            "directory cycle or alias at {}",
+                            child.path().display()
+                        )));
+                    }
+                    Some(Box::new(metadata))
+                } else {
+                    None
+                };
+                entries.push((child.path(), metadata));
             }
         }
         index += 1;
     }
-    Ok(sources)
+    describe(entries, options)
+}
+
+fn describe(
+    entries: Vec<(PathBuf, Option<Box<HostMetadata>>)>,
+    options: Options,
+) -> Result<Vec<Source>> {
+    const CHUNK: usize = 64;
+    let describe = |path: &Path, metadata: Option<HostMetadata>| {
+        let metadata = match metadata {
+            Some(metadata) => metadata,
+            None => {
+                let metadata = fs::symlink_metadata(path)?;
+                if metadata.is_dir() {
+                    return Err(io::Error::other(format!(
+                        "source changed during image build: {}",
+                        path.display()
+                    ))
+                    .into());
+                }
+                metadata
+            }
+        };
+        let has_xattrs = check_source(path, &metadata, options)?;
+        Ok((metadata, has_xattrs))
+    };
+    let workers = options.workers.min(entries.len().div_ceil(CHUNK));
+    if workers <= 1 {
+        return entries
+            .into_iter()
+            .map(|(path, metadata)| {
+                let (metadata, has_xattrs) = describe(&path, metadata.map(|metadata| *metadata))?;
+                Ok(Source {
+                    path,
+                    metadata,
+                    has_xattrs,
+                })
+            })
+            .collect();
+    }
+    let results: Vec<OnceLock<Result<_>>> = entries.iter().map(|_| OnceLock::new()).collect();
+    let (next, failed) = (AtomicUsize::new(0), AtomicBool::new(false));
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let spawned = thread::Builder::new().spawn_scoped(scope, || {
+                while !failed.load(Ordering::Relaxed) {
+                    let start = next.fetch_add(CHUNK, Ordering::Relaxed);
+                    if start >= entries.len() {
+                        break;
+                    }
+                    for index in start..(start + CHUNK).min(entries.len()) {
+                        let (path, metadata) = &entries[index];
+                        let result = describe(path, metadata.as_deref().cloned());
+                        if result.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        let _ = results[index].set(result);
+                    }
+                }
+            });
+            if let Err(error) = spawned {
+                failed.store(true, Ordering::Relaxed);
+                return Err(error);
+            }
+        }
+        Ok(())
+    })?;
+    // Chunks are claimed in order, so no gap precedes the first error.
+    let described = results
+        .into_iter()
+        .map(|result| {
+            result
+                .into_inner()
+                .expect("described before the first error")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(entries
+        .into_iter()
+        .zip(described)
+        .map(|((path, _), (metadata, has_xattrs))| Source {
+            path,
+            metadata,
+            has_xattrs,
+        })
+        .collect())
 }
 
 #[cfg(any(
@@ -235,8 +332,9 @@ fn special_file(metadata: &HostMetadata) -> Option<SpecialFile> {
     }
 }
 
-fn new_source(path: PathBuf, metadata: HostMetadata, options: Options) -> Result<Source> {
-    if let Some(kind) = special_file(&metadata) {
+// Returns whether the entry has supported xattrs.
+fn check_source(path: &Path, metadata: &HostMetadata, options: Options) -> Result<bool> {
+    if let Some(kind) = special_file(metadata) {
         kind.validate()?;
     } else if !metadata.is_dir() && !metadata.is_file() && !metadata.is_symlink() {
         return Err(Error::NotSupported(format!(
@@ -244,7 +342,7 @@ fn new_source(path: PathBuf, metadata: HostMetadata, options: Options) -> Result
             path.display()
         )));
     }
-    let has_xattrs = !read_xattrs(&path, options.skip_unsupported_xattrs)?.is_empty();
+    let has_xattrs = !read_xattrs(path, options.skip_unsupported_xattrs)?.is_empty();
     if !(0..1_000_000_000).contains(&metadata.mtime_nsec()) || metadata.mode() > u32::from(u16::MAX)
     {
         return Err(Error::NotSupported(format!(
@@ -252,11 +350,7 @@ fn new_source(path: PathBuf, metadata: HostMetadata, options: Options) -> Result
             path.display()
         )));
     }
-    Ok(Source {
-        path,
-        metadata,
-        has_xattrs,
-    })
+    Ok(has_xattrs)
 }
 
 fn verify(source: &Source, current: &HostMetadata) -> Result<()> {
@@ -655,7 +749,7 @@ impl<'env> Prefetch<'env> {
         options: Options,
     ) -> Mode {
         let window = Arc::new(Window::new(
-            options.workers.saturating_mul(8),
+            options.workers.saturating_mul(32),
             options.workers.saturating_mul(2 * SEGMENT_SIZE),
         ));
         let (sender, results) = mpsc::channel();

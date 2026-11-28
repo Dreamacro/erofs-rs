@@ -962,6 +962,43 @@ pub(super) mod directory {
     }
 
     #[test]
+    fn parallel_scans_keep_order_and_first_error() {
+        let temp = Temp::new();
+        let root = temp.0.join("root");
+        for dir in ["a", "a/deep", "b", "c/x/y"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for n in 0..300 {
+            let dir = ["", "a", "a/deep", "b", "c/x/y"][n % 5];
+            let path = root.join(dir).join(format!("f{n:03}"));
+            fs::write(&path, vec![n as u8; n * 37]).unwrap();
+            if n % 7 == 0 {
+                set_xattr(&path, b"user.n", &[n as u8]);
+            }
+        }
+        fs::hard_link(root.join("a/f001"), root.join("b/alias")).unwrap();
+        symlink("../a/deep", root.join("c/link")).unwrap();
+        let image = |workers| {
+            let sources = scan(&root, Options::default().workers(workers)).unwrap();
+            let mut output = Cursor::new(Vec::new());
+            write_image(&sources, &mut output, Options::default()).unwrap();
+            output.into_inner()
+        };
+        let expected = image(1);
+        for workers in [2, 4, 8] {
+            assert!(image(workers) == expected);
+        }
+
+        let _socket = UnixListener::bind(root.join("c/x/y/z-socket")).unwrap();
+        for workers in [1, 4] {
+            assert!(matches!(
+                scan(&root, Options::default().workers(workers)),
+                Err(Error::NotSupported(message)) if message.contains("z-socket")
+            ));
+        }
+    }
+
+    #[test]
     fn invalid_options_do_not_access_the_source_or_create_or_remove_output() {
         let temp = Temp::new();
         let source = temp.0.join("missing-source");
